@@ -383,6 +383,35 @@ const ModelsMap = {
       "deep_research"
     ],
     "modality": [
+      "text"
+    ]
+  },
+  "gemma-2-9b-it": {
+    "capabilities": {
+      "vision": true,
+      "document": true,
+      "video": true,
+      "citations": true
+    },
+    "max_context_length": 131072,
+    "max_generation_length": 8192,
+    "abilities": {
+      "vision": 1,
+      "document": 1,
+      "video": 1,
+      "citations": 1,
+      "thinking": 1
+    },
+    "chat_type": [
+      "t2t",
+      "t2v",
+      "t2i",
+      "search",
+      "artifacts",
+      "web_dev",
+      "deep_research"
+    ],
+    "modality": [
       "text",
       "image",
       "video"
