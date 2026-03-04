@@ -2,6 +2,62 @@ const axios = require('axios')
 const { logger } = require('../utils/logger')
 const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 
+const MODEL_REDIRECT = {
+    'qwen3.5-plus': 'coder-model',
+}
+
+function preprocessCliRequestBody(rawBody) {
+    const body = rawBody && typeof rawBody === 'object' ? JSON.parse(JSON.stringify(rawBody)) : {}
+
+    if (body.model && MODEL_REDIRECT[body.model]) {
+        body.model = MODEL_REDIRECT[body.model]
+    }
+    const isStream = body.stream === true
+
+    if (isStream) {
+        const hasToolsArray = Array.isArray(body.tools)
+        if (!hasToolsArray || body.tools.length === 0) {
+            body.tools = [{
+                type: 'function',
+                function: {
+                    name: 'do_not_call_me',
+                    description: 'Do not call this tool.',
+                    parameters: {
+                        type: 'object',
+                        properties: {
+                            operation: { type: 'number', description: 'placeholder' }
+                        },
+                        required: ['operation']
+                    }
+                }
+            }]
+        }
+
+        if (!body.stream_options || typeof body.stream_options !== 'object') {
+            body.stream_options = {}
+        }
+        body.stream_options.include_usage = true
+    }
+
+    return body
+}
+
+function formatCliJsonResponse(data, fallbackModel) {
+    if (!data || typeof data !== 'object') {
+        return data
+    }
+    if (!data.object) {
+        data.object = 'chat.completion'
+    }
+    if (!data.model && fallbackModel) {
+        data.model = fallbackModel
+    }
+    if (!Array.isArray(data.choices)) {
+        data.choices = []
+    }
+    return data
+}
+
 /**
  * 处理CLI聊天完成请求（支持OpenAI格式的流式和JSON响应）
  * @param {Object} req - Express请求对象
@@ -10,7 +66,7 @@ const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../ut
 const handleCliChatCompletion = async (req, res) => {
     try {
         const access_token = req.account.cli_info.access_token
-        const body = req.body
+        const body = preprocessCliRequestBody(req.body)
         const isStream = body.stream === true
 
         // 打印当前使用的账号邮箱
@@ -29,7 +85,19 @@ const handleCliChatCompletion = async (req, res) => {
             headers: {
                 'Authorization': `Bearer ${access_token}`,
                 'Content-Type': 'application/json',
-                'Accept': isStream ? 'text/event-stream' : 'application/json'
+                'Accept': isStream ? 'text/event-stream' : 'application/json',
+                'User-Agent': 'QwenCode/0.10.3 (darwin; arm64)',
+                'X-Dashscope-Useragent': 'QwenCode/0.10.3 (darwin; arm64)',
+                'X-Stainless-Runtime-Version': 'v22.17.0',
+                'Sec-Fetch-Mode': 'cors',
+                'X-Stainless-Lang': 'js',
+                'X-Stainless-Arch': 'arm64',
+                'X-Stainless-Package-Version': '5.11.0',
+                'X-Dashscope-Cachecontrol': 'enable',
+                'X-Stainless-Retry-Count': '0',
+                'X-Stainless-Os': 'MacOS',
+                'X-Dashscope-Authtype': 'qwen-oauth',
+                'X-Stainless-Runtime': 'node'
             },
             data: body,
             timeout: 5 * 60 * 1000,
@@ -73,8 +141,15 @@ const handleCliChatCompletion = async (req, res) => {
 
         // 处理流式响应
         if (isStream) {
-            // 直接管道传输流式数据
-            response.data.pipe(res)
+            // 逐行转发，确保始终输出标准 SSE 片段
+            response.data.on('data', (chunk) => {
+                const text = chunk.toString('utf8')
+                const lines = text.split('\n')
+                for (const line of lines) {
+                    if (!line || !line.startsWith('data:')) continue
+                    res.write(`${line}\n\n`)
+                }
+            })
 
             // 处理流错误
             response.data.on('error', (streamError) => {
@@ -97,7 +172,7 @@ const handleCliChatCompletion = async (req, res) => {
             })
         } else {
             // 处理JSON响应
-            res.json(response.data)
+            res.json(formatCliJsonResponse(response.data, body.model))
             logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (JSON) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
         }
     } catch (error) {

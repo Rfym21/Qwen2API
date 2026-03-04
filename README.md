@@ -2,7 +2,7 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2025.12.14-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Version](https://img.shields.io/badge/version-2026.03.04.10.58-blue.svg)](https://github.com/Rfym21/Qwen2API)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
@@ -578,7 +578,16 @@ API 自动处理图像上传，支持在对话中发送图片：
 
 ### 🖥️ CLI 端点
 
-使用CLI端点仅支持 qwen3-coder-plus 和 qwen3-coder-flash，支持256K上下文和工具调用（Function Calling）
+CLI 端点使用 Qwen Code / Qwen Cli 的 OAuth 令牌访问，支持 256K 上下文和工具调用（Function Calling）。
+
+**支持的模型：**
+
+| 模型 ID | 说明 |
+|---------|------|
+| `qwen3-coder-plus` | Qwen3 Coder Plus |
+| `qwen3-coder-flash` | Qwen3 Coder Flash（速度更快） |
+| `coder-model` | Qwen 3.5 Plus（带思维链，256K 上下文） |
+| `qwen3.5-plus` | `coder-model` 的别名，自动重定向 |
 
 #### 💬 CLI 聊天对话
 
@@ -603,6 +612,20 @@ Authorization: Bearer API_KEY
   "stream": false,
   "temperature": 0.7,
   "max_tokens": 2000
+}
+```
+
+使用 `coder-model`（即 Qwen 3.5 Plus）或其别名 `qwen3.5-plus`：
+```json
+{
+  "model": "coder-model",
+  "messages": [
+    {
+      "role": "user",
+      "content": "写一个快速排序算法。"
+    }
+  ],
+  "stream": false
 }
 ```
 

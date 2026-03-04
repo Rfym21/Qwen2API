@@ -3,9 +3,9 @@
     <div class="container mx-auto">
       <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 px-4 space-y-4 md:space-y-0 pt-5">
         <h1 class="text-4xl font-bold">Token Manager <span class="text-gray-500 text-sm">by 兜豆子</span></h1>
-        <div class="flex flex-col sm:flex-row w-full md:w-auto space-y-3 sm:space-y-0 sm:space-x-2 lg:space-x-4">
+        <div class="grid grid-cols-2 sm:flex sm:flex-row w-full md:w-auto gap-2 sm:gap-0 sm:space-x-2 lg:space-x-4">
           <button @click="showAddModal = true"
-                  class="action-button font-bold border border-green-200 bg-green-50 text-green-900 px-4 py-2 rounded-xl shadow-sm hover:bg-green-100 hover:border-green-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0">
+                  class="action-button font-bold border border-green-200 bg-green-50 text-green-900 px-4 py-2 rounded-xl shadow-sm hover:bg-green-100 hover:border-green-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             添加账号
           </button>
           <button @click="refreshAllAccounts"
@@ -43,11 +43,11 @@
             <span v-else>强制刷新</span>
           </button>
           <button @click="exportAccounts"
-                  class="action-button font-bold border border-yellow-200 bg-yellow-50 text-yellow-900 px-4 py-2 rounded-xl shadow-sm hover:bg-yellow-100 hover:border-yellow-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0">
+                  class="action-button font-bold border border-yellow-200 bg-yellow-50 text-yellow-900 px-4 py-2 rounded-xl shadow-sm hover:bg-yellow-100 hover:border-yellow-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             导出账号
           </button>
           <router-link to="/settings"
-                       class="action-button font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
+                       class="action-button col-span-2 sm:col-span-1 font-bold border border-blue-200 bg-blue-50 text-blue-900 px-4 py-2 rounded-xl shadow-sm hover:bg-blue-100 hover:border-blue-400 transition-all duration-300 transform hover:-translate-y-1 active:translate-y-0 text-center">
             系统设置
           </router-link>
         </div>
@@ -992,19 +992,34 @@ onMounted(() => {
 /* 响应式优化 */
 @media (max-width: 640px) {
   .action-button {
+    min-height: 44px;
     font-size: 0.875rem;
-    padding: 0.5rem 0.75rem;
+    padding: 0.6rem 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .container {
     padding: 0 0.5rem;
   }
-}
 
-@media (max-width: 480px) {
-  .action-button {
-    font-size: 0.8rem;
-    padding: 0.4rem 0.6rem;
+  /* 分页按钮 */
+  .flex.space-x-2.items-center button {
+    min-height: 40px;
+    min-width: 72px;
+    font-size: 0.875rem;
+  }
+
+  /* 多选操作按钮 */
+  .flex.justify-between.items-center button {
+    min-height: 40px;
+    padding: 0.5rem 0.875rem;
+  }
+
+  /* 卡片内按钮 */
+  .token-card button {
+    min-height: 44px;
   }
 }
 </style>
