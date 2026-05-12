@@ -8,41 +8,41 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
-[🔗 加入交流群](https://t.me/nodejs_project) | [📖 文档](#api-文档) | [🐳 Docker 部署](#docker-部署)
+[🔗 加入交流群](https://t.me/nodejs_project) | [📖 檔案](#api-檔案) | [🐳 Docker 部署](#docker-部署)
 
 </div>
 
-## 🛠️ 快速开始
+## 🛠️ 快速開始
 
-### 项目说明
+### 專案說明
 
-Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换为 OpenAI 兼容 API 的代理服务。通过本项目，您只需要一个账户，即可以使用任何支持 OpenAI API 的客户端（如 ChatGPT-Next-Web、LobeChat 等）来调用 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`的各种模型。其中 `/cli` 端点下的模型由 `Qwen Code / Qwen Cli` 提供，支持256k上下文，原生 tools 参数支持
+Qwen-Proxy 是一個將 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 轉換為 OpenAI 相容 API 的代理服務。通過本專案，您只需要一個帳戶，即可以使用任何支援 OpenAI API 的客戶端（如 ChatGPT-Next-Web、LobeChat 等）來呼叫 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli`的各種模型。其中 `/cli` 端點下的模型由 `Qwen Code / Qwen Cli` 提供，支援256k上下文，原生 tools 引數支援
 
 **主要特性：**
-- 兼容 OpenAI API 格式，无缝对接各类客户端
-- 兼容 Anthropic Messages API（`/v1/messages`），支持 Claude Code、Anthropic SDK 等客户端
-- 支持 Function Calling（OpenAI `tools` / Anthropic `tools`），含流式 `arguments` 增量分片与 `tool_choice=required` 强校验重试
-- 支持多账户轮询，提高可用性
-- 支持流式/非流式响应
-- 支持多模态（图片识别、视频理解、图片/视频生成）
-- 支持 OpenAI 风格资源端点：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos`
-- 支持智能搜索、深度思考等高级功能
-- 支持 CLI 端点，提供 256K 上下文和工具调用能力
-- 提供 Web 管理界面，方便配置和监控
-- 批量添加账号支持实时进度展示，可在系统设置中调整登录并发数
+- 相容 OpenAI API 格式，無縫對接各類客戶端
+- 相容 Anthropic Messages API（`/v1/messages`），支援 Claude Code、Anthropic SDK 等客戶端
+- 支援 Function Calling（OpenAI `tools` / Anthropic `tools`），含流式 `arguments` 增量分片與 `tool_choice=required` 強校驗重試
+- 支援多帳戶輪詢，提高可用性
+- 支援流式/非流式響應
+- 支援多模態（圖片識別、影片理解、圖片/影片生成）
+- 支援 OpenAI 風格資源端點：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos`
+- 支援智慧搜尋、深度思考等高階功能
+- 支援 CLI 端點，提供 256K 上下文和工具呼叫能力
+- 提供 Web 管理介面，方便配置和監控
+- 批次新增帳號支援即時進度展示，可在系統設定中調整登入併發數
 
-### ⚠️ 高并发说明
+### ⚠️ 高併發說明
 
-> **重要提示**: `chat.qwen.ai` 对单 IP 有限速策略，目前已知该限制与 Cookie 无关，仅与 IP 相关。
+> **重要提示**: `chat.qwen.ai` 對單 IP 有限速策略，目前已知該限制與 Cookie 無關，僅與 IP 相關。
 
-**解决方案：**
+**解決方案：**
 
-如需高并发使用，建议配合代理池实现 IP 轮换：
+如需高併發使用，建議配合代理池實現 IP 輪換：
 
-| 方案 | 配置方式 | 说明 |
+| 方案 | 配置方式 | 說明 |
 |------|----------|------|
-| **方案一** | `PROXY_URL` + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 直接配置代理地址，所有请求通过代理池轮换 IP |
-| **方案二** | `QWEN_CHAT_PROXY_URL` + [UrlProxy](https://github.com/Rfym21/UrlProxy) + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 通过反代 + 代理池组合，实现更灵活的 IP 轮换 |
+| **方案一** | `PROXY_URL` + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 直接配置代理地址，所有請求通過代理池輪換 IP |
+| **方案二** | `QWEN_CHAT_PROXY_URL` + [UrlProxy](https://github.com/Rfym21/UrlProxy) + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 通過反代 + 代理池組合，實現更靈活的 IP 輪換 |
 
 **配置示例：**
 
@@ -50,28 +50,28 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换
 # 方案一：直接使用代理池
 PROXY_URL=http://127.0.0.1:8282  # ProxyFlow 代理地址
 
-# 方案二：反代 + 代理池组合
+# 方案二：反代 + 代理池組合
 QWEN_CHAT_PROXY_URL=http://127.0.0.1:8000/qwen  # UrlProxy 反代地址（UrlProxy 配置 HTTP_PROXY 指向 ProxyFlow）
 ```
 
-### 🌐 账号级代理 / Per-account proxy
+### 🌐 帳號級代理 / Per-account proxy
 
-每个账号可以配置自己专属的出站代理，从而让多个账号通过不同的 IP 同时使用，规避 `chat.qwen.ai` 基于 IP 的关联封禁。
+每個帳號可以配置自己專屬的出站代理，從而讓多個帳號通過不同的 IP 同時使用，規避 `chat.qwen.ai` 基於 IP 的關聯封禁。
 
-**优先级：** `account.proxy` > 全局 `PROXY_URL` > 不使用代理
+**優先順序：** `account.proxy` > 全域性 `PROXY_URL` > 不使用代理
 
-**支持的代理协议：** HTTP / HTTPS / SOCKS5（与 `PROXY_URL` 一致）
+**支援的代理協議：** HTTP / HTTPS / SOCKS5（與 `PROXY_URL` 一致）
 
-**前端配置（推荐）：**
-打开管理面板 → 添加账号时填写 "代理地址" 字段，或在已有账号卡片上点击 "修改代理" 按钮。
+**前端配置（推薦）：**
+開啟管理面板 → 新增帳號時填寫 "代理地址" 欄位，或在已有帳號卡片上點選 "修改代理" 按鈕。
 
 **ENV 配置（DATA_SAVE_MODE=none）：**
 
 ```bash
-# 旧格式（向后兼容，账号级代理留空）
+# 舊格式（向後相容，帳號級代理留空）
 ACCOUNTS=user1@mail.com:pass1,user2@mail.com:pass2
 
-# 新格式（用 | 分隔代理 URL，可与旧格式混用）
+# 新格式（用 | 分隔代理 URL，可與舊格式混用）
 ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5://10.0.0.2:1080
 ```
 
@@ -91,131 +91,131 @@ ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5:/
 }
 ```
 
-`proxy` 字段为 `null` 或缺失时，账号回退到全局 `PROXY_URL`（若配置）。
+`proxy` 欄位為 `null` 或缺失時，帳號回退到全域性 `PROXY_URL`（若配置）。
 
-> ⚠️ **注意：** 接口返回的代理 URL 不做脱敏处理。本项目假设运行在受信任的本地或私有网络环境中，由单一管理员使用。
+> ⚠️ **注意：** 介面返回的代理 URL 不做脫敏處理。本專案假設執行在受信任的本地或私有網路環境中，由單一管理員使用。
 
-### 环境要求
+### 環境要求
 
-- Node.js 18+ (源码部署时需要)
-- Docker (可选)
-- Redis (可选，用于数据持久化)
+- Node.js 18+ (原始碼部署時需要)
+- Docker (可選)
+- Redis (可選，用於資料持久化)
 
-### ⚙️ 环境配置
+### ⚙️ 環境配置
 
-创建 `.env` 文件并配置以下参数：
+建立 `.env` 檔案並配置以下引數：
 
 ```bash
-# 🌐 服务配置
-LISTEN_ADDRESS=localhost       # 监听地址
-SERVICE_PORT=3000             # 服务端口
+# 🌐 服務配置
+LISTEN_ADDRESS=localhost       # 監聽地址
+SERVICE_PORT=3000             # 服務埠
 
 # 🔐 安全配置
-API_KEY=sk-123456,sk-456789   # API 密钥 (必填，支持多密钥)
-ACCOUNTS=                     # 账户配置 (格式: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
+API_KEY=sk-123456,sk-456789   # API 金鑰 (必填，支援多金鑰)
+ACCOUNTS=                     # 帳戶配置 (格式: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
 
-# 🚀 PM2 多进程配置
-PM2_INSTANCES=1               # PM2进程数量 (1/数字/max)
-PM2_MAX_MEMORY=1G             # PM2内存限制 (100M/1G/2G等)
-                              # 注意: PM2集群模式下所有进程共用同一个端口
+# 🚀 PM2 多程式配置
+PM2_INSTANCES=1               # PM2程式數量 (1/數字/max)
+PM2_MAX_MEMORY=1G             # PM2記憶體限制 (100M/1G/2G等)
+                              # 注意: PM2叢集模式下所有程式共用同一個埠
 
 # 🔍 功能配置
-SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
-OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
-SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
+SEARCH_INFO_MODE=table        # 搜尋資訊展示模式 (table/text)
+OUTPUT_THINK=true             # 是否輸出思考過程 (true/false)
+SIMPLE_MODEL_MAP=false        # 簡化模型對映 (true/false)
 
-# 🌐 代理与反代配置
-QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
-QWEN_CLI_PROXY_URL=           # 自定义 CLI API 反代URL (默认: https://portal.qwen.ai)
+# 🌐 代理與反代配置
+QWEN_CHAT_PROXY_URL=          # 自定義 Chat API 反代URL (預設: https://chat.qwen.ai)
+QWEN_CLI_PROXY_URL=           # 自定義 CLI API 反代URL (預設: https://portal.qwen.ai)
 PROXY_URL=                    # HTTP/HTTPS/SOCKS5 代理地址 (例如: http://127.0.0.1:7890)
 
-# 🗄️ 数据存储
-DATA_SAVE_MODE=none           # 数据保存模式 (none/file/redis)
-REDIS_URL=                    # Redis 连接地址 (可选，使用TLS时为rediss://)
-BATCH_LOGIN_CONCURRENCY=5     # 批量添加账号时的登录并发数
+# 🗄️ 資料儲存
+DATA_SAVE_MODE=none           # 資料儲存模式 (none/file/redis)
+REDIS_URL=                    # Redis 連線地址 (可選，使用TLS時為rediss://)
+BATCH_LOGIN_CONCURRENCY=5     # 批次新增帳號時的登入併發數
 
-# 📸 缓存配置
-CACHE_MODE=default            # 图片缓存模式 (default/file)
+# 📸 快取配置
+CACHE_MODE=default            # 圖片快取模式 (default/file)
 ```
 
-#### 📋 配置说明
+#### 📋 配置說明
 
-| 参数 | 说明 | 示例 |
+| 引數 | 說明 | 示例 |
 |------|------|------|
-| `LISTEN_ADDRESS` | 服务监听地址 | `localhost` 或 `0.0.0.0` |
-| `SERVICE_PORT` | 服务运行端口 | `3000` |
-| `API_KEY` | API 访问密钥，支持多密钥配置。第一个为管理员密钥（可访问前端管理页面），其他为普通密钥（仅可调用API）。多个密钥用逗号分隔 | `sk-admin123,sk-user456,sk-user789` |
-| `PM2_INSTANCES` | PM2进程数量 | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | PM2内存限制 | `100M`/`1G`/`2G` |
-| `SEARCH_INFO_MODE` | 搜索结果展示格式 | `table` 或 `text` |
-| `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
-| `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
-| `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
-| `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
-| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
-| `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
-| `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
-| `BATCH_LOGIN_CONCURRENCY` | 批量添加账号时的登录并发数，可在前端系统设置中动态调整 | `5` |
-| `CACHE_MODE` | 图片缓存存储方式 | `default`/`file` |
-| `LOG_LEVEL` | 日志级别 | `DEBUG`/`INFO`/`WARN`/`ERROR` |
-| `ENABLE_FILE_LOG` | 是否启用文件日志 | `true` 或 `false` |
-| `LOG_DIR` | 日志文件目录 | `./logs` |
-| `MAX_LOG_FILE_SIZE` | 最大日志文件大小(MB) | `10` |
-| `MAX_LOG_FILES` | 保留的日志文件数量 | `5` |
+| `LISTEN_ADDRESS` | 服務監聽地址 | `localhost` 或 `0.0.0.0` |
+| `SERVICE_PORT` | 服務執行埠 | `3000` |
+| `API_KEY` | API 訪問金鑰，支援多金鑰配置。第一個為管理員金鑰（可訪問前端管理頁面），其他為普通金鑰（僅可呼叫API）。多個金鑰用逗號分隔 | `sk-admin123,sk-user456,sk-user789` |
+| `PM2_INSTANCES` | PM2程式數量 | `1`/`4`/`max` |
+| `PM2_MAX_MEMORY` | PM2記憶體限制 | `100M`/`1G`/`2G` |
+| `SEARCH_INFO_MODE` | 搜尋結果展示格式 | `table` 或 `text` |
+| `OUTPUT_THINK` | 是否顯示 AI 思考過程 | `true` 或 `false` |
+| `SIMPLE_MODEL_MAP` | 簡化模型對映，只返回基礎模型不包含變體 | `true` 或 `false` |
+| `QWEN_CHAT_PROXY_URL` | 自定義 Chat API 反代地址 | `https://your-proxy.com` |
+| `QWEN_CLI_PROXY_URL` | 自定義 CLI API 反代地址 | `https://your-cli-proxy.com` |
+| `PROXY_URL` | 出站請求代理地址，支援 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `DATA_SAVE_MODE` | 資料持久化方式 | `none`/`file`/`redis` |
+| `REDIS_URL` | Redis 資料庫連線地址，使用TLS加密時需使用 `rediss://` 協議 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
+| `BATCH_LOGIN_CONCURRENCY` | 批次新增帳號時的登入併發數，可在前端系統設定中動態調整 | `5` |
+| `CACHE_MODE` | 圖片快取儲存方式 | `default`/`file` |
+| `LOG_LEVEL` | 日誌級別 | `DEBUG`/`INFO`/`WARN`/`ERROR` |
+| `ENABLE_FILE_LOG` | 是否啟用檔案日誌 | `true` 或 `false` |
+| `LOG_DIR` | 日誌檔案目錄 | `./logs` |
+| `MAX_LOG_FILE_SIZE` | 最大日誌檔案大小(MB) | `10` |
+| `MAX_LOG_FILES` | 保留的日誌檔案數量 | `5` |
 
-> 💡 **提示**: 可以在 [Upstash](https://upstash.com/) 免费创建 Redis 实例，使用 TLS 协议时地址格式为 `rediss://...`
+> 💡 **提示**: 可以在 [Upstash](https://upstash.com/) 免費建立 Redis 例項，使用 TLS 協議時地址格式為 `rediss://...`
 <div>
 <img src="./docs/images/upstash.png" alt="Upstash Redis" width="600">
 </div>
 
-#### 🔑 多API_KEY配置说明
+#### 🔑 多API_KEY配置說明
 
-`API_KEY` 环境变量支持配置多个API密钥，用于实现不同权限级别的访问控制：
+`API_KEY` 環境變數支援配置多個API金鑰，用於實現不同許可權級別的訪問控制：
 
 **配置格式:**
 ```bash
-# 单个密钥（管理员权限）
+# 單個金鑰（管理員許可權）
 API_KEY=sk-admin123
 
-# 多个密钥（第一个为管理员，其他为普通用户）
+# 多個金鑰（第一個為管理員，其他為普通使用者）
 API_KEY=sk-admin123,sk-user456,sk-user789
 ```
 
-**权限说明:**
+**許可權說明:**
 
-| 密钥类型 | 权限范围 | 功能描述 |
+| 金鑰型別 | 許可權範圍 | 功能描述 |
 |----------|----------|----------|
-| **管理员密钥** | 完整权限 | • 访问前端管理页面<br>• 修改系统设置<br>• 调用所有API接口<br>• 添加/删除普通密钥 |
-| **普通密钥** | API调用权限 | • 仅可调用API接口<br>• 无法访问前端管理页面<br>• 无法修改系统设置 |
+| **管理員金鑰** | 完整許可權 | • 訪問前端管理頁面<br>• 修改系統設定<br>• 呼叫所有API介面<br>• 新增/刪除普通金鑰 |
+| **普通金鑰** | API呼叫許可權 | • 僅可呼叫API介面<br>• 無法訪問前端管理頁面<br>• 無法修改系統設定 |
 
-**使用场景:**
-- **团队协作**: 为不同团队成员分配不同权限的API密钥
-- **应用集成**: 为第三方应用提供受限的API访问权限
-- **安全隔离**: 将管理权限与普通使用权限分离
+**使用場景:**
+- **團隊協作**: 為不同團隊成員分配不同許可權的API金鑰
+- **應用整合**: 為第三方應用提供受限的API訪問許可權
+- **安全隔離**: 將管理許可權與普通使用許可權分離
 
-**注意事项:**
-- 第一个API_KEY自动成为管理员密钥，拥有最高权限
-- 管理员可以通过前端页面动态添加或删除普通密钥
-- 所有密钥都可以正常调用API接口，权限差异仅体现在管理功能上
+**注意事項:**
+- 第一個API_KEY自動成為管理員金鑰，擁有最高許可權
+- 管理員可以通過前端頁面動態新增或刪除普通金鑰
+- 所有金鑰都可以正常呼叫API介面，許可權差異僅體現在管理功能上
 
-#### 📸 CACHE_MODE 缓存模式说明
+#### 📸 CACHE_MODE 快取模式說明
 
-`CACHE_MODE` 环境变量控制图片缓存的存储方式，用于优化图片上传和处理性能：
+`CACHE_MODE` 環境變數控制圖片快取的儲存方式，用於最佳化圖片上傳和處理效能：
 
-| 模式 | 说明 | 适用场景 |
+| 模式 | 說明 | 適用場景 |
 |------|------|----------|
-| `default` | 内存缓存模式 (默认) | 单进程部署，重启后缓存丢失 |
-| `file` | 文件缓存模式 | 多进程部署，缓存持久化到 `./caches/` 目录 |
+| `default` | 記憶體快取模式 (預設) | 單程式部署，重啟後快取丟失 |
+| `file` | 檔案快取模式 | 多程式部署，快取持久化到 `./caches/` 目錄 |
 
-**推荐配置:**
-- **单进程部署**: 使用 `CACHE_MODE=default`，性能最佳
-- **多进程/集群部署**: 使用 `CACHE_MODE=file`，确保进程间缓存共享
-- **Docker 部署**: 建议使用 `CACHE_MODE=file` 并挂载 `./caches` 目录
+**推薦配置:**
+- **單程式部署**: 使用 `CACHE_MODE=default`，效能最佳
+- **多程式/叢集部署**: 使用 `CACHE_MODE=file`，確保程式間快取共享
+- **Docker 部署**: 建議使用 `CACHE_MODE=file` 並掛載 `./caches` 目錄
 
-**文件缓存目录结构:**
+**檔案快取目錄結構:**
 ```
 caches/
-├── [signature1].txt    # 缓存文件，包含图片URL
+├── [signature1].txt    # 快取檔案，包含圖片URL
 ├── [signature2].txt
 └── ...
 ```
@@ -226,7 +226,7 @@ caches/
 
 ### 🐳 Docker 部署
 
-#### 方式一：直接运行
+#### 方式一：直接執行
 
 ```bash
 docker run -d \
@@ -243,47 +243,47 @@ docker run -d \
 #### 方式二：Docker Compose
 
 ```bash
-# 下载配置文件
+# 下載配置檔案
 curl -o docker-compose.yml https://raw.githubusercontent.com/Rfym21/Qwen2API/refs/heads/main/docker/docker-compose.yml
 
-# 启动服务
+# 啟動服務
 docker compose pull && docker compose up -d
 ```
 
 ### 📦 本地部署
 
 ```bash
-# 克隆项目
+# 克隆專案
 git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
-# 安装依赖
+# 安裝依賴
 npm install
 
-# 配置环境变量
+# 配置環境變數
 cp .env.example .env
-# 编辑 .env 文件
+# 編輯 .env 檔案
 
-# 智能启动 (推荐 - 自动判断单进程/多进程)
+# 智慧啟動 (推薦 - 自動判斷單程式/多程式)
 npm start
 
-# 开发模式
+# 開發模式
 npm run dev
 ```
 
-### 🚀 PM2 多进程部署
+### 🚀 PM2 多程式部署
 
-使用 PM2 进行生产环境多进程部署，提供更好的性能和稳定性。
+使用 PM2 進行生產環境多程式部署，提供更好的效能和穩定性。
 
-**重要说明**: PM2 集群模式下，所有进程共用同一个端口，PM2 会自动进行负载均衡。
+**重要說明**: PM2 叢集模式下，所有程式共用同一個埠，PM2 會自動進行負載均衡。
 
-### 🤖 智能启动模式
+### 🤖 智慧啟動模式
 
-使用 `npm start` 可以自动判断启动方式：
+使用 `npm start` 可以自動判斷啟動方式：
 
-- 当 `PM2_INSTANCES=1` 时，使用单进程模式
-- 当 `PM2_INSTANCES>1` 时，使用 Node.js 集群模式
-- 自动限制进程数不超过 CPU 核心数
+- 當 `PM2_INSTANCES=1` 時，使用單程式模式
+- 當 `PM2_INSTANCES>1` 時，使用 Node.js 叢集模式
+- 自動限制程式數不超過 CPU 核心數
 
 ### ☁️ Hugging Face 部署
 
@@ -297,121 +297,121 @@ npm run dev
 
 ---
 
-## 📁 项目结构
+## 📁 專案結構
 
 ```
 Qwen2API/
 ├── README.md
-├── ecosystem.config.js              # PM2配置文件
+├── ecosystem.config.js              # PM2配置檔案
 ├── package.json
 │
-├── docker/                          # Docker配置目录
+├── docker/                          # Docker配置目錄
 │   ├── Dockerfile
 │   ├── docker-compose.yml
 │   └── docker-compose-redis.yml
 │
-├── caches/                          # 缓存文件目录
-├── data/                            # 数据文件目录
+├── caches/                          # 快取檔案目錄
+├── data/                            # 資料檔案目錄
 │   ├── data.json
 │   └── data_template.json
-├── scripts/                         # 脚本目录
-│   └── fingerprint-injector.js      # 浏览器指纹注入脚本
+├── scripts/                         # 指令碼目錄
+│   └── fingerprint-injector.js      # 瀏覽器指紋注入指令碼
 │
-├── src/                             # 后端源代码目录
-│   ├── server.js                    # 主服务器文件
-│   ├── start.js                     # 智能启动脚本 (自动判断单进程/多进程)
+├── src/                             # 後端原始碼目錄
+│   ├── server.js                    # 主伺服器檔案
+│   ├── start.js                     # 智慧啟動指令碼 (自動判斷單程式/多程式)
 │   ├── config/
-│   │   └── index.js                 # 配置文件
-│   ├── controllers/                 # 控制器目录
+│   │   └── index.js                 # 配置檔案
+│   ├── controllers/                 # 控制器目錄
 │   │   ├── chat.js                  # 聊天控制器
-│   │   ├── chat.image.video.js      # 图片/视频生成控制器
+│   │   ├── chat.image.video.js      # 圖片/影片生成控制器
 │   │   ├── cli.chat.js              # CLI聊天控制器
 │   │   └── models.js                # 模型控制器
-│   ├── middlewares/                 # 中间件目录
-│   │   ├── authorization.js         # 授权中间件
-│   │   └── chat-middleware.js       # 聊天中间件
-│   ├── models/                      # 模型目录
-│   │   └── models-map.js            # 模型映射配置
-│   ├── routes/                      # 路由目录
-│   │   ├── accounts.js              # 账户路由
+│   ├── middlewares/                 # 中介軟體目錄
+│   │   ├── authorization.js         # 授權中介軟體
+│   │   └── chat-middleware.js       # 聊天中介軟體
+│   ├── models/                      # 模型目錄
+│   │   └── models-map.js            # 模型對映配置
+│   ├── routes/                      # 路由目錄
+│   │   ├── accounts.js              # 帳戶路由
 │   │   ├── chat.js                  # 聊天路由
 │   │   ├── cli.chat.js              # CLI聊天路由
 │   │   ├── models.js                # 模型路由
-│   │   ├── settings.js              # 设置路由
-│   │   └── verify.js                # 验证路由
-│   └── utils/                       # 工具函数目录
-│       ├── account-rotator.js       # 账户轮询器
-│       ├── account.js               # 账户管理
-│       ├── chat-helpers.js          # 聊天辅助函数
+│   │   ├── settings.js              # 設定路由
+│   │   └── verify.js                # 驗證路由
+│   └── utils/                       # 工具函式目錄
+│       ├── account-rotator.js       # 帳戶輪詢器
+│       ├── account.js               # 帳戶管理
+│       ├── chat-helpers.js          # 聊天輔助函式
 │       ├── cli.manager.js           # CLI管理器
 │       ├── cookie-generator.js      # Cookie生成器
-│       ├── data-persistence.js      # 数据持久化
-│       ├── fingerprint.js           # 浏览器指纹生成
-│       ├── img-caches.js            # 图片缓存
-│       ├── logger.js                # 日志工具
-│       ├── precise-tokenizer.js     # 精确分词器
-│       ├── proxy-helper.js          # 代理辅助函数
-│       ├── redis.js                 # Redis连接
-│       ├── request.js               # HTTP请求封装
-│       ├── setting.js               # 设置管理
-│       ├── ssxmod-manager.js        # ssxmod参数管理
+│       ├── data-persistence.js      # 資料持久化
+│       ├── fingerprint.js           # 瀏覽器指紋生成
+│       ├── img-caches.js            # 圖片快取
+│       ├── logger.js                # 日誌工具
+│       ├── precise-tokenizer.js     # 精確分詞器
+│       ├── proxy-helper.js          # 代理輔助函式
+│       ├── redis.js                 # Redis連線
+│       ├── request.js               # HTTP請求封裝
+│       ├── setting.js               # 設定管理
+│       ├── ssxmod-manager.js        # ssxmod引數管理
 │       ├── token-manager.js         # Token管理器
-│       ├── tools.js                 # 工具调用处理
-│       └── upload.js                # 文件上传
+│       ├── tools.js                 # 工具呼叫處理
+│       └── upload.js                # 檔案上傳
 │
-└── public/                          # 前端项目目录
-    ├── dist/                        # 编译后的前端文件
-    │   ├── assets/                  # 静态资源
+└── public/                          # 前端專案目錄
+    ├── dist/                        # 編譯後的前端檔案
+    │   ├── assets/                  # 靜態資源
     │   ├── favicon.png
     │   └── index.html
-    ├── src/                         # 前端源代码
-    │   ├── App.vue                  # 主应用组件
-    │   ├── main.js                  # 入口文件
-    │   ├── style.css                # 全局样式
-    │   ├── assets/                  # 静态资源
+    ├── src/                         # 前端原始碼
+    │   ├── App.vue                  # 主應用元件
+    │   ├── main.js                  # 入口檔案
+    │   ├── style.css                # 全域性樣式
+    │   ├── assets/                  # 靜態資源
     │   │   └── background.mp4
     │   ├── routes/                  # 路由配置
     │   │   └── index.js
-    │   └── views/                   # 页面组件
-    │       ├── auth.vue             # 认证页面
-    │       ├── dashboard.vue        # 仪表板页面
-    │       └── settings.vue         # 设置页面
-    ├── package.json                 # 前端依赖配置
+    │   └── views/                   # 頁面元件
+    │       ├── auth.vue             # 認證頁面
+    │       ├── dashboard.vue        # 儀錶板頁面
+    │       └── settings.vue         # 設定頁面
+    ├── package.json                 # 前端依賴配置
     ├── package-lock.json
     ├── index.html                   # 前端入口HTML
     ├── postcss.config.js            # PostCSS配置
     ├── tailwind.config.js           # TailwindCSS配置
-    ├── vite.config.js               # Vite构建配置
-    └── public/                      # 公共静态资源
+    ├── vite.config.js               # Vite構建配置
+    └── public/                      # 公共靜態資源
         └── favicon.png
 ```
 
-## 📖 API 文档
+## 📖 API 檔案
 
-### 🔐 API 认证说明
+### 🔐 API 認證說明
 
-本API支持多密钥认证机制，所有API请求都需要在请求头中包含有效的API密钥：
+本API支援多金鑰認證機制，所有API請求都需要在請求頭中包含有效的API金鑰：
 
 ```http
 Authorization: Bearer sk-your-api-key
 ```
 
-**支持的密钥类型:**
-- **管理员密钥**: 第一个配置的API_KEY，拥有完整权限
-- **普通密钥**: 其他配置的API_KEY，仅可调用API接口
+**支援的金鑰型別:**
+- **管理員金鑰**: 第一個配置的API_KEY，擁有完整許可權
+- **普通金鑰**: 其他配置的API_KEY，僅可呼叫API介面
 
-**认证示例:**
+**認證示例:**
 ```bash
-# 使用管理员密钥
+# 使用管理員金鑰
 curl -H "Authorization: Bearer sk-admin123" http://localhost:3000/v1/models
 
-# 使用普通密钥
+# 使用普通金鑰
 curl -H "Authorization: Bearer sk-user456" http://localhost:3000/v1/chat/completions
 ```
 
-### 🔍 获取模型列表
+### 🔍 獲取模型列表
 
-获取所有可用的 AI 模型列表。
+獲取所有可用的 AI 模型列表。
 
 ```http
 GET /v1/models
@@ -419,17 +419,17 @@ Authorization: Bearer sk-your-api-key
 ```
 
 ```http
-GET /models (免认证)
+GET /models (免認證)
 ```
 
-**说明:**
-- `id`: 推荐直接作为请求里的 `model` 使用，优先展示更易读的模型名称
-- `name`: 上游原始模型 ID，便于与官方接口或日志对照
-- `upstream_id`: 不带能力后缀的上游模型 ID
-- `display_name`: 不带能力后缀的展示名
-- 当 `SIMPLE_MODEL_MAP=false` 时，会额外返回 `-thinking`、`-search`、`-image`、`-video`、`-image-edit` 等能力变体
+**說明:**
+- `id`: 推薦直接作為請求裡的 `model` 使用，優先展示更易讀的模型名稱
+- `name`: 上游原始模型 ID，便於與官方介面或日誌對照
+- `upstream_id`: 不帶能力字尾的上游模型 ID
+- `display_name`: 不帶能力字尾的展示名
+- 當 `SIMPLE_MODEL_MAP=false` 時，會額外返回 `-thinking`、`-search`、`-image`、`-video`、`-image-edit` 等能力變體
 
-**响应示例:**
+**響應示例:**
 ```json
 {
   "object": "list",
@@ -447,9 +447,9 @@ GET /models (免认证)
 }
 ```
 
-### 💬 聊天对话
+### 💬 聊天對話
 
-发送聊天消息并获取 AI 回复。
+傳送聊天訊息並獲取 AI 回覆。
 
 ```http
 POST /v1/chat/completions
@@ -457,18 +457,18 @@ Content-Type: application/json
 Authorization: Bearer sk-your-api-key
 ```
 
-**请求体:**
+**請求體:**
 ```json
 {
   "model": "Qwen3.6-Plus",
   "messages": [
     {
       "role": "system",
-      "content": "你是一个有用的助手。"
+      "content": "你是一個有用的助手。"
     },
     {
       "role": "user",
-      "content": "你好，请介绍一下自己。"
+      "content": "你好，請介紹一下自己。"
     }
   ],
   "stream": false,
@@ -477,7 +477,7 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-**响应示例:**
+**響應示例:**
 ```json
 {
   "id": "chatcmpl-123",
@@ -489,7 +489,7 @@ Authorization: Bearer sk-your-api-key
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "你好！我是一个AI助手..."
+        "content": "你好！我是一個AI助手..."
       },
       "finish_reason": "stop"
     }
@@ -502,31 +502,31 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-### 🛠️ Function Calling（工具调用）
+### 🛠️ Function Calling（工具呼叫）
 
-`/v1/chat/completions` 支持完整的 OpenAI Function Calling 协议。即便上游 Web 接口本身不具备原生 tools 能力，本服务通过提示词注入与流式状态机解析，使其行为与 OpenAI API 一致：
+`/v1/chat/completions` 支援完整的 OpenAI Function Calling 協議。即便上游 Web 介面本身不具備原生 tools 能力，本服務通過提示詞注入與流式狀態機解析，使其行為與 OpenAI API 一致：
 
-- 自动将 `tools[]` 压缩为 TS 风格签名注入提示词，节省约 70% token 开销
-- 流式输出按 OpenAI 规范分片：先发 `function.name + 空 arguments` 头块，随后多个 `arguments` 切片
-- 历史消息中的 `assistant.tool_calls` 与 `role:"tool"` 自动折叠回链，`tool_call_id` 精确关联
-- `tool_choice` 全四态：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
-- `tool_choice="required"` 或指定函数时，若首次未触发工具调用，自动追加强约束提示重试一次
+- 自動將 `tools[]` 壓縮為 TS 風格簽名注入提示詞，節省約 70% token 開銷
+- 流式輸出按 OpenAI 規範分片：先發 `function.name + 空 arguments` 頭塊，隨後多個 `arguments` 切片
+- 歷史訊息中的 `assistant.tool_calls` 與 `role:"tool"` 自動摺疊回鏈，`tool_call_id` 精確關聯
+- `tool_choice` 全四態：`"auto"` / `"required"` / `{type:"function",function:{name:"..."}}` / `"none"`
+- `tool_choice="required"` 或指定函式時，若首次未觸發工具呼叫，自動追加強約束提示重試一次
 
-**请求示例：**
+**請求示例：**
 
 ```json
 {
   "model": "qwen3-coder-plus",
   "stream": true,
   "messages": [
-    {"role": "user", "content": "查一下北京的天气"}
+    {"role": "user", "content": "查一下北京的天氣"}
   ],
   "tools": [
     {
       "type": "function",
       "function": {
         "name": "get_weather",
-        "description": "获取城市天气",
+        "description": "獲取城市天氣",
         "parameters": {
           "type": "object",
           "properties": { "city": { "type": "string" } },
@@ -539,7 +539,7 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-**流式响应（节选）：**
+**流式響應（節選）：**
 
 ```
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xxx","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}
@@ -551,11 +551,11 @@ data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
 data: [DONE]
 ```
 
-OpenAI SDK、LangChain、Cline、Continue 等遵循 OpenAI 工具协议的客户端可直接接入。
+OpenAI SDK、LangChain、Cline、Continue 等遵循 OpenAI 工具協議的客戶端可直接接入。
 
 ### 🤖 Anthropic Messages API
 
-兼容 Anthropic 的 `/v1/messages` 端点，可直接对接 Claude Code、Anthropic SDK、aider 等客户端。
+相容 Anthropic 的 `/v1/messages` 端點，可直接對接 Claude Code、Anthropic SDK、aider 等客戶端。
 
 ```http
 POST /v1/messages
@@ -563,26 +563,26 @@ Content-Type: application/json
 Authorization: Bearer sk-your-api-key
 ```
 
-支持的字段：
+支援的欄位：
 
-| 字段 | 说明 |
+| 欄位 | 說明 |
 |---|---|
 | `model` | 任意 Qwen 模型名（如 `qwen3-coder-plus`） |
-| `system` | 字符串或 `{type:"text"}` 块数组 |
-| `messages[].content` | 字符串、文本块、图片块、`tool_use` 块、`tool_result` 块 |
-| `tools[]` | Anthropic 风格 `{name,input_schema,description}` |
-| `tool_choice` | `{type:"auto"}` / `{type:"any"}`（=必须调用） / `{type:"tool",name:"..."}` / `{type:"none"}` |
-| `thinking` | `{type:"enabled",budget_tokens:N}` 启用思考模式 |
-| `stream` | 流式 SSE 输出 |
+| `system` | 字串或 `{type:"text"}` 塊陣列 |
+| `messages[].content` | 字串、文本塊、圖片塊、`tool_use` 塊、`tool_result` 塊 |
+| `tools[]` | Anthropic 風格 `{name,input_schema,description}` |
+| `tool_choice` | `{type:"auto"}` / `{type:"any"}`（=必須呼叫） / `{type:"tool",name:"..."}` / `{type:"none"}` |
+| `thinking` | `{type:"enabled",budget_tokens:N}` 啟用思考模式 |
+| `stream` | 流式 SSE 輸出 |
 
-**请求示例（含工具调用）：**
+**請求示例（含工具呼叫）：**
 
 ```json
 {
   "model": "qwen3-coder-plus",
   "max_tokens": 1024,
   "messages": [
-    {"role": "user", "content": "查广州天气"}
+    {"role": "user", "content": "查廣州天氣"}
   ],
   "tools": [
     {
@@ -598,7 +598,7 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-**非流式响应：**
+**非流式響應：**
 
 ```json
 {
@@ -611,7 +611,7 @@ Authorization: Bearer sk-your-api-key
       "type": "tool_use",
       "id": "call_xxx",
       "name": "get_weather",
-      "input": { "city": "广州" }
+      "input": { "city": "廣州" }
     }
   ],
   "stop_reason": "tool_use",
@@ -630,7 +630,7 @@ event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_xxx","name":"get_weather","input":{}}}
 
 event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"广州\"}"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"廣州\"}"}}
 
 event: content_block_stop
 data: {"type":"content_block_stop","index":0}
@@ -642,17 +642,17 @@ event: message_stop
 data: {"type":"message_stop"}
 ```
 
-### 🎨 图像与视频生成
+### 🎨 影像與影片生成
 
-当前支持两种调用方式：
-- 使用 `/v1/chat/completions` + 模型后缀：`-image`、`-image-edit`、`-video`
-- 使用 OpenAI 风格资源端点：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos`
+當前支援兩種呼叫方式：
+- 使用 `/v1/chat/completions` + 模型字尾：`-image`、`-image-edit`、`-video`
+- 使用 OpenAI 風格資源端點：`/v1/images/generations`、`/v1/images/edits`、`/v1/videos`
 
-以下示例中的模型名请以 `/v1/models` 返回的 `id` 字段为准。
+以下示例中的模型名請以 `/v1/models` 返回的 `id` 欄位為準。
 
-#### 方式一：通过 `/v1/chat/completions`
+#### 方式一：通過 `/v1/chat/completions`
 
-文本生图：
+文本生圖：
 
 ```json
 {
@@ -660,7 +660,7 @@ data: {"type":"message_stop"}
   "messages": [
     {
       "role": "user",
-      "content": "画一只在花园里玩耍的小猫咪，卡通风格"
+      "content": "畫一隻在花園裡玩耍的小貓咪，卡通風格"
     }
   ],
   "size": "1:1",
@@ -668,7 +668,7 @@ data: {"type":"message_stop"}
 }
 ```
 
-图片编辑：
+圖片編輯：
 
 ```json
 {
@@ -679,7 +679,7 @@ data: {"type":"message_stop"}
       "content": [
         {
           "type": "text",
-          "text": "把这张图片改成浅蓝色科技风海报"
+          "text": "把這張圖片改成淺藍色科技風海報"
         },
         {
           "type": "image_url",
@@ -694,7 +694,7 @@ data: {"type":"message_stop"}
 }
 ```
 
-视频生成：
+影片生成：
 
 ```json
 {
@@ -702,7 +702,7 @@ data: {"type":"message_stop"}
   "messages": [
     {
       "role": "user",
-      "content": "生成一个 3 秒夜景延时视频，城市街道霓虹灯闪烁"
+      "content": "生成一個 3 秒夜景延時影片，城市街道霓虹燈閃爍"
     }
   ],
   "size": "9:16",
@@ -710,13 +710,13 @@ data: {"type":"message_stop"}
 }
 ```
 
-**支持的尺寸参数:**
-- `/v1/chat/completions` 下的图片/视频生成支持 `1:1`、`4:3`、`3:4`、`16:9`、`9:16`
-- `/v1/images/generations`、`/v1/images/edits`、`/v1/videos` 兼容 `1024x1024`、`1536x1024`、`1024x1536`、`1792x1024`、`1024x1792`
+**支援的尺寸引數:**
+- `/v1/chat/completions` 下的圖片/影片生成支援 `1:1`、`4:3`、`3:4`、`16:9`、`9:16`
+- `/v1/images/generations`、`/v1/images/edits`、`/v1/videos` 相容 `1024x1024`、`1536x1024`、`1024x1536`、`1792x1024`、`1024x1792`
 
-#### 方式二：OpenAI 风格资源端点
+#### 方式二：OpenAI 風格資源端點
 
-图像生成：
+影像生成：
 
 ```http
 POST /v1/images/generations
@@ -727,13 +727,13 @@ Authorization: Bearer sk-your-api-key
 ```json
 {
   "model": "Qwen3-Omni-Flash",
-  "prompt": "一只橘猫坐在木桌上看向镜头，写实风格",
+  "prompt": "一隻橘貓坐在木桌上看向鏡頭，寫實風格",
   "size": "1024x1024",
   "response_format": "url"
 }
 ```
 
-图像编辑：
+影像編輯：
 
 ```http
 POST /v1/images/edits
@@ -741,14 +741,14 @@ Content-Type: multipart/form-data
 Authorization: Bearer sk-your-api-key
 ```
 
-表单字段：
-- `model`: 可选，不传时自动选择支持图片编辑的默认模型
-- `prompt`: 可选，默认为 `请基于上传图片完成编辑`
-- `image`: 必填，支持 multipart 文件上传，也支持 JSON 字符串形式的图片 URL / data URI
-- `size`: 可选，支持 OpenAI 风格尺寸写法
-- `response_format`: 可选，支持 `url`、`b64_json`
+表單欄位：
+- `model`: 可選，不傳時自動選擇支援圖片編輯的預設模型
+- `prompt`: 可選，預設為 `請基於上傳圖片完成編輯`
+- `image`: 必填，支援 multipart 檔案上傳，也支援 JSON 字串形式的圖片 URL / data URI
+- `size`: 可選，支援 OpenAI 風格尺寸寫法
+- `response_format`: 可選，支援 `url`、`b64_json`
 
-视频生成：
+影片生成：
 
 ```http
 POST /v1/videos
@@ -759,12 +759,12 @@ Authorization: Bearer sk-your-api-key
 ```json
 {
   "model": "Qwen3-Omni-Flash",
-  "prompt": "一个简短的 3 秒夜景延时视频，城市街道霓虹灯闪烁",
+  "prompt": "一個簡短的 3 秒夜景延時影片，城市街道霓虹燈閃爍",
   "size": "1024x1792"
 }
 ```
 
-图像生成响应示例：
+影像生成響應示例：
 
 ```json
 {
@@ -777,7 +777,7 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-视频生成响应示例：
+影片生成響應示例：
 
 ```json
 {
@@ -794,11 +794,11 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-### 🎯 高级功能
+### 🎯 高階功能
 
-#### 🔍 智能搜索模式
+#### 🔍 智慧搜尋模式
 
-在模型名称后添加 `-search` 后缀启用搜索功能：
+在模型名稱後新增 `-search` 字尾啟用搜索功能：
 
 ```json
 {
@@ -809,7 +809,7 @@ Authorization: Bearer sk-your-api-key
 
 #### 🧠 推理模式
 
-在模型名称后添加 `-thinking` 后缀启用思考过程输出：
+在模型名稱後新增 `-thinking` 字尾啟用思考過程輸出：
 
 ```json
 {
@@ -818,9 +818,9 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-#### 🔍🧠 组合模式
+#### 🔍🧠 組合模式
 
-同时启用搜索和推理功能：
+同時啟用搜索和推理功能：
 
 ```json
 {
@@ -829,11 +829,11 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
-#### 🖼️ 多模态支持
+#### 🖼️ 多模態支援
 
-API 自动处理图片和视频上传，支持在对话中发送图片、视频 URL 或 Base64 data URI。
+API 自動處理圖片和影片上傳，支援在對話中傳送圖片、影片 URL 或 Base64 data URI。
 
-图片理解示例：
+圖片理解示例：
 
 ```json
 {
@@ -844,7 +844,7 @@ API 自动处理图片和视频上传，支持在对话中发送图片、视频 
       "content": [
         {
           "type": "text",
-          "text": "这张图片里有什么？"
+          "text": "這張圖片裡有什麼？"
         },
         {
           "type": "image_url",
@@ -858,7 +858,7 @@ API 自动处理图片和视频上传，支持在对话中发送图片、视频 
 }
 ```
 
-视频理解示例：
+影片理解示例：
 
 ```json
 {
@@ -869,7 +869,7 @@ API 自动处理图片和视频上传，支持在对话中发送图片、视频 
       "content": [
         {
           "type": "text",
-          "text": "请用一句话描述这个视频"
+          "text": "請用一句話描述這個影片"
         },
         {
           "type": "input_video",
@@ -883,27 +883,27 @@ API 自动处理图片和视频上传，支持在对话中发送图片、视频 
 }
 ```
 
-支持的视频字段：
+支援的影片欄位：
 - `input_video`
 - `video_url`
 - `video`
 
-### 🖥️ CLI 端点
+### 🖥️ CLI 端點
 
-CLI 端点使用 Qwen Code / Qwen Cli 的 OAuth 令牌访问，支持 256K 上下文和工具调用（Function Calling）。
+CLI 端點使用 Qwen Code / Qwen Cli 的 OAuth 令牌訪問，支援 256K 上下文和工具呼叫（Function Calling）。
 
-**支持的模型：**
+**支援的模型：**
 
-| 模型 ID | 说明 |
+| 模型 ID | 說明 |
 |---------|------|
 | `qwen3-coder-plus` | Qwen3 Coder Plus |
 | `qwen3-coder-flash` | Qwen3 Coder Flash（速度更快） |
-| `coder-model` | Qwen 3.5 Plus（带思维链，256K 上下文） |
-| `qwen3.5-plus` | `coder-model` 的别名，自动重定向 |
+| `coder-model` | Qwen 3.5 Plus（帶思維鏈，256K 上下文） |
+| `qwen3.5-plus` | `coder-model` 的別名，自動重定向 |
 
-#### 💬 CLI 聊天对话
+#### 💬 CLI 聊天對話
 
-通过 CLI 端点发送聊天请求，支持流式和非流式响应。
+通過 CLI 端點傳送聊天請求，支援流式和非流式響應。
 
 ```http
 POST /cli/v1/chat/completions
@@ -911,14 +911,14 @@ Content-Type: application/json
 Authorization: Bearer API_KEY
 ```
 
-**请求体:**
+**請求體:**
 ```json
 {
   "model": "qwen3-coder-plus",
   "messages": [
     {
       "role": "user",
-      "content": "你好，请介绍一下自己。"
+      "content": "你好，請介紹一下自己。"
     }
   ],
   "stream": false,
@@ -927,37 +927,37 @@ Authorization: Bearer API_KEY
 }
 ```
 
-使用 `coder-model`（即 Qwen 3.5 Plus）或其别名 `qwen3.5-plus`：
+使用 `coder-model`（即 Qwen 3.5 Plus）或其別名 `qwen3.5-plus`：
 ```json
 {
   "model": "coder-model",
   "messages": [
     {
       "role": "user",
-      "content": "写一个快速排序算法。"
+      "content": "寫一個快速排序演算法。"
     }
   ],
   "stream": false
 }
 ```
 
-**流式请求:**
+**流式請求:**
 ```json
 {
   "model": "qwen3-coder-flash",
   "messages": [
     {
       "role": "user",
-      "content": "写一首关于春天的诗。"
+      "content": "寫一首關於春天的詩。"
     }
   ],
   "stream": true
 }
 ```
 
-**响应格式:**
+**響應格式:**
 
-非流式响应与标准 OpenAI API 格式相同：
+非流式響應與標準 OpenAI API 格式相同：
 ```json
 {
   "id": "chatcmpl-123",
@@ -969,7 +969,7 @@ Authorization: Bearer API_KEY
       "index": 0,
       "message": {
         "role": "assistant",
-        "content": "你好！我是一个AI助手..."
+        "content": "你好！我是一個AI助手..."
       },
       "finish_reason": "stop"
     }
@@ -982,7 +982,7 @@ Authorization: Bearer API_KEY
 }
 ```
 
-流式响应使用 Server-Sent Events (SSE) 格式：
+流式響應使用 Server-Sent Events (SSE) 格式：
 ```
 data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"qwen3-coder-flash","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
 
@@ -990,3 +990,20 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288
 
 data: [DONE]
 ```
+
+Port 3000 已被 systemd 服務佔用，這是正常的。用 systemd 管理服務：
+# 檢視狀態
+systemctl --user status qwen2api
+# 重啟
+systemctl --user restart qwen2api
+# 檢視日誌
+journalctl --user -u qwen2api -n 30 --no-pager
+# 停止（如果你想手動跑）
+systemctl --user stop qwen2api
+bun src/start.js
+當前 systemd 服務正在背景正常執行中：
+systemctl --user status qwen2api --no-pager | head -3
+要確認就直接 curl health endpoint：
+curl -s http://localhost:3000/health | python3 -m json.tool
+
+systemctl --user kill qwen2api.service -s SIGKILL 2>&1; sleep 1; lsof -ti:3000 2>/dev/null | xargs -r kill -9 2>/dev/null; sleep 1; systemctl --user status qwen2api.service --no-pager 2>&1 | head -8
