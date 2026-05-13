@@ -31,29 +31,6 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换
 - 提供 Web 管理界面，方便配置和监控
 - 批量添加账号支持实时进度展示，可在系统设置中调整登录并发数
 
-### ⚠️ 高并发说明
-
-> **重要提示**: `chat.qwen.ai` 对单 IP 有限速策略，目前已知该限制与 Cookie 无关，仅与 IP 相关。
-
-**解决方案：**
-
-如需高并发使用，建议配合代理池实现 IP 轮换：
-
-| 方案 | 配置方式 | 说明 |
-|------|----------|------|
-| **方案一** | `PROXY_URL` + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 直接配置代理地址，所有请求通过代理池轮换 IP |
-| **方案二** | `QWEN_CHAT_PROXY_URL` + [UrlProxy](https://github.com/Rfym21/UrlProxy) + [ProxyFlow](https://github.com/Rfym21/ProxyFlow) | 通过反代 + 代理池组合，实现更灵活的 IP 轮换 |
-
-**配置示例：**
-
-```bash
-# 方案一：直接使用代理池
-PROXY_URL=http://127.0.0.1:8282  # ProxyFlow 代理地址
-
-# 方案二：反代 + 代理池组合
-QWEN_CHAT_PROXY_URL=http://127.0.0.1:8000/qwen  # UrlProxy 反代地址（UrlProxy 配置 HTTP_PROXY 指向 ProxyFlow）
-```
-
 ### 🌐 账号级代理 / Per-account proxy
 
 每个账号可以配置自己专属的出站代理，从而让多个账号通过不同的 IP 同时使用，规避 `chat.qwen.ai` 基于 IP 的关联封禁。
@@ -990,3 +967,21 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288
 
 data: [DONE]
 ```
+
+---
+
+## ⚠️ 免责声明
+
+1. 本项目仅供学习交流使用，**严禁用于任何商业用途**。
+2. 使用本项目所产生的一切后果由使用者自行承担，项目开发者不承担任何责任。
+3. 本项目不对 `chat.qwen.ai` 及 `Qwen Code / Qwen Cli` 的服务可用性、稳定性作任何保证。
+4. 使用者应遵守所在地区的法律法规，以及通义千问的服务条款和使用政策。
+5. 如有侵权，请联系作者删除。
+
+## 🚫 禁止商用
+
+本项目采用 **仅限个人学习与研究** 的使用许可：
+
+- 禁止将本项目或其衍生作品用于任何商业目的，包括但不限于：出售、出租、提供付费服务、嵌入商业产品等。
+- 禁止利用本项目进行任何违反通义千问服务条款的行为。
+- 禁止将本项目用于大规模自动化调用、恶意攻击或滥用上游服务。
