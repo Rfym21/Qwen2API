@@ -450,6 +450,44 @@ const deleteAccount = async (key) => {
   }
 }
 
+const SETTINGS_KEY = 'qwen2api:settings'
+
+/**
+ * 获取运行时设置
+ * @returns {Promise<Object>} 设置对象 (字段类型 — string, 调用方ответственен за parseInt)
+ */
+const getSettings = async () => {
+  try {
+    const client = await ensureConnection()
+    const data = await client.hgetall(SETTINGS_KEY)
+    return data && Object.keys(data).length > 0 ? data : {}
+  } catch (err) {
+    logger.error('获取运行时设置失败', 'REDIS', '', err)
+    return {}
+  }
+}
+
+/**
+ * 保存运行时设置（部分合并 через hset）
+ * @param {Object} partial - 字段
+ * @returns {Promise<boolean>} 设置是否成功
+ */
+const setSettings = async (partial) => {
+  try {
+    const client = await ensureConnection()
+    const stringified = {}
+    for (const [k, v] of Object.entries(partial || {})) {
+      stringified[k] = v === null || v === undefined ? '' : String(v)
+    }
+    if (Object.keys(stringified).length === 0) return true
+    await client.hset(SETTINGS_KEY, stringified)
+    return true
+  } catch (err) {
+    logger.error('保存运行时设置失败', 'REDIS', '', err)
+    return false
+  }
+}
+
 /**
  * 检查键是否存在
  * @param {string} key - 键名
@@ -498,6 +536,8 @@ const redisClient = {
   setAccount,
   deleteAccount,
   checkKeyExists,
+  getSettings,
+  setSettings,
   getConnectionStatus,
   cleanup,
 
