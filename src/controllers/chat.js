@@ -655,7 +655,7 @@ const handleChatCompletion = async (req, res) => {
         if (!response_data.status || !response_data.response) {
             res.status(500)
                 .json({
-                    error: "请求发送失败！！！"
+                    error: "Request failed"
                 })
             return
         }
@@ -672,7 +672,7 @@ const handleChatCompletion = async (req, res) => {
         logger.error('聊天处理错误', 'CHAT', '', error)
         res.status(500)
             .json({
-                error: "token无效,请求发送失败！！！"
+                error: "Invalid token, request failed"
             })
     }
 }
