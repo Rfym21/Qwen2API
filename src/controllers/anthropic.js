@@ -641,7 +641,7 @@ const handleAnthropicMessages = async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         type: 'error',
-        error: { type: 'api_error', message: '服务错误' }
+        error: { type: 'api_error', message: 'Service error' }
       });
     } else {
       try { res.end(); } catch (_) { /* ignore */ }

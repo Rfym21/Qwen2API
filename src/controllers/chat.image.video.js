@@ -128,7 +128,7 @@ const parseUpstreamImageError = (data) => {
             raw_response_body: rawPayload
         })
         return {
-            error: errorData.details || errorData.code || '服务错误，请稍后再试',
+            error: errorData.details || errorData.code || 'Service error, please try again later',
             code: errorData.code,
             request_id: payload.request_id,
             status: errorData.code === 'Bad_Request' && /internal error/i.test(errorData.details || '') ? 502 : 500
@@ -648,7 +648,7 @@ const normalizeOpenAIImageVideoSize = (size) => {
  */
 const sendOpenAIErrorResponse = (res, error) => {
     const status = error?.status || 500
-    const message = error?.error || error?.message || '服务错误，请稍后再试'
+    const message = error?.error || error?.message || 'Service error, please try again later'
 
     return res.status(status).json({
         error: {
@@ -1467,7 +1467,7 @@ const generateImageVideoResult = async (payload) => {
 
         throw {
             status: 500,
-            error: error?.message || '服务错误，请稍后再试'
+            error: error?.message || 'Service error, please try again later'
         }
     }
 }
@@ -1506,12 +1506,12 @@ const handleImageVideoCompletion = async (req, res) => {
         logger.error('图片视频资源处理错误', 'CHAT', '', error)
 
         if (downstreamStream) {
-            return returnResponse(res, req.body.model, error?.error || error?.message || '服务错误，请稍后再试', true)
+            return returnResponse(res, req.body.model, error?.error || error?.message || 'Service error, please try again later', true)
         }
 
         return sendUpstreamError(res, error?.error ? error : {
             status: 500,
-            error: error?.message || '服务错误，请稍后再试'
+            error: error?.message || 'Service error, please try again later'
         })
     }
 }
