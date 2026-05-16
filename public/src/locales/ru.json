@@ -59,7 +59,13 @@
     "editProxyTitle": "Изменить proxy",
     "editProxyHint": "Оставьте пустым, чтобы очистить и использовать глобальный PROXY_URL",
     "clearProxy": "Очистить",
-    "save": "Сохранить"
+    "save": "Сохранить",
+    "acct": {
+      "chatToday": "Chat (сегодня)",
+      "cliToday": "CLI (сегодня)",
+      "calls": "запросов",
+      "cliSuccess": "успешно"
+    }
   },
   "msg": {
     "batchComplete": "Добавление завершено: успешно {n}",

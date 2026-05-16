@@ -59,7 +59,13 @@
     "editProxyTitle": "修改代理",
     "editProxyHint": "留空将清除该账号代理，回退到全局 PROXY_URL",
     "clearProxy": "清除",
-    "save": "保存"
+    "save": "保存",
+    "acct": {
+      "chatToday": "今日 Chat",
+      "cliToday": "今日 CLI",
+      "calls": "次调用",
+      "cliSuccess": "成功"
+    }
   },
   "msg": {
     "batchComplete": "批量添加完成: 成功{n}个",

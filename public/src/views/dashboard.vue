@@ -194,32 +194,58 @@
                 </div>
               </div>
 
-              <div class="pt-4 mt-auto border-t border-gray-200/50 space-y-2">
-                <button @click="openEditProxy(token)"
-                        class="w-full py-2 rounded-lg transition-all duration-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200">
-                  {{ t('dash.editProxy') }}
-                </button>
-                <button @click="refreshToken(token.email)"
-                        :disabled="refreshingTokens.includes(token.email)"
-                        :class="[
-                          'w-full py-2 rounded-lg transition-all duration-300 flex items-center justify-center space-x-2',
-                          refreshingTokens.includes(token.email)
-                            ? 'bg-green-400 text-white refreshing-button-green cursor-not-allowed'
-                            : 'macaron-green-button text-green-600 hover:bg-green-100 border border-green-200'
-                        ]">
-                  <span v-if="refreshingTokens.includes(token.email)" class="flex items-center space-x-2">
-                    <svg class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                      <path class="opacity-75" fill="currentColor" d="m4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                    <span>{{ t('dash.refreshing') }}</span>
+              <div class="bg-white/40 backdrop-blur-sm border border-white/40 rounded-2xl px-4 py-3 text-sm space-y-1 transition-all">
+                <div class="flex items-baseline justify-between gap-2">
+                  <span class="text-gray-600">{{ t('dash.acct.chatToday') }}:</span>
+                  <span class="font-medium text-gray-800 text-xs md:text-sm">
+                    {{ getAccountStats(token.email).chat.input }} in / {{ getAccountStats(token.email).chat.output }} out
                   </span>
-                  <span v-else>{{ t('dash.refreshToken') }}</span>
-                </button>
-                <button @click="deleteToken(token.email)"
-                        class="w-full group-hover:bg-red-50 text-red-600 py-2 rounded-lg transition-all duration-300 hover:bg-red-100">
-                  {{ t('dash.deleteAccount') }}
-                </button>
+                </div>
+                <div class="flex items-baseline justify-between gap-2">
+                  <span class="text-gray-600">{{ t('dash.acct.cliToday') }}:</span>
+                  <span class="font-medium text-gray-800 text-xs md:text-sm">
+                    {{ getCliRequestNumber(token.email) }} / {{ cliQuotaLimit }} {{ t('dash.acct.calls') }}
+                    <span class="text-xs opacity-60">({{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }})</span>
+                  </span>
+                </div>
+                <div class="h-2 bg-gray-200/60 rounded-full overflow-hidden">
+                  <div :style="{ width: getCliProgressPct(token.email) + '%' }"
+                       :class="getCliProgressColor(token.email)"
+                       class="h-full transition-all duration-300"></div>
+                </div>
+                <div class="text-xs text-gray-500 text-right">
+                  {{ getAccountStats(token.email).cli.input }} in / {{ getAccountStats(token.email).cli.output }} out
+                </div>
+              </div>
+
+              <div class="pt-4 mt-auto border-t border-gray-200/50">
+                <div class="flex flex-row gap-2">
+                  <button @click="openEditProxy(token)"
+                          class="flex-1 py-2 px-2 rounded-lg transition-all duration-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 text-xs md:text-sm">
+                    {{ t('dash.editProxy') }}
+                  </button>
+                  <button @click="refreshToken(token.email)"
+                          :disabled="refreshingTokens.includes(token.email)"
+                          :class="[
+                            'flex-1 py-2 px-2 rounded-lg transition-all duration-300 flex items-center justify-center gap-1 text-xs md:text-sm',
+                            refreshingTokens.includes(token.email)
+                              ? 'bg-green-400 text-white refreshing-button-green cursor-not-allowed'
+                              : 'macaron-green-button text-green-600 hover:bg-green-100 border border-green-200'
+                          ]">
+                    <span v-if="refreshingTokens.includes(token.email)" class="flex items-center gap-1">
+                      <svg class="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="m4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      <span>{{ t('dash.refreshing') }}</span>
+                    </span>
+                    <span v-else>{{ t('dash.refreshToken') }}</span>
+                  </button>
+                  <button @click="deleteToken(token.email)"
+                          class="flex-1 py-2 px-2 rounded-lg border border-red-200 text-red-600 group-hover:bg-red-50 transition-all duration-300 hover:bg-red-100 text-xs md:text-sm">
+                    {{ t('dash.deleteAccount') }}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -521,6 +547,46 @@ const showDeleteAllConfirm = ref(false)
 const isRefreshingAll = ref(false)
 const isForceRefreshingAll = ref(false)
 const refreshingTokens = ref([])
+
+// Per-account stats (Qwen2API-3wg.2)
+const accountStats = ref({})
+const statsInterval = ref(null)
+const cliQuotaLimit = ref(2000)
+const DEFAULT_STATS = Object.freeze({
+  chat: { input: 0, output: 0 },
+  cli: { calls: 0, input: 0, output: 0 }
+})
+
+const getAccountStats = (email) => accountStats.value[email]?.stats || DEFAULT_STATS
+const getCliRequestNumber = (email) => accountStats.value[email]?.cliRequestNumber || 0
+const getCliProgressPct = (email) => {
+  const limit = cliQuotaLimit.value || 2000
+  return Math.min(100, getCliRequestNumber(email) / limit * 100)
+}
+const getCliProgressColor = (email) => {
+  const pct = getCliProgressPct(email)
+  if (pct >= 80) return 'bg-red-500'
+  if (pct >= 50) return 'bg-amber-500'
+  return 'bg-emerald-500'
+}
+
+const fetchAccountStats = async () => {
+  try {
+    const res = await axios.get('/api/accountStats', {
+      headers: getAuthHeaders()
+    })
+    const map = {}
+    for (const entry of res.data?.accounts || []) {
+      if (entry?.email) map[entry.email] = entry
+    }
+    accountStats.value = map
+    if (typeof res.data?.cliQuotaLimit === 'number' && res.data.cliQuotaLimit > 0) {
+      cliQuotaLimit.value = res.data.cliQuotaLimit
+    }
+  } catch (error) {
+    console.error('fetchAccountStats error:', error)
+  }
+}
 
 // Toast 通知
 const toast = ref({
@@ -996,10 +1062,16 @@ const exportAccounts = async () => {
 
 onMounted(() => {
   getTokens()
+  fetchAccountStats()
+  statsInterval.value = setInterval(fetchAccountStats, 30000)
 })
 
 onBeforeUnmount(() => {
   clearBatchTaskPolling()
+  if (statsInterval.value) {
+    clearInterval(statsInterval.value)
+    statsInterval.value = null
+  }
 })
 </script>
 
