@@ -3,6 +3,40 @@ const DataPersistence = require('./data-persistence')
 const TokenManager = require('./token-manager')
 const AccountRotator = require('./account-rotator')
 const { logger } = require('./logger')
+
+/**
+ * 默认 daily stats 结构。返回新对象，调用方安全修改
+ * @returns {Object} default stats
+ */
+const createDefaultStats = () => ({
+    chat: { input: 0, output: 0 },
+    cli: { calls: 0, input: 0, output: 0 }
+})
+
+/**
+ * 保证账户具备 stats 字段（兼容老 data.json/Redis 数据）
+ * @param {Object} account - 账户对象
+ */
+const ensureStats = (account) => {
+    if (!account) return
+    if (!account.stats || typeof account.stats !== 'object') {
+        account.stats = createDefaultStats()
+        return
+    }
+    if (!account.stats.chat || typeof account.stats.chat !== 'object') {
+        account.stats.chat = { input: 0, output: 0 }
+    } else {
+        account.stats.chat.input = Number(account.stats.chat.input) || 0
+        account.stats.chat.output = Number(account.stats.chat.output) || 0
+    }
+    if (!account.stats.cli || typeof account.stats.cli !== 'object') {
+        account.stats.cli = { calls: 0, input: 0, output: 0 }
+    } else {
+        account.stats.cli.calls = Number(account.stats.cli.calls) || 0
+        account.stats.cli.input = Number(account.stats.cli.input) || 0
+        account.stats.cli.output = Number(account.stats.cli.output) || 0
+    }
+}
 /**
  * 账户管理器
  * 统一管理账户、令牌、模型等功能
@@ -61,6 +95,9 @@ class Account {
     async loadAccountTokens() {
         try {
             this.accountTokens = await this.dataPersistence.loadAccounts()
+
+            // 兼容历史数据：旧 data.json/Redis 没有 stats 字段
+            this.accountTokens.forEach(ensureStats)
 
             // 如果是环境变量模式，需要进行登录获取令牌
             if (config.dataSaveMode === 'none' && this.accountTokens.length > 0) {
@@ -164,7 +201,7 @@ class Account {
      * @private
      */
     _setupDailyResetTimer() {
-        logger.info('设置CLI请求次数每日重置定时器', 'CLI')
+        logger.info('设置每日 00:00 重置定时器（CLI 请求次数 + daily stats）', 'CLI')
 
         // 计算到下一天00:00:00的毫秒数
         const now = new Date()
@@ -175,26 +212,53 @@ class Account {
 
         // 首次执行使用setTimeout
         this.cliRequestNumberInterval = setTimeout(() => {
-            // 重置所有CLI账户的请求次数
-            this._resetCliRequestNumbers()
+            this._resetDailyCounters()
 
             // 设置每24小时执行一次的定时器
             this.cliDailyResetInterval = setInterval(() => {
-                this._resetCliRequestNumbers()
+                this._resetDailyCounters()
             }, 24 * 60 * 60 * 1000)
         }, timeDiff)
     }
 
     /**
-     * 重置CLI请求次数
+     * 每日 00:00 重置：CLI 请求计数 + chat/cli daily stats
+     * 重置后立即 persist——否则 PM2 重启会从磁盘恢复昨日数据，让 reset 失去意义
      * @private
      */
-    _resetCliRequestNumbers() {
+    async _resetDailyCounters() {
+        // CLI 请求计数（旧逻辑）
         const cliAccounts = this.accountTokens.filter(account => account.cli_info)
         cliAccounts.forEach(account => {
             account.cli_info.request_number = 0
         })
-        logger.info(`已重置 ${cliAccounts.length} 个CLI账户的请求次数`, 'CLI')
+
+        // 新增：chat/cli daily stats
+        this.accountTokens.forEach(account => {
+            ensureStats(account)
+            account.stats.chat.input = 0
+            account.stats.chat.output = 0
+            account.stats.cli.calls = 0
+            account.stats.cli.input = 0
+            account.stats.cli.output = 0
+        })
+
+        logger.info(`已重置 ${cliAccounts.length} 个CLI账户的请求次数 + ${this.accountTokens.length} 个账户的 daily stats`, 'CLI')
+
+        // 立即 persist 以挺过 PM2 重启
+        try {
+            await this.dataPersistence.saveAllAccounts(this.accountTokens)
+        } catch (error) {
+            logger.error('每日重置后 persist 失败', 'ACCOUNT', '', error)
+        }
+    }
+
+    /**
+     * 重置CLI请求次数（向后兼容别名）
+     * @private
+     */
+    _resetCliRequestNumbers() {
+        return this._resetDailyCounters()
     }
 
     /**
@@ -505,11 +569,64 @@ class Account {
     }
 
     /**
-     * 记录账户使用失败
+     * 记录账户传输层失败（影响 cooldown）
+     * 仅在 timeout/ECONNRESET 等传输层错误调用——HTTP 4xx/5xx 走 recordAccountError
      * @param {string} email - 邮箱地址
+     * @param {string|number} [code] - 错误码（err.code 或 HTTP status）
      */
-    recordAccountFailure(email) {
-        this.accountRotator.recordFailure(email)
+    recordAccountFailure(email, code) {
+        this.accountRotator.recordFailure(email, code)
+    }
+
+    /**
+     * 记录账户错误（仅用于 UI warn 指示，不影响 cooldown）
+     * HTTP 4xx/5xx 走这里——上游主动拒绝，账户本身有效
+     * @param {string} email - 邮箱地址
+     * @param {string|number} [code] - HTTP status 或错误码
+     */
+    recordAccountError(email, code) {
+        this.accountRotator.recordError(email, code)
+    }
+
+    /**
+     * 累计 daily stats（per-account）
+     * 调用方：chat.js / anthropic.js / cli.chat.js 在成功消费完上游 usage 后
+     * 注意：PM2_INSTANCES>1 时各 worker 各持一份 in-memory 副本（已记于 epic notes）
+     * @param {string} email - 邮箱地址
+     * @param {'chat'|'cli'} kind - 统计类别
+     * @param {Object} delta - 增量
+     * @param {number} [delta.input] - 输入 tokens
+     * @param {number} [delta.output] - 输出 tokens
+     * @param {number} [delta.calls] - 调用次数（仅 cli 使用）
+     */
+    accumulateStats(email, kind, delta) {
+        if (!email || !delta) return
+        const account = this.accountTokens.find(acc => acc.email === email)
+        if (!account) return
+
+        ensureStats(account)
+
+        const input = Number(delta.input) || 0
+        const output = Number(delta.output) || 0
+        const calls = Number(delta.calls) || 0
+
+        if (kind === 'chat') {
+            account.stats.chat.input += input
+            account.stats.chat.output += output
+        } else if (kind === 'cli') {
+            account.stats.cli.calls += calls
+            account.stats.cli.input += input
+            account.stats.cli.output += output
+        } else {
+            return
+        }
+
+        // 异步 debounced persist——失败不影响调用方
+        try {
+            this.dataPersistence.saveAccountStats(email, account.stats)
+        } catch (error) {
+            logger.error(`accumulateStats persist 调度失败 (${email})`, 'STATS', '', error)
+        }
     }
 
     /**
@@ -554,7 +671,8 @@ class Account {
                 password,
                 token,
                 expires: decoded.exp,
-                proxy: (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
+                proxy: (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null,
+                stats: createDefaultStats()
             }
 
             // 添加到内存
@@ -604,7 +722,8 @@ class Account {
                 password,
                 token,
                 expires,
-                proxy: (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
+                proxy: (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null,
+                stats: createDefaultStats()
             }
 
             // 添加到内存

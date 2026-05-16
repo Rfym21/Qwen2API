@@ -1,6 +1,7 @@
 const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
+const accountManager = require('../utils/account.js');
 const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
@@ -9,6 +10,26 @@ const {
   createToolCallStreamParser
 } = require('../utils/tool-prompt.js');
 const { logger } = require('../utils/logger');
+
+/**
+ * 安全累计 chat stats（与 chat.js attributeChatUsage 共享语义）
+ * 静默吞掉异常——stats 累计失败不应中断响应
+ * 同 epic notes: tool-retry 全归属主账户（精度损失可接受）
+ * @param {Object} account - 主请求账户对象
+ * @param {number} promptTokens - 输入 tokens
+ * @param {number} completionTokens - 输出 tokens
+ */
+const attributeChatUsage = (account, promptTokens, completionTokens) => {
+  if (!account || !account.email) return;
+  try {
+    accountManager.accumulateStats(account.email, 'chat', {
+      input: Number(promptTokens) || 0,
+      output: Number(completionTokens) || 0
+    });
+  } catch (e) {
+    // 静默
+  }
+};
 
 /**
  * Anthropic stop_reason 枚举
@@ -501,6 +522,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     completionTokens = usage.completion_tokens || 0;
   }
 
+  // Daily stats 累计——一次性归属主账户（见模块顶部 attributeChatUsage 注释）
+  attributeChatUsage(ctx.currentAccount, promptTokens, completionTokens);
+
   writeAnthropicEvent(res, 'message_delta', {
     type: 'message_delta',
     delta: { stop_reason: stopReason, stop_sequence: null },
@@ -597,6 +621,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     });
   }
 
+  // Daily stats 累计——一次性归属主账户（同 stream 分支注释）
+  attributeChatUsage(ctx.currentAccount, promptTokens, completionTokens);
+
   res.set({ 'Content-Type': 'application/json' });
   res.json({
     id: message_id,
@@ -629,7 +656,7 @@ const handleAnthropicMessages = async (req, res) => {
     }
 
     const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
-    const ctx = { message_id, model, hasTools, toolChoice, requestBody: body };
+    const ctx = { message_id, model, hasTools, toolChoice, requestBody: body, currentAccount: upstreamResp.currentAccount };
 
     if (req.body?.stream) {
       await handleAnthropicStream(res, ctx, upstreamResp.response);
