@@ -71,7 +71,7 @@ class DataPersistence {
   /**
    * 加载运行时设置（chat retry config 等）
    * 在 'none' 模式下返回 {}, 因为没有可写存储
-   * @returns {Promise<Object>} 设置对象 (空对象表示无сохранённых значений)
+   * @returns {Promise<Object>} 设置对象 (空对象表示尚未存储任何值)
    */
   async loadSettings() {
     try {

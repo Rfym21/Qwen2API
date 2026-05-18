@@ -487,7 +487,7 @@ const SETTINGS_KEY = 'qwen2api:settings'
 
 /**
  * 获取运行时设置
- * @returns {Promise<Object>} 设置对象 (字段类型 — string, 调用方ответственен за parseInt)
+ * @returns {Promise<Object>} 设置对象 (字段类型为 string，调用方需自行 parseInt)
  */
 const getSettings = async () => {
   try {
@@ -501,7 +501,7 @@ const getSettings = async () => {
 }
 
 /**
- * 保存运行时设置（部分合并 через hset）
+ * 保存运行时设置（通过 hset 部分合并）
  * @param {Object} partial - 字段
  * @returns {Promise<boolean>} 设置是否成功
  */
