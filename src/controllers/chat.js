@@ -395,7 +395,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.end()
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
-        try { res.status(500).json({ error: "服务错误!!!" }) } catch (_) { /* response already started */ }
+        try { res.status(500).json({ error: "Service error" }) } catch (_) { /* response already started */ }
     }
 }
 
@@ -632,7 +632,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
         res.status(500)
             .json({
-                error: "服务错误!!!"
+                error: "Service error"
             })
     }
 }
@@ -655,7 +655,7 @@ const handleChatCompletion = async (req, res) => {
         if (!response_data.status || !response_data.response) {
             res.status(500)
                 .json({
-                    error: "请求发送失败！！！"
+                    error: "Request failed"
                 })
             return
         }
@@ -672,7 +672,7 @@ const handleChatCompletion = async (req, res) => {
         logger.error('聊天处理错误', 'CHAT', '', error)
         res.status(500)
             .json({
-                error: "token无效,请求发送失败！！！"
+                error: "Invalid token, request failed"
             })
     }
 }
