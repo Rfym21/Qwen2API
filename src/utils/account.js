@@ -14,29 +14,65 @@ const createDefaultStats = () => ({
 })
 
 /**
- * 保证账户具备 stats 字段（兼容老 data.json/Redis 数据）
+ * 保证账户具备 stats 和 statsHistory 字段（兼容老 data.json/Redis 数据）
  * @param {Object} account - 账户对象
  */
 const ensureStats = (account) => {
     if (!account) return
     if (!account.stats || typeof account.stats !== 'object') {
         account.stats = createDefaultStats()
-        return
-    }
-    if (!account.stats.chat || typeof account.stats.chat !== 'object') {
-        account.stats.chat = { input: 0, output: 0 }
     } else {
-        account.stats.chat.input = Number(account.stats.chat.input) || 0
-        account.stats.chat.output = Number(account.stats.chat.output) || 0
+        if (!account.stats.chat || typeof account.stats.chat !== 'object') {
+            account.stats.chat = { input: 0, output: 0 }
+        } else {
+            account.stats.chat.input = Number(account.stats.chat.input) || 0
+            account.stats.chat.output = Number(account.stats.chat.output) || 0
+        }
+        if (!account.stats.cli || typeof account.stats.cli !== 'object') {
+            account.stats.cli = { calls: 0, input: 0, output: 0 }
+        } else {
+            account.stats.cli.calls = Number(account.stats.cli.calls) || 0
+            account.stats.cli.input = Number(account.stats.cli.input) || 0
+            account.stats.cli.output = Number(account.stats.cli.output) || 0
+        }
     }
-    if (!account.stats.cli || typeof account.stats.cli !== 'object') {
-        account.stats.cli = { calls: 0, input: 0, output: 0 }
-    } else {
-        account.stats.cli.calls = Number(account.stats.cli.calls) || 0
-        account.stats.cli.input = Number(account.stats.cli.input) || 0
-        account.stats.cli.output = Number(account.stats.cli.output) || 0
+    // statsHistory: { 'YYYY-MM-DD': { chat:{input,output}, cli:{calls,input,output} } }
+    // Backward-compat: legacy records without the field — initialize to {}
+    if (!account.statsHistory || typeof account.statsHistory !== 'object') {
+        account.statsHistory = {}
     }
 }
+
+/**
+ * YYYY-MM-DD date key for (now + offsetDays) in Node process local TZ
+ * @param {number} offsetDays - day offset (negative = past)
+ * @returns {string}
+ */
+const _formatDateKey = (offsetDays) => {
+    const d = new Date()
+    d.setDate(d.getDate() + offsetDays)
+    const yyyy = d.getFullYear()
+    const mm = String(d.getMonth() + 1).padStart(2, '0')
+    const dd = String(d.getDate()).padStart(2, '0')
+    return `${yyyy}-${mm}-${dd}`
+}
+
+const _getTodayKey = () => _formatDateKey(0)
+const _getYesterdayKey = () => _formatDateKey(-1)
+const _dateKeyDaysAgo = (n) => _formatDateKey(-n)
+
+const _hasNonZeroStats = (stats) => {
+    if (!stats || typeof stats !== 'object') return false
+    const c = stats.chat || {}
+    const l = stats.cli || {}
+    return (Number(c.input) || 0) > 0
+        || (Number(c.output) || 0) > 0
+        || (Number(l.calls) || 0) > 0
+        || (Number(l.input) || 0) > 0
+        || (Number(l.output) || 0) > 0
+}
+
+const STATS_HISTORY_RETENTION_DAYS = 90
 /**
  * 账户管理器
  * 统一管理账户、令牌、模型等功能
@@ -59,8 +95,8 @@ class Account {
         this.cliRequestNumberInterval = null
         this.cliDailyResetInterval = null
 
-        // 初始化
-        this._initialize()
+        // Keep the init promise so debug methods can await readiness
+        this._initPromise = this._initialize()
     }
 
     /**
@@ -228,8 +264,18 @@ class Account {
     }
 
     /**
-     * 每日 00:00 重置：CLI 请求计数 + chat/cli daily stats
-     * 重置后立即 persist——否则 PM2 重启会从磁盘恢复昨日数据，让 reset 失去意义
+     * Daily 00:00 reset: CLI request counters + chat/cli daily stats.
+     * Before zeroing, snapshot yesterday into account.statsHistory and prune
+     * entries older than STATS_HISTORY_RETENTION_DAYS days, then a single
+     * saveAllAccounts batch (instead of 30 individual saves).
+     *
+     * Caveats:
+     * - PM2_INSTANCES > 1: each worker archives its own partial copy of stats;
+     *   the daily total would be under-reported proportionally to the worker
+     *   count. With instances=1 (ecosystem.config.js default) this is not
+     *   triggered.
+     * - DATA_SAVE_MODE=none: saveAllAccounts returns false and history is not
+     *   persisted. Set DATA_SAVE_MODE=file or redis to enable the feature.
      * @private
      */
     async _resetDailyCounters() {
@@ -239,9 +285,32 @@ class Account {
             account.cli_info.request_number = 0
         })
 
-        // 新增：chat/cli daily stats
+        const yesterday = _getYesterdayKey()
+        const cutoff = _dateKeyDaysAgo(STATS_HISTORY_RETENTION_DAYS)
+        let archivedCount = 0
+
+        // For every account (including inactive ones) prune old history;
+        // for accounts with any non-zero counters, snapshot yesterday.
         this.accountTokens.forEach(account => {
             ensureStats(account)
+
+            // Date-based pruning (string compare is valid for YYYY-MM-DD).
+            for (const key of Object.keys(account.statsHistory)) {
+                if (key < cutoff) {
+                    delete account.statsHistory[key]
+                }
+            }
+
+            // Snapshot only if there was at least one non-zero counter.
+            if (_hasNonZeroStats(account.stats)) {
+                account.statsHistory[yesterday] = {
+                    chat: { ...account.stats.chat },
+                    cli: { ...account.stats.cli }
+                }
+                archivedCount++
+            }
+
+            // Reset today.
             account.stats.chat.input = 0
             account.stats.chat.output = 0
             account.stats.cli.calls = 0
@@ -249,14 +318,45 @@ class Account {
             account.stats.cli.output = 0
         })
 
-        logger.info(`已重置 ${cliAccounts.length} 个CLI账户的请求次数 + ${this.accountTokens.length} 个账户的 daily stats`, 'CLI')
+        logger.info(
+            `已重置 ${cliAccounts.length} 个CLI账户请求次数 + ${this.accountTokens.length} 个账户 daily stats，归档 ${archivedCount} 条 statsHistory[${yesterday}]`,
+            'CLI'
+        )
 
-        // 立即 persist 以挺过 PM2 重启
+        // Single batch save. In file mode — one data.json rewrite; in redis
+        // mode — sequential HSETs (the saveAccountStats debounce is not used).
         try {
             await this.dataPersistence.saveAllAccounts(this.accountTokens)
         } catch (error) {
             logger.error('每日重置后 persist 失败', 'ACCOUNT', '', error)
         }
+    }
+
+    /**
+     * Public helper: today's YYYY-MM-DD key in Node process local TZ.
+     * Paired with the _getYesterdayKey used inside _resetDailyCounters.
+     * The /statsHistory route must use this rather than new Date() in the
+     * browser — otherwise differing browser/container TZs can shift month
+     * boundaries.
+     * @returns {string}
+     */
+    getTodayKey() {
+        return _getTodayKey()
+    }
+
+    /**
+     * Debug: manual trigger for archive/reset (used by the dev endpoint).
+     * The readiness guard prevents wiping data.accounts = [] before init finishes.
+     * @returns {Promise<void>}
+     */
+    async archiveYesterdayForTest() {
+        if (this._initPromise) {
+            await this._initPromise
+        }
+        if (!this.isInitialized || !Array.isArray(this.accountTokens) || this.accountTokens.length === 0) {
+            throw new Error('account manager not initialized — refusing to archive (would wipe data)')
+        }
+        return this._resetDailyCounters()
     }
 
     /**

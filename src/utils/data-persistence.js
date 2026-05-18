@@ -240,6 +240,7 @@ class DataPersistence {
     if (accountData.expires !== undefined) merged.expires = accountData.expires
     if (accountData.proxy !== undefined) merged.proxy = accountData.proxy ?? null
     if (accountData.stats !== undefined) merged.stats = accountData.stats
+    if (accountData.statsHistory !== undefined) merged.statsHistory = accountData.statsHistory
 
     if (existingIndex !== -1) {
       data.accounts[existingIndex] = merged
@@ -280,7 +281,8 @@ class DataPersistence {
       token: account.token,
       expires: account.expires,
       proxy: account.proxy ?? null,
-      stats: account.stats ?? undefined
+      stats: account.stats ?? undefined,
+      statsHistory: account.statsHistory ?? undefined
     }))
 
     await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
