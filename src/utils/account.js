@@ -110,12 +110,18 @@ class Account {
             // 更新账户轮询器
             this.accountRotator.setAccounts(this.accountTokens)
 
-            // 初始化 CLI 账户,随机初始化一个账号
+            // 初始化 CLI 账户（后台执行，不阻塞 chat-flow init）
+            // CLI poll 在 upstream 504 时可挂 5 分钟（cli.manager.js pollForToken: 60 次 × 5 秒），
+            // 而 chat-flow（/v1/chat/completions, /v1/messages）不需要 cli_info，无需等待。
+            // routes/cli.chat.js:22 已正确过滤无 cli_info 的账户，所以 /cli/* 在 CLI init 未完成时
+            // 自然回退到「无可用账户」状态。
             if (this.accountTokens.length > 0) {
                 const randomIndex = Math.floor(Math.random() * this.accountTokens.length)
                 const randomAccount = this.accountTokens[randomIndex]
-                logger.info(`初始化 CLI 账户, 随机初始化账号: ${randomAccount.email}`, 'ACCOUNT')
-                await this._initializeCliAccount(randomAccount)
+                logger.info(`后台初始化 CLI 账户, 随机初始化账号: ${randomAccount.email}`, 'ACCOUNT')
+                this._initializeCliAccount(randomAccount).catch(err => {
+                    logger.error(`CLI 账户后台初始化失败: ${randomAccount.email}`, 'ACCOUNT', '', err)
+                })
             }
 
             // 设置cli定时器 每天00:00:00刷新请求次数
