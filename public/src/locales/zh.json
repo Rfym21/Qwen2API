@@ -13,6 +13,7 @@
     "forceRefreshing": "强制刷新中...",
     "forceRefresh": "强制刷新",
     "export": "导出账号",
+    "statistics": "统计",
     "settings": "系统设置",
     "perPage": "每页显示:",
     "totalItems": "共 {n} 项",
@@ -173,5 +174,33 @@
     "label": "🌐 语言 / Language",
     "ru": "Русский",
     "zh": "中文"
+  },
+  "stats": {
+    "title": "统计",
+    "loading": "加载中...",
+    "loadFailed": "加载统计失败：",
+    "backToDashboard": "返回账号管理",
+    "filter": {
+      "label": "时间范围",
+      "currentMonth": "当月",
+      "prevMonth": "上月",
+      "last90": "最近 90 天"
+    },
+    "totals": {
+      "label": "全部账号汇总",
+      "chatInput": "Chat 输入",
+      "chatOutput": "Chat 输出",
+      "cliInput": "CLI 输入",
+      "cliOutput": "CLI 输出",
+      "cliCalls": "CLI 调用"
+    },
+    "account": {
+      "label": "按账号",
+      "noData": "该时间段无数据"
+    },
+    "chart": {
+      "input": "输入",
+      "output": "输出"
+    }
   }
 }
