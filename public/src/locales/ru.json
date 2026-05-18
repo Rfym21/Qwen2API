@@ -59,7 +59,24 @@
     "editProxyTitle": "Изменить proxy",
     "editProxyHint": "Оставьте пустым, чтобы очистить и использовать глобальный PROXY_URL",
     "clearProxy": "Очистить",
-    "save": "Сохранить"
+    "save": "Сохранить",
+    "acct": {
+      "chatToday": "Chat (сегодня)",
+      "cliToday": "CLI (сегодня)",
+      "calls": "запросов",
+      "cliSuccess": "успешно",
+      "unitK": "к",
+      "unitM": "M",
+      "status": {
+        "active": "Активен",
+        "warn": "Недавние ошибки ({code}, {ago} назад)",
+        "warnNoCode": "Недавние ошибки ({ago} назад)",
+        "cooldown": "В охлаждении (осталось {until})",
+        "tokenExpiring": "Токен скоро истекает",
+        "unitSec": "сек",
+        "unitMin": "мин"
+      }
+    }
   },
   "msg": {
     "batchComplete": "Добавление завершено: успешно {n}",

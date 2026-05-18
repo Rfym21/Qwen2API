@@ -8,9 +8,15 @@ const { logger } = require('./logger')
  * 数据持久化管理器
  * 统一处理账户数据的存储和读取
  */
+// Debounce 窗口（per-email）写入 stats——避免每次 token 累计都触发文件 I/O
+const STATS_PERSIST_DEBOUNCE_MS = 5000
+
 class DataPersistence {
   constructor() {
     this.dataFilePath = path.join(__dirname, '../../data/data.json')
+    // 每个 email 的待持久化 stats 与定时器（debounce）
+    this._statsPersistTimers = new Map()
+    this._statsPendingPayload = new Map()
   }
 
   /**
@@ -209,33 +215,36 @@ class DataPersistence {
   }
 
   /**
-   * 保存到文件
+   * 保存到文件（MERGE 语义）
+   * partial save（仅 token、proxy、stats）不应覆盖未传字段——保留 existing 值
    * @private
    */
   async _saveToFile(email, accountData) {
     await this._ensureDataFileExists()
-    
+
     const fileContent = await fs.readFile(this.dataFilePath, 'utf-8')
     const data = JSON.parse(fileContent)
-    
+
     if (!data.accounts) {
       data.accounts = []
     }
 
-    // 查找现有账户或添加新账户
     const existingIndex = data.accounts.findIndex(account => account.email === email)
-    const updatedAccount = {
-      email,
-      password: accountData.password,
-      token: accountData.token,
-      expires: accountData.expires,
-      proxy: accountData.proxy ?? null
-    }
+    const existing = existingIndex !== -1 ? data.accounts[existingIndex] : {}
+
+    // 仅写入显式传入的字段；未传字段保留 existing 值。stats 同理——
+    // 避免 token refresh / proxy update 的 partial save 把累计 stats 清零
+    const merged = { ...existing, email }
+    if (accountData.password !== undefined) merged.password = accountData.password
+    if (accountData.token !== undefined) merged.token = accountData.token
+    if (accountData.expires !== undefined) merged.expires = accountData.expires
+    if (accountData.proxy !== undefined) merged.proxy = accountData.proxy ?? null
+    if (accountData.stats !== undefined) merged.stats = accountData.stats
 
     if (existingIndex !== -1) {
-      data.accounts[existingIndex] = updatedAccount
+      data.accounts[existingIndex] = merged
     } else {
-      data.accounts.push(updatedAccount)
+      data.accounts.push(merged)
     }
 
     await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
@@ -270,10 +279,48 @@ class DataPersistence {
       password: account.password,
       token: account.token,
       expires: account.expires,
-      proxy: account.proxy ?? null
+      proxy: account.proxy ?? null,
+      stats: account.stats ?? undefined
     }))
 
     await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
+    return true
+  }
+
+  /**
+   * 调度 per-account daily stats 持久化（debounce 5 秒）
+   * 高频 accumulateStats 调用合并为单次 I/O——重复调用替换上一个 timer
+   * dataSaveMode='none' 时不写盘，返回 false
+   * @param {string} email - 邮箱
+   * @param {Object} stats - 完整 stats 对象 { chat: {input,output}, cli: {calls,input,output} }
+   * @returns {boolean} 是否调度成功
+   */
+  saveAccountStats(email, stats) {
+    if (config.dataSaveMode === 'none') {
+      return false
+    }
+    if (!email || !stats) {
+      return false
+    }
+
+    // 替换 pending payload 与 timer
+    this._statsPendingPayload.set(email, stats)
+    const prev = this._statsPersistTimers.get(email)
+    if (prev) clearTimeout(prev)
+
+    const timer = setTimeout(async () => {
+      this._statsPersistTimers.delete(email)
+      const payload = this._statsPendingPayload.get(email)
+      this._statsPendingPayload.delete(email)
+      if (!payload) return
+      try {
+        await this.saveAccount(email, { stats: payload })
+      } catch (error) {
+        logger.error(`stats 持久化失败 (${email})`, 'STATS', '', error)
+      }
+    }, STATS_PERSIST_DEBOUNCE_MS)
+
+    this._statsPersistTimers.set(email, timer)
     return true
   }
 

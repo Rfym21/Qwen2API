@@ -1,6 +1,25 @@
 const axios = require('axios')
 const { logger } = require('../utils/logger')
+const accountManager = require('../utils/account')
 const { getProxyAgent, getCliBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
+
+/**
+ * 静默累计 CLI daily stats——异常不影响响应
+ * @param {string} email - 账户邮箱
+ * @param {Object} usage - upstream usage { prompt_tokens, completion_tokens }
+ */
+const attributeCliUsage = (email, usage) => {
+    if (!email) return
+    try {
+        accountManager.accumulateStats(email, 'cli', {
+            calls: 1,
+            input: Number(usage?.prompt_tokens) || 0,
+            output: Number(usage?.completion_tokens) || 0
+        })
+    } catch (e) {
+        // 静默
+    }
+}
 
 const MODEL_REDIRECT = {
     'qwen3.5-plus': 'coder-model',
@@ -333,6 +352,8 @@ const handleCliChatCompletion = async (req, res) => {
                 requestBody: body,
                 details: errorDetails
             })
+            // HTTP 4xx/5xx——仅刷新 warn 指示, 不影响 cooldown（账户本身有效, 是上游主动拒绝）
+            accountManager.recordAccountError(req.account.email, response.status)
             return res.status(response.status).json({
                 error: {
                     message: `api_error`,
@@ -345,19 +366,43 @@ const handleCliChatCompletion = async (req, res) => {
 
         // 处理流式响应
         if (isStream) {
-            // 逐行转发，确保始终输出标准 SSE 片段
+            // 缓冲 SSE 解析——usage 帧可能跨 TCP 块（仅 split('\n\n') 会丢失），
+            // 沿用 chat.js/anthropic.js 的 buffer + while indexOf('\n\n') 模式
+            let sseBuffer = ''
+            let cliUsage = null
+
             response.data.on('data', (chunk) => {
                 const text = chunk.toString('utf8')
+                // 透传客户端: 逐行回写，保持原有行为
                 const lines = text.split('\n')
                 for (const line of lines) {
                     if (!line || !line.startsWith('data:')) continue
                     res.write(`${line}\n\n`)
+                }
+
+                // 解析 usage 帧（带缓冲——帧可能被分块切开）
+                sseBuffer += text
+                let idx
+                while ((idx = sseBuffer.indexOf('\n\n')) !== -1) {
+                    const frame = sseBuffer.slice(0, idx)
+                    sseBuffer = sseBuffer.slice(idx + 2)
+                    if (!frame.startsWith('data:')) continue
+                    const payload = frame.slice(frame.indexOf(':') + 1).trim()
+                    if (!payload || payload === '[DONE]') continue
+                    try {
+                        const parsed = JSON.parse(payload)
+                        if (parsed?.usage) cliUsage = parsed.usage
+                    } catch (e) {
+                        // 部分/非法 JSON——继续累计
+                    }
                 }
             })
 
             // 处理流错误
             response.data.on('error', (streamError) => {
                 logger.error(`CLI请求使用账号[${req.account.email}]流式传输失败 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌')
+                // 传输错误——记 failure（影响 cooldown）
+                accountManager.recordAccountFailure(req.account.email, streamError?.code)
                 if (!res.headersSent) {
                     res.status(500).json({
                         error: {
@@ -372,18 +417,27 @@ const handleCliChatCompletion = async (req, res) => {
             // 处理流结束
             response.data.on('end', () => {
                 logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+                attributeCliUsage(req.account.email, cliUsage)
                 res.end()
             })
         } else {
             // 处理JSON响应
+            const cliUsage = response.data?.usage
             res.json(formatCliJsonResponse(response.data, body.model))
             logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (JSON) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+            attributeCliUsage(req.account.email, cliUsage)
         }
     } catch (error) {
         logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥', {
             requestBody: body,
             ...(await buildCliAxiosErrorLog(error))
         })
+        // catch 路径——区分传输错误（cooldown）与 HTTP 错误（warn-only）
+        if (error?.response) {
+            accountManager.recordAccountError(req.account.email, error.response.status)
+        } else {
+            accountManager.recordAccountFailure(req.account.email, error?.code)
+        }
 
         // 如果是axios错误，提供更详细的错误信息
         if (error.response) {

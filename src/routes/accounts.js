@@ -606,4 +606,74 @@ router.post('/forceRefreshAllAccounts', adminKeyVerify, async (req, res) => {
 })
 
 
+/**
+ * GET /accountStats
+ * 返回 dashboard 用 daily stats + per-account status
+ * Status priority: cooldown > warn > token_expiring > active
+ *
+ * @returns {{
+ *   accounts: Array<{
+ *     email: string,
+ *     stats: { chat: {input,output}, cli: {calls,input,output} },
+ *     cliRequestNumber: number,
+ *     status: { kind: string, cooldownEndsAt: number|null, lastErrorAt: number|null, lastErrorCode: string|number|null }
+ *   }>,
+ *   cliQuotaLimit: number
+ * }}
+ */
+router.get('/accountStats', adminKeyVerify, async (req, res) => {
+  try {
+    const now = Date.now()
+    // 15 分钟 warn 窗口——recordError 写 lastErrorAt 后, UI 显示 🟡 warn 一段时间
+    const WARN_WINDOW_MS = 15 * 60 * 1000
+    // 6 小时——与 tokenManager.isTokenExpiringSoon default 一致
+    const TOKEN_EXPIRING_MS = 6 * 60 * 60 * 1000
+    // CLI 每日配额（与 routes/cli.chat.js:22 同步，dashboard 进度条用）
+    const CLI_QUOTA_LIMIT = 2000
+
+    const rotatorStats = accountManager.accountRotator.getStats()
+    const usageStats = rotatorStats.usageStats || {}
+
+    const accounts = accountManager.getAllAccountKeys().map(account => {
+      const email = account.email
+      const rotatorRecord = usageStats[email] || {}
+      const cooldownEndsAt = rotatorRecord.cooldownEndsAt || null
+      const lastErrorAt = rotatorRecord.lastErrorAt || null
+      const lastErrorCode = rotatorRecord.lastErrorCode || null
+
+      // 优先级：cooldown > warn > token_expiring > active
+      let kind = 'active'
+      if (cooldownEndsAt && now < cooldownEndsAt) {
+        kind = 'cooldown'
+      } else if (lastErrorAt && (now - lastErrorAt) < WARN_WINDOW_MS) {
+        kind = 'warn'
+      } else if (account.expires && (account.expires * 1000 - now) < TOKEN_EXPIRING_MS) {
+        // account.expires 是 UNIX seconds（JWT exp 直接保存）——*1000 得到 ms
+        // 直接对比 timestamp, 不调用 isTokenExpiringSoon(token)（后者接受 token 字符串而非 expires）
+        kind = 'token_expiring'
+      }
+
+      return {
+        email,
+        stats: account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } },
+        cliRequestNumber: account.cli_info?.request_number || 0,
+        status: {
+          kind,
+          cooldownEndsAt,
+          lastErrorAt,
+          lastErrorCode
+        }
+      }
+    })
+
+    res.json({
+      accounts,
+      cliQuotaLimit: CLI_QUOTA_LIMIT
+    })
+  } catch (error) {
+    logger.error('获取账户 stats 失败', 'ACCOUNT', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
 module.exports = router

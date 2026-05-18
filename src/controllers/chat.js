@@ -80,6 +80,23 @@ const buildRequiredRetryHint = (toolChoice) => {
  * @param {boolean} [options.has_tools] - 是否启用工具调用解析
  * @param {string|Object} [options.tool_choice] - OpenAI tool_choice 控制项
  */
+/**
+ * 安全累计 stats——任何异常都吞掉，不影响响应给客户端
+ * @param {Object} account - 当前账户对象（含 email）
+ * @param {Object} usage - { prompt_tokens, completion_tokens }
+ */
+const attributeChatUsage = (account, usage) => {
+    if (!account || !account.email || !usage) return
+    try {
+        accountManager.accumulateStats(account.email, 'chat', {
+            input: Number(usage.prompt_tokens) || 0,
+            output: Number(usage.completion_tokens) || 0
+        })
+    } catch (e) {
+        // 静默——stats 累计失败不应中断响应
+    }
+}
+
 const handleStreamResponse = async (res, response, enable_thinking, enable_web_search, requestBody = null, options = {}) => {
     try {
         const message_id = generateUUID()
@@ -369,6 +386,11 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
         totalTokens.total_tokens = totalTokens.prompt_tokens + totalTokens.completion_tokens
 
+        // Daily stats 累计——一次性归属到主请求账户
+        // 注：tool_choice=required retry 走的可能是另一个账户，但 retry 路径罕见，
+        // 全归属主账户是可接受的精度损失（PR #3wg.1 epic notes 已记）
+        attributeChatUsage(options.currentAccount, totalTokens)
+
         const finishReason = (toolParser && toolParser.hasEmittedAnyCall()) ? 'tool_calls' : 'stop'
         res.write(`data: ${JSON.stringify({
             "id": `chatcmpl-${message_id}`,
@@ -608,6 +630,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         totalTokens.completion_tokens = Math.max(0, totalTokens.completion_tokens || 0)
         totalTokens.total_tokens = totalTokens.prompt_tokens + totalTokens.completion_tokens
 
+        // Daily stats 累计——一次性归属到主请求账户（同 stream 分支注释）
+        attributeChatUsage(options.currentAccount, totalTokens)
+
         const assistantMessage = { role: 'assistant', content: assistantContent || null }
         if (toolCalls.length > 0) {
             assistantMessage.tool_calls = toolCalls
@@ -662,10 +687,10 @@ const handleChatCompletion = async (req, res) => {
 
         if (stream) {
             setResponseHeaders(res, true)
-            await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice })
+            await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice, currentAccount: response_data.currentAccount })
         } else {
             setResponseHeaders(res, false)
-            await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice })
+            await handleNonStreamResponse(res, response_data.response, enable_thinking, enable_web_search, model, req.body, { has_tools: req.has_tools, tool_choice: req.tool_choice, currentAccount: response_data.currentAccount })
         }
 
     } catch (error) {

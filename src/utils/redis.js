@@ -384,12 +384,23 @@ const getAllAccounts = async () => {
         logger.error(`账户 ${keys[index]} 数据为空`, 'REDIS')
         return null
       }
+      // stats 以 JSON 字符串存储于 HSET——malformed/missing 返回 undefined，由上层 ensureStats 补默认
+      let stats
+      if (accountData.stats) {
+        try {
+          stats = JSON.parse(accountData.stats)
+        } catch (parseError) {
+          logger.warn(`账户 ${keys[index]} stats JSON 解析失败，使用默认值: ${parseError.message}`, 'REDIS')
+          stats = undefined
+        }
+      }
       return {
         email: keys[index].replace('user:', ''),
         password: accountData.password || '',
         token: accountData.token || '',
         expires: accountData.expires || '',
-        proxy: accountData.proxy || null
+        proxy: accountData.proxy || null,
+        stats
       }
     }).filter(Boolean) // 过滤掉null值
 
@@ -411,13 +422,23 @@ const setAccount = async (key, value) => {
   try {
     const client = await ensureConnection()
 
-    const { password, token, expires, proxy } = value
-    await client.hset(`user:${key}`, {
-      password: password || '',
-      token: token || '',
-      expires: expires || '',
-      proxy: proxy || ''
-    })
+    const { password, token, expires, proxy, stats } = value
+
+    // 仅写入显式传入的字段——HSET 不影响其他字段，保留 MERGE 语义
+    // 这样 partial save（token refresh / proxy update）不会清零 daily stats
+    const payload = {}
+    if (password !== undefined) payload.password = password || ''
+    if (token !== undefined) payload.token = token || ''
+    if (expires !== undefined) payload.expires = expires || ''
+    if (proxy !== undefined) payload.proxy = proxy || ''
+    if (stats !== undefined) payload.stats = JSON.stringify(stats)
+
+    if (Object.keys(payload).length === 0) {
+      logger.warn(`账户 ${key} setAccount 收到空 payload，跳过写入`, 'REDIS')
+      return true
+    }
+
+    await client.hset(`user:${key}`, payload)
 
     logger.success(`账户 ${key} 设置成功`, 'REDIS')
     return true

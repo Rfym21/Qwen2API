@@ -94,14 +94,19 @@ const sendChatRequest = async (body) => {
             }
             const response = await axios.post(url, payload, requestConfig)
             if (response.status === 200) {
+                // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
+                // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
+                // 如果未来 retry 切换账号，需要在切换处更新 currentAccount 引用
                 return {
                     currentToken,
+                    currentAccount,
                     status: true,
                     response: response.data
                 }
             }
-            // 非 200 但是没抛 — 退出цикла, обрабатываем как неуспех ниже
+            // 非 200 但是没抛——退出循环, 走下面错误分类
             lastError = new Error(`Unexpected status ${response.status}`)
+            lastError.response = { status: response.status }
             break
         } catch (error) {
             lastError = error
@@ -121,10 +126,10 @@ const sendChatRequest = async (body) => {
     }
 
     // 所有尝试失败 — 分类错误
-    if (lastError) {
+    if (lastError && currentAccount?.email) {
         const hadHttpResponse = !!lastError.response
-        if (!hadHttpResponse && isRetryableNetworkError(lastError) && currentAccount?.email) {
-            // 传输层失败耗尽重试 — 给账号记一次失败 (cooldown 由 account-rotator 处理)
+        if (!hadHttpResponse && isRetryableNetworkError(lastError)) {
+            // 传输层失败耗尽重试——记 failure，累计可触发 cooldown（PR #112 语义）
             logger.error(
                 `聊天请求传输失败 (已尝试 ${totalAttempts} 次): ${lastError.message}`,
                 'REQUEST'
@@ -134,11 +139,15 @@ const sendChatRequest = async (body) => {
                 'ACCOUNT',
                 '⏳'
             )
-            accountManager.recordAccountFailure(currentAccount.email)
+            accountManager.recordAccountFailure(currentAccount.email, lastError.code)
         } else {
-            // 收到 HTTP 响应 (上游问题, 不是账号问题) — 不影响 cooldown
+            // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown
+            const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
+            accountManager.recordAccountError(currentAccount.email, status)
         }
+    } else if (lastError) {
+        logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
     }
 
     return {
