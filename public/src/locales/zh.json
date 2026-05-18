@@ -65,6 +65,8 @@
       "cliToday": "今日 CLI",
       "calls": "次调用",
       "cliSuccess": "成功",
+      "unitK": "k",
+      "unitM": "M",
       "status": {
         "active": "活跃",
         "warn": "最近有错误 ({code}, {ago}前)",

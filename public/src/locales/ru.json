@@ -65,6 +65,8 @@
       "cliToday": "CLI (сегодня)",
       "calls": "запросов",
       "cliSuccess": "успешно",
+      "unitK": "к",
+      "unitM": "M",
       "status": {
         "active": "Активен",
         "warn": "Недавние ошибки ({code}, {ago} назад)",

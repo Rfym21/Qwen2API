@@ -207,24 +207,41 @@
                 <div class="flex items-baseline justify-between gap-2">
                   <span class="text-gray-600">{{ t('dash.acct.chatToday') }}:</span>
                   <span class="font-medium text-gray-800 text-xs md:text-sm">
-                    {{ getAccountStats(token.email).chat.input }} in / {{ getAccountStats(token.email).chat.output }} out
+                    <span :title="String(getAccountStats(token.email).chat.input)">{{ formatCompact(getAccountStats(token.email).chat.input) }}</span>
+                    in /
+                    <span :title="String(getAccountStats(token.email).chat.output)">{{ formatCompact(getAccountStats(token.email).chat.output) }}</span>
+                    out
                   </span>
                 </div>
-                <div class="flex items-baseline justify-between gap-2">
-                  <span class="text-gray-600">{{ t('dash.acct.cliToday') }}:</span>
-                  <span class="font-medium text-gray-800 text-xs md:text-sm">
-                    {{ getCliRequestNumber(token.email) }} / {{ cliQuotaLimit }} {{ t('dash.acct.calls') }}
-                    <span class="text-xs opacity-60">({{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }})</span>
+                <button type="button"
+                        @click="toggleCliExpanded"
+                        class="flex items-baseline justify-between gap-2 w-full text-left focus:outline-none">
+                  <span class="text-gray-600 border-b border-dotted border-gray-400 hover:text-gray-800 transition-colors">
+                    {{ t('dash.acct.cliToday') }}:
                   </span>
-                </div>
-                <div class="h-2 bg-gray-200/60 rounded-full overflow-hidden">
-                  <div :style="{ width: getCliProgressPct(token.email) + '%' }"
-                       :class="getCliProgressColor(token.email)"
-                       class="h-full transition-all duration-300"></div>
-                </div>
-                <div class="text-xs text-gray-500 text-right">
-                  {{ getAccountStats(token.email).cli.input }} in / {{ getAccountStats(token.email).cli.output }} out
-                </div>
+                  <span class="font-medium text-gray-800 text-xs md:text-sm flex items-center gap-1">
+                    <span>{{ getCliRequestNumber(token.email) }} / {{ cliQuotaLimit }} {{ t('dash.acct.calls') }}</span>
+                    <span class="text-xs text-gray-400 transition-transform duration-200" :class="{ 'rotate-90': cliExpanded }">▸</span>
+                  </span>
+                </button>
+                <transition name="fade">
+                  <div v-if="cliExpanded" class="space-y-1 pt-1">
+                    <div class="text-xs text-gray-500 text-right">
+                      {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
+                    </div>
+                    <div class="h-2 bg-gray-200/60 rounded-full overflow-hidden">
+                      <div :style="{ width: getCliProgressPct(token.email) + '%' }"
+                           :class="getCliProgressColor(token.email)"
+                           class="h-full transition-all duration-300"></div>
+                    </div>
+                    <div class="text-xs text-gray-500 text-right">
+                      <span :title="String(getAccountStats(token.email).cli.input)">{{ formatCompact(getAccountStats(token.email).cli.input) }}</span>
+                      in /
+                      <span :title="String(getAccountStats(token.email).cli.output)">{{ formatCompact(getAccountStats(token.email).cli.output) }}</span>
+                      out
+                    </div>
+                  </div>
+                </transition>
               </div>
 
               <div class="pt-4 mt-auto border-t border-gray-200/50">
@@ -577,6 +594,27 @@ const getCliProgressColor = (email) => {
   if (pct >= 80) return 'bg-red-500'
   if (pct >= 50) return 'bg-amber-500'
   return 'bg-emerald-500'
+}
+
+// Compact number formatting (Qwen2API-j7x): 415575 → '415к', 1500 → '1.5к', 1500000 → '1.5M'.
+// <1000 — as is. Tooltip с полным значением применяется на уровне шаблона.
+const formatCompact = (n) => {
+  const num = Number(n) || 0
+  if (num < 1000) return String(num)
+  if (num < 1_000_000) {
+    const k = num / 1000
+    const formatted = k >= 100 ? Math.round(k) : (Math.round(k * 10) / 10)
+    return `${formatted}${t('dash.acct.unitK')}`
+  }
+  const m = num / 1_000_000
+  return `${Math.round(m * 10) / 10}${t('dash.acct.unitM')}`
+}
+
+// CLI accordion (Qwen2API-ao2): свёрнут по умолчанию, состояние общее для всех карточек в localStorage.
+const cliExpanded = ref(localStorage.getItem('cliExpanded') === '1')
+const toggleCliExpanded = () => {
+  cliExpanded.value = !cliExpanded.value
+  localStorage.setItem('cliExpanded', cliExpanded.value ? '1' : '0')
 }
 
 // Per-account status indicator (Qwen2API-3wg.3)
