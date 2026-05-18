@@ -676,4 +676,105 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
   }
 })
 
+/**
+ * GET /statsHistory
+ * 返回 dashboard /statistics 用 — 历史每日 token 消耗 (90 天 retention).
+ * 今日数据合并自 account.stats (live counter) 到 history[today]，
+ * 避免新部署后首日 UI 全空。
+ *
+ * Known edge-case: a ~5 s window at 00:00 between resetting stats=0 and
+ * writing statsHistory[yesterday] via saveAllAccounts — a brief "sag"
+ * once per day. Not patched (seconds, once per day).
+ *
+ * @returns {{
+ *   today: string,                            // YYYY-MM-DD in server TZ
+ *   accounts: Array<{
+ *     email: string,
+ *     history: Record<string, { chat: {input,output}, cli: {calls,input,output} }>
+ *   }>
+ * }}
+ */
+router.get('/statsHistory', adminKeyVerify, async (req, res) => {
+  try {
+    // today is the same helper used by the archival routine (paired with
+    // _getYesterdayKey). The frontend MUST build ranges (currentMonth /
+    // prevMonth / last90) off this value, not new Date() — otherwise
+    // differing browser/container TZs can shift month boundaries.
+    const today = accountManager.getTodayKey()
+
+    const accounts = accountManager.getAllAccountKeys().map(account => {
+      // Deep copy of history: the 5 s window at 00:00 has _resetDailyCounters
+      // mutating nested chat/cli entries; a shallow top-level copy does not
+      // protect against that. The deep copy avoids handing the client a
+      // half-reset snapshot.
+      const history = {}
+      const src = account.statsHistory || {}
+      for (const key of Object.keys(src)) {
+        const entry = src[key] || {}
+        const chat = entry.chat || {}
+        const cli = entry.cli || {}
+        history[key] = {
+          chat: { input: Number(chat.input) || 0, output: Number(chat.output) || 0 },
+          cli: {
+            calls: Number(cli.calls) || 0,
+            input: Number(cli.input) || 0,
+            output: Number(cli.output) || 0
+          }
+        }
+      }
+
+      // Today is the live counter from account.stats.
+      // Deep copy of chat/cli — otherwise a concurrent accumulateStats call
+      // may mutate the object already handed out.
+      const s = account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } }
+      history[today] = {
+        chat: { input: Number(s.chat?.input) || 0, output: Number(s.chat?.output) || 0 },
+        cli: {
+          calls: Number(s.cli?.calls) || 0,
+          input: Number(s.cli?.input) || 0,
+          output: Number(s.cli?.output) || 0
+        }
+      }
+
+      return { email: account.email, history }
+    })
+
+    res.json({ today, accounts })
+  } catch (error) {
+    logger.error('获取 statsHistory 失败', 'ACCOUNT', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+/**
+ * POST /debug/archiveYesterday
+ * Debug-only: manual trigger for the archival/reset routine (used while
+ * smoke-testing the storage layer).
+ *
+ * Registered ONLY when ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
+ * NODE_ENV is intentionally NOT used — this repo does not set it
+ * (src/start.js, ecosystem.config.js), so 'production' cannot be guaranteed.
+ *
+ * In any normal (including production) configuration the route is absent —
+ * POST returns 404. Caveat: GET on any unknown path falls into app.get('*')
+ * and returns the SPA with status 200, so always verify route absence with
+ * `-X POST`.
+ */
+if (process.env.ENABLE_STATS_DEBUG_ARCHIVE === 'true') {
+  router.post('/debug/archiveYesterday', adminKeyVerify, async (req, res) => {
+    try {
+      await accountManager.archiveYesterdayForTest()
+      res.json({ ok: true, archivedAt: new Date().toISOString() })
+    } catch (error) {
+      // The readiness guard inside archiveYesterdayForTest throws with this message.
+      if (error && error.message && error.message.includes('not initialized')) {
+        return res.status(503).json({ error: 'account manager not initialized, try again' })
+      }
+      logger.error('debug/archiveYesterday 失败', 'ACCOUNT', '', error)
+      res.status(500).json({ error: error.message })
+    }
+  })
+  logger.info('已启用 debug/archiveYesterday 端点 (ENABLE_STATS_DEBUG_ARCHIVE=true)', 'ACCOUNT')
+}
+
 module.exports = router
