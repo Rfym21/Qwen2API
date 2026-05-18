@@ -64,7 +64,16 @@
       "chatToday": "今日 Chat",
       "cliToday": "今日 CLI",
       "calls": "次调用",
-      "cliSuccess": "成功"
+      "cliSuccess": "成功",
+      "status": {
+        "active": "活跃",
+        "warn": "最近有错误 ({code}, {ago}前)",
+        "warnNoCode": "最近有错误 ({ago}前)",
+        "cooldown": "冷却中 (剩余 {until})",
+        "tokenExpiring": "Token 即将过期",
+        "unitSec": "秒",
+        "unitMin": "分"
+      }
     }
   },
   "msg": {

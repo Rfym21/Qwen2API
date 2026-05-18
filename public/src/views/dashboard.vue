@@ -140,7 +140,10 @@
           <div v-for="token in displayedTokens"
                :key="token.email"
                class="token-card group relative overflow-hidden rounded-2xl transition-all duration-300 hover:shadow-2xl pt-4"
-               :class="{'ring-2 ring-indigo-500 ring-opacity-75': isSelected(token.email)}">
+               :class="[
+                 { 'ring-2 ring-indigo-500 ring-opacity-75': isSelected(token.email) },
+                 { 'opacity-60 grayscale': isOnCooldown(token.email) }
+               ]">
             <div class="absolute top-3 left-3 z-10">
               <label class="custom-checkbox cursor-pointer">
                 <input type="checkbox"
@@ -153,6 +156,12 @@
                   </svg>
                 </div>
               </label>
+            </div>
+            <div class="absolute top-3 right-3 z-10 flex items-center gap-1 text-lg leading-none select-none"
+                 :title="getStatusTooltip(token.email)">
+              <span>{{ getStatusEmoji(token.email) }}</span>
+              <span v-if="isOnCooldown(token.email)"
+                    class="text-sm font-mono text-gray-700">{{ getCountdown(token.email) }}</span>
             </div>
             <div class="absolute inset-0 bg-white/30 backdrop-blur-md border border-white/30"></div>
             <div class="relative p-6 flex flex-col gap-4">
@@ -494,7 +503,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
 import LangSwitcher from '../components/LangSwitcher.vue'
@@ -570,6 +579,64 @@ const getCliProgressColor = (email) => {
   return 'bg-emerald-500'
 }
 
+// Per-account status indicator (Qwen2API-3wg.3)
+const STATUS_EMOJI = Object.freeze({
+  active: '🟢',
+  warn: '🟡',
+  cooldown: '🔴',
+  token_expiring: '🪫'
+})
+const nowTick = ref(Date.now())
+let tickInterval = null
+// Map<email, cooldownEndsAt> — refetch suppression per-account.
+// Single global flag would block refetch for other accounts after first expiry.
+const cooldownRefetched = new Map()
+
+const getStatusKind = (email) => accountStats.value[email]?.status?.kind || 'active'
+const getStatusEmoji = (email) => STATUS_EMOJI[getStatusKind(email)] || STATUS_EMOJI.active
+const isOnCooldown = (email) => {
+  const s = accountStats.value[email]?.status
+  return s?.kind === 'cooldown' && typeof s?.cooldownEndsAt === 'number'
+}
+
+const formatAgo = (ms) => {
+  const sec = Math.max(0, Math.floor(ms / 1000))
+  if (sec < 60) return `${sec} ${t('dash.acct.status.unitSec')}`
+  return `${Math.floor(sec / 60)} ${t('dash.acct.status.unitMin')}`
+}
+
+const formatCountdown = (ms) => {
+  const sec = Math.max(0, Math.floor(ms / 1000))
+  const mm = String(Math.floor(sec / 60)).padStart(2, '0')
+  const ss = String(sec % 60).padStart(2, '0')
+  return `${mm}:${ss}`
+}
+
+const getCountdown = (email) => {
+  const s = accountStats.value[email]?.status
+  if (s?.kind !== 'cooldown' || typeof s?.cooldownEndsAt !== 'number') return ''
+  return formatCountdown(s.cooldownEndsAt - nowTick.value)
+}
+
+const getStatusTooltip = (email) => {
+  const s = accountStats.value[email]?.status
+  const kind = s?.kind || 'active'
+  if (kind === 'cooldown' && typeof s?.cooldownEndsAt === 'number') {
+    return t('dash.acct.status.cooldown', { until: formatCountdown(s.cooldownEndsAt - nowTick.value) })
+  }
+  if (kind === 'warn') {
+    const ago = typeof s?.lastErrorAt === 'number' ? formatAgo(nowTick.value - s.lastErrorAt) : ''
+    if (s?.lastErrorCode !== null && s?.lastErrorCode !== undefined && s?.lastErrorCode !== '') {
+      return t('dash.acct.status.warn', { code: s.lastErrorCode, ago })
+    }
+    return t('dash.acct.status.warnNoCode', { ago })
+  }
+  if (kind === 'token_expiring') {
+    return t('dash.acct.status.tokenExpiring')
+  }
+  return t('dash.acct.status.active')
+}
+
 const fetchAccountStats = async () => {
   try {
     const res = await axios.get('/api/accountStats', {
@@ -583,10 +650,35 @@ const fetchAccountStats = async () => {
     if (typeof res.data?.cliQuotaLimit === 'number' && res.data.cliQuotaLimit > 0) {
       cliQuotaLimit.value = res.data.cliQuotaLimit
     }
+    // Drop suppression entries where account is no longer in cooldown OR
+    // cooldownEndsAt changed (new cooldown cycle → must allow refetch again).
+    for (const [email, cachedEndsAt] of cooldownRefetched) {
+      const s = map[email]?.status
+      if (s?.kind !== 'cooldown' || s?.cooldownEndsAt !== cachedEndsAt) {
+        cooldownRefetched.delete(email)
+      }
+    }
   } catch (error) {
     console.error('fetchAccountStats error:', error)
   }
 }
+
+// Auto-refetch when any account's cooldown expires (per-account suppression via Map).
+// Marks every expired-but-not-yet-refetched account in the suppression Map, then
+// fires a single fetchAccountStats (one call refreshes status for all accounts).
+watch([nowTick, accountStats], () => {
+  const stats = accountStats.value
+  let shouldRefetch = false
+  for (const email of Object.keys(stats)) {
+    const s = stats[email]?.status
+    if (s?.kind !== 'cooldown' || typeof s?.cooldownEndsAt !== 'number') continue
+    if (nowTick.value >= s.cooldownEndsAt && cooldownRefetched.get(email) !== s.cooldownEndsAt) {
+      cooldownRefetched.set(email, s.cooldownEndsAt)
+      shouldRefetch = true
+    }
+  }
+  if (shouldRefetch) fetchAccountStats()
+})
 
 // Toast 通知
 const toast = ref({
@@ -1064,6 +1156,8 @@ onMounted(() => {
   getTokens()
   fetchAccountStats()
   statsInterval.value = setInterval(fetchAccountStats, 30000)
+  // 1s tick drives countdown rerender and cooldown-expiry watcher.
+  tickInterval = setInterval(() => { nowTick.value = Date.now() }, 1000)
 })
 
 onBeforeUnmount(() => {
@@ -1071,6 +1165,10 @@ onBeforeUnmount(() => {
   if (statsInterval.value) {
     clearInterval(statsInterval.value)
     statsInterval.value = null
+  }
+  if (tickInterval) {
+    clearInterval(tickInterval)
+    tickInterval = null
   }
 })
 </script>
