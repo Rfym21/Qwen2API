@@ -63,6 +63,71 @@ class DataPersistence {
   }
 
   /**
+   * 加载运行时设置（chat retry config 等）
+   * 在 'none' 模式下返回 {}, 因为没有可写存储
+   * @returns {Promise<Object>} 设置对象 (空对象表示无сохранённых значений)
+   */
+  async loadSettings() {
+    try {
+      switch (config.dataSaveMode) {
+        case 'redis':
+          return (await redisClient.getSettings()) || {}
+        case 'file':
+          return await this._loadSettingsFromFile()
+        case 'none':
+          return {}
+        default:
+          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
+          return {}
+      }
+    } catch (error) {
+      logger.error('加载运行时设置失败', 'DATA', '', error)
+      return {}
+    }
+  }
+
+  /**
+   * 保存运行时设置（部分合并）
+   * @param {Object} partial - 要写入的字段
+   * @returns {Promise<boolean>} 保存是否成功
+   */
+  async saveSettings(partial) {
+    try {
+      switch (config.dataSaveMode) {
+        case 'redis':
+          return await redisClient.setSettings(partial)
+        case 'file':
+          return await this._saveSettingsToFile(partial)
+        case 'none':
+          logger.warn('环境变量模式不支持保存运行时设置', 'DATA')
+          return false
+        default:
+          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
+          return false
+      }
+    } catch (error) {
+      logger.error('保存运行时设置失败', 'DATA', '', error)
+      return false
+    }
+  }
+
+  async _loadSettingsFromFile() {
+    await this._ensureDataFileExists()
+    const fileContent = await fs.readFile(this.dataFilePath, 'utf-8')
+    const data = JSON.parse(fileContent)
+    return (data.settings && typeof data.settings === 'object') ? data.settings : {}
+  }
+
+  async _saveSettingsToFile(partial) {
+    await this._ensureDataFileExists()
+    const fileContent = await fs.readFile(this.dataFilePath, 'utf-8')
+    const data = JSON.parse(fileContent)
+    data.settings = { ...(data.settings || {}), ...partial }
+    await fs.writeFile(this.dataFilePath, JSON.stringify(data, null, 2), 'utf-8')
+    return true
+  }
+
+  /**
    * 批量保存账户数据
    * @param {Array} accounts - 账户列表
    * @returns {Promise<boolean>} 保存是否成功

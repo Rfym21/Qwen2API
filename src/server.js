@@ -4,6 +4,7 @@ const config = require('./config/index.js')
 const cors = require('cors')
 const { logger } = require('./utils/logger')
 const { initSsxmodManager } = require('./utils/ssxmod-manager')
+const DataPersistence = require('./utils/data-persistence')
 const app = express()
 const path = require('path')
 const fs = require('fs')
@@ -66,16 +67,38 @@ const serverInfo = {
   enableFileLog: config.enableFileLog
 }
 
-if (config.listenAddress) {
-  app.listen(config.listenPort, config.listenAddress, () => {
-    logger.server('服务器启动成功', 'SERVER', serverInfo)
-    logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-    logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
-  })
-} else {
-  app.listen(config.listenPort, () => {
-    logger.server('服务器启动成功', 'SERVER', serverInfo)
-    logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-    logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
-  })
+// 应用持久化的运行时设置（web UI > env > hardcoded default）
+// Web UI 可覆盖 chatRetryCount / chatRetryBackoffMs; env в config/index.js — baseline
+const applyPersistedSettings = async () => {
+  try {
+    const persisted = await new DataPersistence().loadSettings()
+    if (persisted.chatRetryCount !== undefined && persisted.chatRetryCount !== '') {
+      const v = parseInt(persisted.chatRetryCount, 10)
+      if (!isNaN(v) && v >= 0) config.chatRetryCount = v
+    }
+    if (persisted.chatRetryBackoffMs !== undefined && persisted.chatRetryBackoffMs !== '') {
+      const v = parseInt(persisted.chatRetryBackoffMs, 10)
+      if (!isNaN(v) && v >= 0) config.chatRetryBackoffMs = v
+    }
+  } catch (err) {
+    logger.warn('加载持久化设置失败, 使用 env/默认值', 'CONFIG', '', err.message)
+  }
 }
+
+const startServer = () => {
+  if (config.listenAddress) {
+    app.listen(config.listenPort, config.listenAddress, () => {
+      logger.server('服务器启动成功', 'SERVER', serverInfo)
+      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
+      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+    })
+  } else {
+    app.listen(config.listenPort, () => {
+      logger.server('服务器启动成功', 'SERVER', serverInfo)
+      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
+      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+    })
+  }
+}
+
+applyPersistedSettings().finally(startServer)

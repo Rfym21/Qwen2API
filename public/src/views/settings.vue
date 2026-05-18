@@ -134,6 +134,23 @@
                                 class="w-full mt-2 bg-black text-white rounded-lg py-2 hover:bg-white hover:text-black border border-black transition-all duration-300">{{ t('settings.save') }}</button>
                         </div>
                     </div>
+                    <!-- 聊天请求 retry 配置 -->
+                    <div class="setting-card relative overflow-hidden rounded-2xl p-6 flex flex-col gap-4">
+                        <div class="absolute inset-0 bg-white/30 backdrop-blur-md border border-white/30 rounded-2xl">
+                        </div>
+                        <div class="relative flex flex-col gap-2">
+                            <label class="text-gray-700 font-semibold">{{ t('settings.retryTitle') }}</label>
+                            <label class="text-gray-700">{{ t('settings.retryCountLabel') }}</label>
+                            <input v-model.number="settings.chatRetryCount" type="number" min="0" max="10"
+                                class="mt-1 block w-full rounded-xl border-gray-300 bg-white/60 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4">
+                            <label class="text-gray-700">{{ t('settings.retryBackoffLabel') }}</label>
+                            <input v-model.number="settings.chatRetryBackoffMs" type="number" min="0" max="60000"
+                                class="mt-1 block w-full rounded-xl border-gray-300 bg-white/60 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 transition-all duration-300 h-12 text-base px-4">
+                            <span class="text-xs text-gray-500">{{ t('settings.retryHint') }}</span>
+                            <button @click="saveRetryConfig"
+                                class="w-full mt-2 bg-black text-white rounded-lg py-2 hover:bg-white hover:text-black border border-black transition-all duration-300">{{ t('settings.save') }}</button>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -179,7 +196,9 @@ const settings = ref({
     batchLoginConcurrency: 5,
     outThink: false,
     searchInfoMode: 'table',
-    simpleModelMap: false
+    simpleModelMap: false,
+    chatRetryCount: 1,
+    chatRetryBackoffMs: 400
 })
 
 const showAddKeyModal = ref(false)
@@ -203,6 +222,8 @@ const loadSettings = async () => {
         settings.value.outThink = res.data.outThink
         settings.value.searchInfoMode = res.data.searchInfoMode
         settings.value.simpleModelMap = res.data.simpleModelMap
+        if (res.data.chatRetryCount !== undefined) settings.value.chatRetryCount = res.data.chatRetryCount
+        if (res.data.chatRetryBackoffMs !== undefined) settings.value.chatRetryBackoffMs = res.data.chatRetryBackoffMs
     } catch (error) {
         console.error('loadSettings error:', error)
     }
@@ -271,6 +292,19 @@ const saveSimpleModelMap = async () => {
         alert(t('smsg.simpleMapSaved'))
     } catch (error) {
         alert(t('smsg.simpleMapFailed') + error.message)
+    }
+}
+const saveRetryConfig = async () => {
+    try {
+        await axios.post('/api/setRetryConfig', {
+            chatRetryCount: settings.value.chatRetryCount,
+            chatRetryBackoffMs: settings.value.chatRetryBackoffMs
+        }, {
+            headers: { 'Authorization': localStorage.getItem('apiKey') || '' }
+        })
+        alert(t('smsg.retrySaved'))
+    } catch (error) {
+        alert(t('smsg.retryFailed') + (error.response?.data?.error || error.message))
     }
 }
 
