@@ -394,13 +394,24 @@ const getAllAccounts = async () => {
           stats = undefined
         }
       }
+      // statsHistory is stored as a JSON string in HSET; malformed/missing → undefined, ensureStats fills {} upstream
+      let statsHistory
+      if (accountData.statsHistory) {
+        try {
+          statsHistory = JSON.parse(accountData.statsHistory)
+        } catch (parseError) {
+          logger.warn(`账户 ${keys[index]} statsHistory JSON 解析失败，使用默认值: ${parseError.message}`, 'REDIS')
+          statsHistory = undefined
+        }
+      }
       return {
         email: keys[index].replace('user:', ''),
         password: accountData.password || '',
         token: accountData.token || '',
         expires: accountData.expires || '',
         proxy: accountData.proxy || null,
-        stats
+        stats,
+        statsHistory
       }
     }).filter(Boolean) // 过滤掉null值
 
@@ -422,7 +433,7 @@ const setAccount = async (key, value) => {
   try {
     const client = await ensureConnection()
 
-    const { password, token, expires, proxy, stats } = value
+    const { password, token, expires, proxy, stats, statsHistory } = value
 
     // 仅写入显式传入的字段——HSET 不影响其他字段，保留 MERGE 语义
     // 这样 partial save（token refresh / proxy update）不会清零 daily stats
@@ -432,6 +443,7 @@ const setAccount = async (key, value) => {
     if (expires !== undefined) payload.expires = expires || ''
     if (proxy !== undefined) payload.proxy = proxy || ''
     if (stats !== undefined) payload.stats = JSON.stringify(stats)
+    if (statsHistory !== undefined) payload.statsHistory = JSON.stringify(statsHistory)
 
     if (Object.keys(payload).length === 0) {
       logger.warn(`账户 ${key} setAccount 收到空 payload，跳过写入`, 'REDIS')
@@ -475,7 +487,7 @@ const SETTINGS_KEY = 'qwen2api:settings'
 
 /**
  * 获取运行时设置
- * @returns {Promise<Object>} 设置对象 (字段类型 — string, 调用方ответственен за parseInt)
+ * @returns {Promise<Object>} 设置对象 (字段类型为 string，调用方需自行 parseInt)
  */
 const getSettings = async () => {
   try {
@@ -489,7 +501,7 @@ const getSettings = async () => {
 }
 
 /**
- * 保存运行时设置（部分合并 через hset）
+ * 保存运行时设置（通过 hset 部分合并）
  * @param {Object} partial - 字段
  * @returns {Promise<boolean>} 设置是否成功
  */

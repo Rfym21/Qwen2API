@@ -13,6 +13,7 @@
     "forceRefreshing": "Принудительное обновление...",
     "forceRefresh": "Принудительное обновление",
     "export": "Экспорт аккаунтов",
+    "statistics": "Статистика",
     "settings": "Настройки",
     "perPage": "На странице:",
     "totalItems": "Всего: {n}",
@@ -173,5 +174,33 @@
     "label": "🌐 Язык / Language",
     "ru": "Русский",
     "zh": "中文"
+  },
+  "stats": {
+    "title": "Статистика",
+    "loading": "Загрузка...",
+    "loadFailed": "Не удалось загрузить статистику: ",
+    "backToDashboard": "К аккаунтам",
+    "filter": {
+      "label": "Период",
+      "currentMonth": "Текущий месяц",
+      "prevMonth": "Прошлый месяц",
+      "last90": "Последние 90 дней"
+    },
+    "totals": {
+      "label": "Итог по всем аккаунтам",
+      "chatInput": "Chat вход",
+      "chatOutput": "Chat выход",
+      "cliInput": "CLI вход",
+      "cliOutput": "CLI выход",
+      "cliCalls": "CLI запросов"
+    },
+    "account": {
+      "label": "По аккаунтам",
+      "noData": "Нет данных за период"
+    },
+    "chart": {
+      "input": "Вход",
+      "output": "Выход"
+    }
   }
 }
