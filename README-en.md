@@ -1,7 +1,6 @@
-
 <div align="center">
 
-> [中文版本 / Chinese version](README.md)
+> [中文](README.md) | [🇷🇺 Русская версия](README-ru.md) | [English](README-en.md)
 
 # 🚀 Qwen-Proxy
 
