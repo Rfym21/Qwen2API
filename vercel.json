@@ -1,0 +1,7 @@
+{
+  "installCommand": "npm install && cd public && npm install && npm run build",
+  "buildCommand": null,
+  "outputDirectory": null,
+  "devCommand": null,
+  "framework": "express"
+}
