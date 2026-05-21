@@ -1,0 +1,15 @@
+{
+    "i18n-ally.localesPaths": [
+        "public/src/locales"
+    ],
+    "i18n-ally.sourceLanguage": "zh",
+    "i18n-ally.displayLanguage": "zh",
+    "i18n-ally.keystyle": "nested",
+    "i18n-ally.enabledFrameworks": [
+        "vue"
+    ],
+    "i18n-ally.dirStructure": "file",
+    "i18n-ally.enabledParsers": [
+        "json"
+    ]
+}

@@ -6,10 +6,8 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     proxy: {
-      '/': {
-        target: 'http://localhost:4000', // 实际后端地址
-        changeOrigin: true,
-      }
+      '/verify': 'http://localhost:3000',
+      '/api': 'http://localhost:3000'
     }
   }
 })

@@ -12,8 +12,8 @@ const buildPublicModelData = (model, suffix = '') => {
     const upstreamModelID = String(model?.id || '')
     const displayModelID = String(model?.name || model?.id || '')
 
-    modelData.id = `${displayModelID}${suffix}`
-    modelData.name = `${upstreamModelID}${suffix}`
+    modelData.name = `${displayModelID}${suffix}`
+    modelData.id = `${upstreamModelID}${suffix}`
     modelData.upstream_id = upstreamModelID
     modelData.display_name = displayModelID
 
