@@ -18,7 +18,7 @@ const detectLocale = () => {
   }
 
   const full = navigator.language;
-  const code = navLang.split('-')[0];
+  const code = full.split('-')[0];
 
   return code in messages ? code : fallbackLocale;
 }
