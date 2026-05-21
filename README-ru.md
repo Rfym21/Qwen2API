@@ -1,6 +1,6 @@
-> [🇨🇳 中文版 / Chinese version](README.md)
-
 <div align="center">
+
+> [中文](README.md) | [🇷🇺 Русская версия](README-ru.md) | [English](README-en.md)
 
 # 🚀 Qwen-Proxy
 
@@ -291,6 +291,20 @@ npm run dev
 <div>
 <img src="./docs/images/hf.png" alt="Hugging Face Deployment" width="600">
 </div>
+
+### ☁️ Развертывание на Vercel
+
+Быстрое развертывание на Vercel:
+
+[![Развернуть с Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
+
+Необходимо настроить переменные окружения:
+```
+ACCOUNTS=email:password
+SERVICE_PORT=80
+API_KEY=sk-xxx
+DATA_SAVE_MODE=none
+```
 
 ---
 
