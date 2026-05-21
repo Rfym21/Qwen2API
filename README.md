@@ -272,6 +272,21 @@ npm run dev
 <img src="./docs/images/hf.png" alt="Hugging Face Deployment" width="600">
 </div>
 
+### ☁️ Vercel 部署
+
+快速部署到 Vercel：
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
+
+需要配置环境变量：
+```
+ACCOUNTS=email:password
+SERVICE_PORT=80
+API_KEY=sk-xxx
+DATA_SAVE_MODE=none
+```
+
+
 ---
 
 ## 📁 项目结构
