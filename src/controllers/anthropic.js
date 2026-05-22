@@ -388,6 +388,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
   let blockIndex = -1;
   let textBlockOpen = false;
+  let thinkingBlockOpen = false;
   let promptTokens = 0;
   let completionTokens = 0;
 
@@ -404,12 +405,46 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   /**
+   * 关闭当前打开的思维块
+   */
+  const closeThinkingBlockIfOpen = () => {
+    if (thinkingBlockOpen) {
+      writeAnthropicEvent(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+      thinkingBlockOpen = false;
+    }
+  };
+
+  /**
+   * 输出一段思维增量；按需打开新思维块
+   * @param {string} thinking - 思维增量
+   */
+  const emitThinkingDelta = (thinking) => {
+    if (!thinking) return;
+    if (!thinkingBlockOpen) {
+      closeTextBlockIfOpen();
+      blockIndex += 1;
+      writeAnthropicEvent(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: blockIndex,
+        content_block: { type: 'thinking', thinking: '' }
+      });
+      thinkingBlockOpen = true;
+    }
+    writeAnthropicEvent(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: blockIndex,
+      delta: { type: 'thinking_delta', thinking }
+    });
+  };
+
+  /**
    * 输出一段文本增量；按需打开新文本块
    * @param {string} text - 文本增量
    */
   const emitTextDelta = (text) => {
     if (!text) return;
     if (!textBlockOpen) {
+      closeThinkingBlockIfOpen();
       blockIndex += 1;
       writeAnthropicEvent(res, 'content_block_start', {
         type: 'content_block_start',
@@ -430,6 +465,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
    * @param {Object} call - 工具调用
    */
   const emitToolUse = (call) => {
+    closeThinkingBlockIfOpen();
     closeTextBlockIfOpen();
     blockIndex += 1;
     writeAnthropicEvent(res, 'content_block_start', {
@@ -451,7 +487,6 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let completionContent = '';
   let webSearchInfo = null;
   let thinkingStarted = false;
-  let thinkingEnded = false;
 
   /**
    * 处理一个上游 delta JSON
@@ -472,21 +507,26 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     let content = delta.content;
     completionContent += content;
 
-    if (delta.phase === 'think' && !thinkingStarted) {
-      thinkingStarted = true;
-      content = `<think>\n\n${content}`;
-    }
-    if (delta.phase === 'answer' && !thinkingEnded && thinkingStarted) {
-      thinkingEnded = true;
-      content = `\n\n</think>\n${content}`;
-    }
-
-    if (parser && delta.phase === 'answer') {
-      const parsed = parser.push(content);
-      if (parsed.textDelta) emitTextDelta(parsed.textDelta);
-      for (const call of parsed.completedCalls) emitToolUse(call);
-    } else {
-      emitTextDelta(content);
+    if (delta.phase === 'think') {
+      if (!thinkingStarted) {
+        thinkingStarted = true;
+        if (webSearchInfo) {
+          const config = require('../config/index.js');
+          try {
+            const searchTable = await accountManager.generateMarkdownTable(webSearchInfo, config.searchInfoMode);
+            emitThinkingDelta(searchTable + '\n\n');
+          } catch (_) {}
+        }
+      }
+      emitThinkingDelta(content);
+    } else if (delta.phase === 'answer') {
+      if (parser) {
+        const parsed = parser.push(content);
+        if (parsed.textDelta) emitTextDelta(parsed.textDelta);
+        for (const call of parsed.completedCalls) emitToolUse(call);
+      } else {
+        emitTextDelta(content);
+      }
     }
   };
 
@@ -512,6 +552,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     for (const call of tail.completedCalls) emitToolUse(call);
   }
 
+  closeThinkingBlockIfOpen();
   closeTextBlockIfOpen();
 
   const stopReason = (parser && parser.hasEmittedAnyCall()) ? 'tool_use' : 'end_turn';
@@ -544,14 +585,14 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const { message_id, model, hasTools, toolChoice, requestBody } = ctx;
 
-  let fullContent = '';
+  let thinkingContent = '';
+  let answerContent = '';
   let promptTokens = 0;
   let completionTokens = 0;
-  let thinkingStarted = false;
-  let thinkingEnded = false;
+  let webSearchInfo = null;
 
   /**
-   * 处理一个上游 delta JSON 并累积 fullContent
+   * 处理一个上游 delta JSON
    * @param {Object} json - 上游 SSE delta
    */
   const onUpstreamDelta = async (json) => {
@@ -561,24 +602,35 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       completionTokens = json.usage.completion_tokens || completionTokens;
     }
     const delta = json.choices[0].delta;
+    if (delta && delta.name === 'web_search') {
+      webSearchInfo = delta.extra?.web_search_info;
+    }
     if (!delta || !delta.content || (delta.phase !== 'think' && delta.phase !== 'answer')) return;
-    let content = delta.content;
-    if (delta.phase === 'think' && !thinkingStarted) {
-      thinkingStarted = true;
-      content = `<think>\n\n${content}`;
+    const content = delta.content;
+    if (delta.phase === 'think') {
+      thinkingContent += content;
+    } else if (delta.phase === 'answer') {
+      answerContent += content;
     }
-    if (delta.phase === 'answer' && !thinkingEnded && thinkingStarted) {
-      thinkingEnded = true;
-      content = `\n\n</think>\n${content}`;
-    }
-    fullContent += content;
   };
 
   await consumeUpstream(upstream, onUpstreamDelta);
 
+  if (webSearchInfo) {
+    const config = require('../config/index.js');
+    try {
+      const searchTable = await accountManager.generateMarkdownTable(webSearchInfo, config.searchInfoMode);
+      if (thinkingContent) {
+        thinkingContent = searchTable + '\n\n' + thinkingContent;
+      } else {
+        answerContent = searchTable + '\n\n' + answerContent;
+      }
+    } catch (_) {}
+  }
+
   let { cleanedText, toolCalls } = hasTools
-    ? parseToolCallsFromText(fullContent)
-    : { cleanedText: fullContent, toolCalls: [] };
+    ? parseToolCallsFromText(answerContent)
+    : { cleanedText: answerContent, toolCalls: [] };
 
   // required 重试
   if (hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)) {
@@ -586,13 +638,13 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     try {
       const retryResp = await sendChatRequest(appendRetryHint(requestBody, buildRetryHint(toolChoice)));
       if (retryResp.status && retryResp.response) {
-        const before = fullContent;
+        const before = answerContent;
         await consumeUpstream(retryResp.response, onUpstreamDelta);
-        const retried = fullContent.slice(before.length);
+        const retried = answerContent.slice(before.length);
         const parsedRetry = parseToolCallsFromText(retried);
         if (parsedRetry.toolCalls.length > 0) {
           toolCalls = parsedRetry.toolCalls;
-          cleanedText = parseToolCallsFromText(fullContent).cleanedText;
+          cleanedText = parseToolCallsFromText(answerContent).cleanedText;
         }
       }
     } catch (e) {
@@ -601,12 +653,15 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   }
 
   if (promptTokens === 0 && completionTokens === 0) {
-    const usage = createUsageObject(requestBody?.messages || '', fullContent, null);
+    const usage = createUsageObject(requestBody?.messages || '', thinkingContent + answerContent, null);
     promptTokens = usage.prompt_tokens || 0;
     completionTokens = usage.completion_tokens || 0;
   }
 
   const contentBlocks = [];
+  if (thinkingContent && thinkingContent.trim()) {
+    contentBlocks.push({ type: 'thinking', thinking: thinkingContent });
+  }
   if (cleanedText && cleanedText.trim()) {
     contentBlocks.push({ type: 'text', text: cleanedText });
   }
