@@ -493,7 +493,7 @@ const getSettings = async () => {
   try {
     const client = await ensureConnection()
     const data = await client.hgetall(SETTINGS_KEY)
-    return data && Object.keys(data).length > 0 ? data : {}
+    return JSON.parse(data.json)
   } catch (err) {
     logger.error('获取运行时设置失败', 'REDIS', '', err)
     return {}
@@ -508,11 +508,9 @@ const getSettings = async () => {
 const setSettings = async (partial) => {
   try {
     const client = await ensureConnection()
-    const stringified = {}
-    for (const [k, v] of Object.entries(partial || {})) {
-      stringified[k] = v === null || v === undefined ? '' : String(v)
+    const stringified = {
+      json: JSON.stringify(partial)
     }
-    if (Object.keys(stringified).length === 0) return true
     await client.hset(SETTINGS_KEY, stringified)
     return true
   } catch (err) {
