@@ -45,7 +45,9 @@ router.post('/addRegularKey', adminKeyVerify, async (req, res) => {
     // 添加到配置中
     config.apiKeys.push(apiKey)
 
-    res.json({ message: 'API Key添加成功' })
+    const persisted = await dataPersistence.saveSettings({ apiKeys: config.apiKeys })
+
+    res.json({ message: 'API Key添加成功', persisted })
   } catch (error) {
     logger.error('添加API Key失败', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
@@ -73,7 +75,9 @@ router.post('/deleteRegularKey', adminKeyVerify, async (req, res) => {
 
     config.apiKeys.splice(index, 1)
 
-    res.json({ message: 'API Key删除成功' })
+    const persisted = await dataPersistence.saveSettings({ apiKeys: config.apiKeys })
+
+    res.json({ message: 'API Key删除成功', persisted })
   } catch (error) {
     logger.error('删除API Key失败', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
