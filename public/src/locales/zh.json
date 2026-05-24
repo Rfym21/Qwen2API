@@ -77,7 +77,8 @@
         "unitSec": "秒",
         "unitMin": "分"
       }
-    }
+    },
+    "chat": "测试会话"
   },
   "msg": {
     "batchComplete": "批量添加完成: 成功{n}个",
@@ -202,5 +203,9 @@
       "input": "输入",
       "output": "输出"
     }
+  },
+  "chat": {
+    "title": "测试 ChatCompletion API",
+    "send": "发送"
   }
 }
