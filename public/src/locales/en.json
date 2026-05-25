@@ -77,7 +77,8 @@
     "taskStatus": "Task status",
     "title": "Token Manager",
     "total": "total",
-    "totalItems": "Total {n} items"
+    "totalItems": "Total {n} items",
+    "chat": "test session"
   },
   "lang": {
     "label": "🌐 Language / Language",
@@ -202,5 +203,9 @@
       "cliOutput": "CLI output",
       "label": "Summary of all accounts"
     }
+  },
+  "chat": {
+    "send": "send",
+    "title": "Test the ChatCompletion API"
   }
 }
