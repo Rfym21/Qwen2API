@@ -205,6 +205,7 @@ class Account {
             const cliAccount = await cliManager.initCliAccount(account.token, account)
 
             if (cliAccount.access_token && cliAccount.refresh_token && cliAccount.expiry_date) {
+                account.cli_unavailable_reason = null
                 account.cli_info = {
                     access_token: cliAccount.access_token,
                     refresh_token: cliAccount.refresh_token,
@@ -231,6 +232,8 @@ class Account {
                 }
                 logger.success(`CLI账户 ${account.email} 初始化成功`, 'CLI')
             } else {
+                account.cli_info = null
+                account.cli_unavailable_reason = 'unsupported'
                 logger.error(`CLI账户 ${account.email} 初始化失败：无效的响应数据`, 'CLI', '', cliAccount)
             }
         } catch (error) {

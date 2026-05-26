@@ -224,19 +224,31 @@
                     out
                   </span>
                 </div>
-                <button type="button"
+                <template v-if="getStatusKind(token.email) === 'cli_unsupported'">
+                  <div class="flex items-baseline justify-between gap-2 w-full text-left">
+                    <span class="text-gray-400 border-b border-dotted border-gray-300 transition-colors"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliToday') }}:
+                    </span>
+                    <span class="font-medium text-gray-400 text-xs md:text-sm"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliUnavailableShort') }}
+                    </span>
+                  </div>
+                </template>
+                <button v-else type="button"
                         @click="toggleCliExpanded"
                         class="flex items-baseline justify-between gap-2 w-full text-left focus:outline-none">
                   <span class="text-gray-600 border-b border-dotted border-gray-400 hover:text-gray-800 transition-colors">
                     {{ t('dash.acct.cliToday') }}:
                   </span>
                   <span class="font-medium text-gray-800 text-xs md:text-sm flex items-center gap-1">
-                    <span>{{ getCliRequestNumber(token.email) }} / {{ cliQuotaLimit }} {{ t('dash.acct.calls') }}</span>
+                    <span>{{ getCliRequestNumber(token.email) }} / {{ getCliQuotaLimit(token.email) }} {{ t('dash.acct.calls') }}</span>
                     <span class="text-xs text-gray-400 transition-transform duration-200" :class="{ 'rotate-90': cliExpanded }">▸</span>
                   </span>
                 </button>
                 <transition name="fade">
-                  <div v-if="cliExpanded" class="space-y-1 pt-1">
+                  <div v-if="cliExpanded && getStatusKind(token.email) !== 'cli_unsupported'" class="space-y-1 pt-1">
                     <div class="text-xs text-gray-500 text-right">
                       {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
                     </div>
@@ -597,8 +609,14 @@ const DEFAULT_STATS = Object.freeze({
 
 const getAccountStats = (email) => accountStats.value[email]?.stats || DEFAULT_STATS
 const getCliRequestNumber = (email) => accountStats.value[email]?.cliRequestNumber || 0
+const getCliQuotaLimit = (email) => {
+  const perAccountLimit = accountStats.value[email]?.cliQuotaLimit
+  if (typeof perAccountLimit === 'number') return perAccountLimit
+  return cliQuotaLimit.value
+}
 const getCliProgressPct = (email) => {
-  const limit = cliQuotaLimit.value || 2000
+  const limit = getCliQuotaLimit(email)
+  if (limit <= 0) return 0
   return Math.min(100, getCliRequestNumber(email) / limit * 100)
 }
 const getCliProgressColor = (email) => {
@@ -624,7 +642,8 @@ const STATUS_EMOJI = Object.freeze({
   active: '🟢',
   warn: '🟡',
   cooldown: '🔴',
-  token_expiring: '🪫'
+  token_expiring: '🪫',
+  cli_unsupported: '⚪'
 })
 const nowTick = ref(Date.now())
 let tickInterval = null
@@ -674,6 +693,9 @@ const getStatusTooltip = (email) => {
   if (kind === 'token_expiring') {
     return t('dash.acct.status.tokenExpiring')
   }
+  if (kind === 'cli_unsupported') {
+    return t('dash.acct.status.cliUnsupported')
+  }
   return t('dash.acct.status.active')
 }
 
@@ -687,7 +709,7 @@ const fetchAccountStats = async () => {
       if (entry?.email) map[entry.email] = entry
     }
     accountStats.value = map
-    if (typeof res.data?.cliQuotaLimit === 'number' && res.data.cliQuotaLimit > 0) {
+    if (typeof res.data?.cliQuotaLimit === 'number') {
       cliQuotaLimit.value = res.data.cliQuotaLimit
     }
     // Drop suppression entries where account is no longer in cooldown OR

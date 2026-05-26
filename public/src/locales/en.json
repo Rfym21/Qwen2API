@@ -11,10 +11,12 @@
       "chatToday": "Chat Today",
       "cliSuccess": "success",
       "cliToday": "CLI Today",
+      "cliUnavailableShort": "Unavailable",
       "status": {
         "active": "active",
         "cooldown": "Cooling down ({until} remaining)",
         "tokenExpiring": "Token is about to expire",
+        "cliUnsupported": "CLI calling is not supported",
         "unitMin": "point",
         "unitSec": "Second",
         "warn": "There were recent errors ({code}, {ago} ago)",
