@@ -180,7 +180,7 @@ class CliAuthManager {
      */
     async pollForToken(device_code, code_verifier, account) {
         let pollInterval = 5000
-        const maxAttempts = 60
+        const maxAttempts = 3
         const chatBaseUrl = getChatBaseUrl()
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
