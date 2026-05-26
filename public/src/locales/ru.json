@@ -65,6 +65,7 @@
       "chatToday": "Chat (сегодня)",
       "cliToday": "CLI (сегодня)",
       "calls": "запросов",
+      "cliUnavailableShort": "Недоступно",
       "cliSuccess": "успешно",
       "unitK": "к",
       "unitM": "M",
@@ -74,6 +75,7 @@
         "warnNoCode": "Недавние ошибки ({ago} назад)",
         "cooldown": "В охлаждении (осталось {until})",
         "tokenExpiring": "Токен скоро истекает",
+        "cliUnsupported": "CLI-вызовы не поддерживаются",
         "unitSec": "сек",
         "unitMin": "мин"
       }

@@ -8,6 +8,7 @@ const { adminKeyVerify } = require('../middlewares/authorization')
 const { deleteAccount, saveAccounts, refreshAccountToken } = require('../utils/setting')
 const { parseAccountLine } = require('../utils/account-parser')
 const { isValidProxyUrl } = require('../utils/proxy-helper')
+const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
 const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https:// 或 socks5:// 开头'
@@ -624,12 +625,6 @@ router.post('/forceRefreshAllAccounts', adminKeyVerify, async (req, res) => {
 router.get('/accountStats', adminKeyVerify, async (req, res) => {
   try {
     const now = Date.now()
-    // 15 分钟 warn 窗口——recordError 写 lastErrorAt 后, UI 显示 🟡 warn 一段时间
-    const WARN_WINDOW_MS = 15 * 60 * 1000
-    // 6 小时——与 tokenManager.isTokenExpiringSoon default 一致
-    const TOKEN_EXPIRING_MS = 6 * 60 * 60 * 1000
-    // CLI 每日配额（与 routes/cli.chat.js:22 同步，dashboard 进度条用）
-    const CLI_QUOTA_LIMIT = 2000
 
     const rotatorStats = accountManager.accountRotator.getStats()
     const usageStats = rotatorStats.usageStats || {}
@@ -637,38 +632,21 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
     const accounts = accountManager.getAllAccountKeys().map(account => {
       const email = account.email
       const rotatorRecord = usageStats[email] || {}
-      const cooldownEndsAt = rotatorRecord.cooldownEndsAt || null
-      const lastErrorAt = rotatorRecord.lastErrorAt || null
-      const lastErrorCode = rotatorRecord.lastErrorCode || null
-
-      // 优先级：cooldown > warn > token_expiring > active
-      let kind = 'active'
-      if (cooldownEndsAt && now < cooldownEndsAt) {
-        kind = 'cooldown'
-      } else if (lastErrorAt && (now - lastErrorAt) < WARN_WINDOW_MS) {
-        kind = 'warn'
-      } else if (account.expires && (account.expires * 1000 - now) < TOKEN_EXPIRING_MS) {
-        // account.expires 是 UNIX seconds（JWT exp 直接保存）——*1000 得到 ms
-        // 直接对比 timestamp, 不调用 isTokenExpiringSoon(token)（后者接受 token 字符串而非 expires）
-        kind = 'token_expiring'
-      }
+      const cliState = getAccountCliState(account, rotatorRecord, now)
 
       return {
         email,
-        stats: account.stats || { chat: { input: 0, output: 0 }, cli: { calls: 0, input: 0, output: 0 } },
-        cliRequestNumber: account.cli_info?.request_number || 0,
-        status: {
-          kind,
-          cooldownEndsAt,
-          lastErrorAt,
-          lastErrorCode
-        }
+        ...cliState
       }
     })
 
+    const cliQuotaLimit = accounts.some(account => account.cliQuotaLimit === DEFAULT_CLI_QUOTA_LIMIT)
+      ? DEFAULT_CLI_QUOTA_LIMIT
+      : 0
+
     res.json({
       accounts,
-      cliQuotaLimit: CLI_QUOTA_LIMIT
+      cliQuotaLimit
     })
   } catch (error) {
     logger.error('获取账户 stats 失败', 'ACCOUNT', '', error)
