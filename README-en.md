@@ -547,7 +547,9 @@ OpenAI SDK, LangChain, Cline, Continue, and other clients following OpenAI tool 
 
 ### 🤖 Anthropic Messages API
 
-Compatible with Anthropic's `/v1/messages` endpoint, can directly connect to Claude Code, Anthropic SDK, aider, and other clients.
+Provides an **Anthropic-compatible bridge** for the `/v1/messages` endpoint, allowing direct use with common clients such as Claude Code, the Anthropic SDK, and aider.
+
+> Note: Qwen2API is a compatibility bridge, not an Anthropic-equivalent backend. For unsupported fields, the current strategy is intentionally **permissive**: the request is accepted whenever possible, and important unsupported fields are surfaced through response headers and server logs instead of being silently ignored. Fields such as `system`, multi-turn `messages`, `tools`, `tool_choice`, and `thinking` are currently **approximate compatibility**, not native Anthropic semantics.
 
 ```http
 POST /v1/messages
@@ -555,17 +557,37 @@ Content-Type: application/json
 Authorization: Bearer sk-your-api-key
 ```
 
-Supported fields:
+**Compatibility matrix:**
 
-| Field | Description |
-|---|---|
-| [model](file://d:\Code\Qwen2API\src\controllers\anthropic.js#L238-L238) | Any Qwen model name (like `qwen3-coder-plus`) |
-| `system` | String or `{type:"text"}` block array |
-| `messages[].content` | String, text blocks, image blocks, `tool_use` blocks, `tool_result` blocks |
-| `tools[]` | Anthropic style `{name,input_schema,description}` |
-| `tool_choice` | `{type:"auto"}` / `{type:"any"}` (=must call) / `{type:"tool",name:"..."}` / `{type:"none"}` |
-| `thinking` | `{type:"enabled",budget_tokens:N}` enables thinking mode |
-| [stream](file://d:\Code\Qwen2API\src\controllers\anthropic.js#L233-L233) | Streaming SSE output |
+| Field / capability | Status | Current behavior | Notes / client impact |
+|---|---|---|---|
+| `model` | Supported | Mapped to a Qwen model name | Any resolvable Qwen model ID can be used |
+| `messages.text` | Supported | Supports basic text messages | Standard chat clients work |
+| `messages.image` | Supported | Supports image blocks and translates them into the internal image format | Suitable for common multimodal clients |
+| `messages.tool_use` | Partial | Accepts Anthropic-style `tool_use` history blocks, then translates/folds them internally | Not native upstream tool-call semantics |
+| `messages.tool_result` | Partial | Accepts `tool_result` and converts it into bridge-layer tool-result text | Details such as `is_error` are not guaranteed to be preserved |
+| `system` | Partial | Merged into the prompt prefix | Not preserved as a native upstream system layer |
+| `messages` (multi-turn) | Partial | Multi-turn history is compacted / translated | Structured conversation semantics are approximate |
+| `tools[]` | Partial | Supports the basic `{name,input_schema,description}` shape | Implemented through prompt/XML simulation, not native upstream tool execution |
+| `tool_choice` | Partial | Supports the basic `auto` / `any` / `tool` / `none` modes | Relies on prompt steering and retry hints, not an upstream hard guarantee |
+| `thinking` | Partial | Currently accepts legacy `thinking: {type:"enabled", budget_tokens:N}` and maps it approximately | Not equivalent to Anthropic's newer adaptive thinking / effort semantics |
+| `stream` | Supported | Returns an Anthropic-style SSE event sequence | Suitable for Claude Code and other streaming clients |
+| `max_tokens` | Ignored with warning | Currently does not enforce an upstream output limit | Exposed through warning headers / logs |
+| `stop_sequences` | Ignored with warning | Not currently mapped to upstream stop behavior | Exposed through warning headers / logs |
+| `metadata` | Ignored with warning | Not used in the upstream request | Exposed through warning headers / logs |
+| `temperature` / `top_p` / `top_k` | Ignored with warning | Not currently mapped to upstream sampling controls | Exposed through warning headers / logs |
+| `service_tier` | Ignored with warning | Not supported | Exposed through warning headers / logs |
+| `container` | Ignored with warning | Not supported | Exposed through warning headers / logs |
+| `output_config` | Ignored with warning | Does not currently support official structured outputs / effort semantics | Exposed through warning headers / logs |
+| `mcp_servers` | Not supported yet | Anthropic MCP runtime semantics are not supported | Currently surfaced as a risk warning; a later version may convert this into an explicit error |
+| `context_management` | Not supported yet | Official compaction / context-editing semantics are not supported | Currently surfaced as a risk warning; a later version may convert this into an explicit error |
+
+When a request includes approximate or unsupported fields, the response may include these headers:
+
+- `X-Qwen2API-Anthropic-Compatibility`
+- `X-Qwen2API-Anthropic-Warnings`
+
+These headers indicate which Anthropic capabilities are **Partial** and which fields were **Ignored with warning**. They do not change the basic successful response body shape.
 
 **Request Example (with tool calling):**
 
@@ -586,9 +608,11 @@ Supported fields:
       }
     }
   ],
-  "tool_choice": { "type:"any" }
+  "tool_choice": { "type": "any" }
 }
 ```
+
+> Note: `max_tokens` is accepted in the example above, but it is currently **Ignored with warning** and does not enforce an upstream output limit the way the official Anthropic API does.
 
 **Non-streaming Response:**
 

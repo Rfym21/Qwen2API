@@ -503,6 +503,119 @@ Authorization: Bearer sk-your-api-key
 }
 ```
 
+### 🤖 Anthropic Messages API
+
+Проект предоставляет **Anthropic-compatible bridge** для конечной точки `/v1/messages`, чтобы её можно было использовать с такими клиентами, как Claude Code, Anthropic SDK, aider и другими совместимыми инструментами.
+
+> Примечание: Qwen2API — это слой совместимости, а не эквивалентный официальный backend Anthropic. Для неподдерживаемых полей текущая стратегия намеренно **мягкая**: запрос по возможности принимается, а важные неподдерживаемые поля явно показываются через response headers и серверные логи, вместо того чтобы молча игнорироваться. Поля `system`, многоходовые `messages`, `tools`, `tool_choice` и `thinking` сейчас поддерживаются **приближённо**, а не как нативная семантика Anthropic.
+
+```http
+POST /v1/messages
+Content-Type: application/json
+Authorization: Bearer sk-your-api-key
+```
+
+**Матрица совместимости:**
+
+| Поле / возможность | Статус | Текущее поведение | Примечание / влияние на клиента |
+|---|---|---|---|
+| `model` | Supported | Сопоставляется с именем модели Qwen | Можно использовать любой разрешаемый ID модели Qwen |
+| `messages.text` | Supported | Поддерживаются обычные текстовые сообщения | Базовые chat-клиенты работают |
+| `messages.image` | Supported | Поддерживаются image-блоки с переводом во внутренний формат изображений | Подходит для типичных мультимодальных клиентов |
+| `messages.tool_use` | Partial | Принимаются Anthropic-style блоки истории `tool_use`, затем они переводятся и сворачиваются внутри bridge | Это не нативная upstream-семантика tool call |
+| `messages.tool_result` | Partial | Принимается `tool_result`, затем преобразуется в текстовый результат bridge-слоя | Детали вроде `is_error` не гарантированно сохраняются |
+| `system` | Partial | Встраивается в префикс prompt | Не сохраняется как отдельный нативный system-слой upstream |
+| `messages` (multi-turn) | Partial | История нескольких ходов сжимается / переводится | Семантика структурированного диалога приблизительная |
+| `tools[]` | Partial | Поддерживается базовая форма `{name,input_schema,description}` | Реализовано через prompt/XML-симуляцию, а не нативное upstream tool execution |
+| `tool_choice` | Partial | Поддерживаются базовые режимы `auto` / `any` / `tool` / `none` | Опирается на prompt steering и retry hints, а не на жёсткую гарантию upstream |
+| `thinking` | Partial | Сейчас принимается legacy-форма `thinking: {type:"enabled", budget_tokens:N}` и приблизительно отображается | Не эквивалентно новым adaptive thinking / effort semantics Anthropic |
+| `stream` | Supported | Возвращает Anthropic-style SSE последовательность событий | Подходит для Claude Code и других streaming-клиентов |
+| `max_tokens` | Ignored with warning | Сейчас не ограничивает upstream output по-настоящему | Показывается через warning headers / logs |
+| `stop_sequences` | Ignored with warning | Сейчас не отображается на upstream stop behavior | Показывается через warning headers / logs |
+| `metadata` | Ignored with warning | Сейчас не участвует в upstream-запросе | Показывается через warning headers / logs |
+| `temperature` / `top_p` / `top_k` | Ignored with warning | Сейчас не переводится в upstream sampling controls | Показывается через warning headers / logs |
+| `service_tier` | Ignored with warning | Сейчас не поддерживается | Показывается через warning headers / logs |
+| `container` | Ignored with warning | Сейчас не поддерживается | Показывается через warning headers / logs |
+| `output_config` | Ignored with warning | Сейчас не поддерживаются official structured outputs / effort semantics | Показывается через warning headers / logs |
+| `mcp_servers` | Not supported yet | Anthropic MCP runtime semantics сейчас не поддерживаются | Пока только помечается как риск; в будущей версии может стать явной ошибкой |
+| `context_management` | Not supported yet | Official compaction / context-editing semantics сейчас не поддерживаются | Пока только помечается как риск; в будущей версии может стать явной ошибкой |
+
+Если запрос содержит приближённо поддерживаемые или неподдерживаемые поля, в ответе могут появиться следующие headers:
+
+- `X-Qwen2API-Anthropic-Compatibility`
+- `X-Qwen2API-Anthropic-Warnings`
+
+Эти headers показывают, какие Anthropic-возможности имеют статус **Partial**, а какие поля были **Ignored with warning**. Они не меняют базовую форму успешного response body.
+
+**Пример запроса (с tool calling):**
+
+```json
+{
+  "model": "qwen3-coder-plus",
+  "max_tokens": 1024,
+  "messages": [
+    {"role": "user", "content": "Проверь погоду в Гуанчжоу"}
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "input_schema": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "any" }
+}
+```
+
+> Примечание: `max_tokens` в примере выше принимается, но сейчас относится к **Ignored with warning** и не ограничивает upstream output так же, как это делает официальный Anthropic API.
+
+**Непотоковый ответ:**
+
+```json
+{
+  "id": "msg_xxx",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3-coder-plus",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "call_xxx",
+      "name": "get_weather",
+      "input": { "city": "Гуанчжоу" }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 233, "output_tokens": 25 }
+}
+```
+
+**Последовательность SSE-событий в потоковом режиме:**
+
+```
+event: message_start
+data: {"type":"message_start","message":{...}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_xxx","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Гуанчжоу\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":234,"output_tokens":25}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
 ### 🎨 Генерация/редактирование изображений
 
 Используйте модели с суффиксом `-image` для генерации изображений из текста.

@@ -547,7 +547,9 @@ OpenAI SDK、LangChain、Cline、Continue 等遵循 OpenAI 工具协议的客户
 
 ### 🤖 Anthropic Messages API
 
-兼容 Anthropic 的 `/v1/messages` 端点，可直接对接 Claude Code、Anthropic SDK、aider 等客户端。
+提供 **Anthropic-compatible bridge** 的 `/v1/messages` 端点，可直接对接 Claude Code、Anthropic SDK、aider 等常见客户端。
+
+> 说明：Qwen2API 是兼容桥接层，不是 Anthropic 官方等价实现。对未支持字段，本项目当前采用**尽量宽松**的策略：尽可能接受请求，并通过响应头与服务端日志显式提示，而不是继续静默忽略。对 `system`、多轮 `messages`、`tools`、`tool_choice`、`thinking` 等字段，当前为**近似兼容**，并非官方原生语义。
 
 ```http
 POST /v1/messages
@@ -555,17 +557,37 @@ Content-Type: application/json
 Authorization: Bearer sk-your-api-key
 ```
 
-支持的字段：
+**兼容矩阵：**
 
-| 字段 | 说明 |
-|---|---|
-| `model` | 任意 Qwen 模型名（如 `qwen3-coder-plus`） |
-| `system` | 字符串或 `{type:"text"}` 块数组 |
-| `messages[].content` | 字符串、文本块、图片块、`tool_use` 块、`tool_result` 块 |
-| `tools[]` | Anthropic 风格 `{name,input_schema,description}` |
-| `tool_choice` | `{type:"auto"}` / `{type:"any"}`（=必须调用） / `{type:"tool",name:"..."}` / `{type:"none"}` |
-| `thinking` | `{type:"enabled",budget_tokens:N}` 启用思考模式 |
-| `stream` | 流式 SSE 输出 |
+| 字段 / 能力 | 状态 | 当前行为 | 备注 / 客户端影响 |
+|---|---|---|---|
+| `model` | Supported | 映射到 Qwen 模型名 | 可用任意可解析的 Qwen 模型 ID |
+| `messages.text` | Supported | 支持基础文本消息 | 基础聊天可用 |
+| `messages.image` | Supported | 支持图片块并转译到内部图片格式 | 适合常见多模态客户端 |
+| `messages.tool_use` | Partial | 接收 Anthropic 风格 `tool_use` 历史块，但内部会转译并折叠 | 不是上游原生工具调用语义 |
+| `messages.tool_result` | Partial | 接收 `tool_result`，内部转为桥接层工具结果文本 | `is_error` 等细节不保证保真 |
+| `system` | Partial | 会被合并进提示前缀 | 不是独立的原生 system 层 |
+| `messages`（多轮） | Partial | 多轮历史会被压缩/转译 | 结构化上下文语义为近似兼容 |
+| `tools[]` | Partial | 支持基础 `{name,input_schema,description}` | 通过 prompt/XML 模拟，不是原生 upstream tool execution |
+| `tool_choice` | Partial | 支持 `auto` / `any` / `tool` / `none` 基础形态 | 依赖提示词与 retry hint，不是上游强保证 |
+| `thinking` | Partial | 当前接受旧式 `thinking: {type:"enabled", budget_tokens:N}` 并近似映射 | 不等价官方新式 adaptive thinking / effort 语义 |
+| `stream` | Supported | 返回 Anthropic 风格 SSE 事件序列 | 适合 Claude Code 等流式客户端 |
+| `max_tokens` | Ignored with warning | 当前不会真实限制上游输出 | 会通过 warning headers / logs 显式提示 |
+| `stop_sequences` | Ignored with warning | 当前未映射到上游停止序列 | 会通过 warning headers / logs 显式提示 |
+| `metadata` | Ignored with warning | 当前不参与上游请求 | 会通过 warning headers / logs 显式提示 |
+| `temperature` / `top_p` / `top_k` | Ignored with warning | 当前不参与上游采样控制 | 会通过 warning headers / logs 显式提示 |
+| `service_tier` | Ignored with warning | 当前不支持 | 会通过 warning headers / logs 显式提示 |
+| `container` | Ignored with warning | 当前不支持 | 会通过 warning headers / logs 显式提示 |
+| `output_config` | Ignored with warning | 当前不支持 structured outputs / effort 等官方语义 | 会通过 warning headers / logs 显式提示 |
+| `mcp_servers` | Not supported yet | 当前不支持 Anthropic MCP runtime 语义 | 当前仅提示风险，后续版本可能改为显式报错 |
+| `context_management` | Not supported yet | 当前不支持 compaction / context editing 等官方语义 | 当前仅提示风险，后续版本可能改为显式报错 |
+
+当请求包含近似支持或未支持字段时，响应可能带有以下 header：
+
+- `X-Qwen2API-Anthropic-Compatibility`
+- `X-Qwen2API-Anthropic-Warnings`
+
+这些 header 用于提示当前请求中哪些 Anthropic 能力是 **Partial**、哪些字段被 **Ignored with warning**，不会改变成功响应 body 的基本结构。
 
 **请求示例（含工具调用）：**
 
@@ -589,6 +611,8 @@ Authorization: Bearer sk-your-api-key
   "tool_choice": { "type": "any" }
 }
 ```
+
+> 注意：上例中的 `max_tokens` 当前会被接受，但仍属于 **Ignored with warning**，不会像官方 Anthropic API 那样真实约束上游输出。
 
 **非流式响应：**
 

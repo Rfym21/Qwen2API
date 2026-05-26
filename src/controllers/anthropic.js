@@ -10,6 +10,10 @@ const {
   createToolCallStreamParser
 } = require('../utils/tool-prompt.js');
 const { logger } = require('../utils/logger');
+const {
+  analyzeAnthropicCompatibility,
+  buildAnthropicCompatibilityHeaders
+} = require('./anthropic.compatibility.js');
 
 /**
  * 安全累计 chat stats（与 chat.js attributeChatUsage 共享语义）
@@ -699,6 +703,16 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
  */
 const handleAnthropicMessages = async (req, res) => {
   try {
+    const compatibility = analyzeAnthropicCompatibility(req.body || {});
+    const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
+    if (Object.keys(compatibilityHeaders).length > 0) {
+      res.set(compatibilityHeaders);
+      logger.warn(
+        `Anthropic compatibility notice: ${compatibility.summary}`,
+        'ANTHROPIC'
+      );
+    }
+
     const built = await buildInternalRequest(req.body || {});
     const { body, hasTools, toolChoice, model } = built;
 
@@ -733,6 +747,8 @@ const handleAnthropicMessages = async (req, res) => {
 
 module.exports = {
   handleAnthropicMessages,
+  analyzeAnthropicCompatibility,
+  buildAnthropicCompatibilityHeaders,
   // 暴露内部辅助以便测试
   flattenAnthropicMessages,
   normalizeAnthropicTools,
