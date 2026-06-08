@@ -53,6 +53,8 @@ const compressSchemaType = (schema) => {
   return type || 'any';
 };
 
+const TOOL_PREFIX = 'My_';
+
 /**
  * 将单个工具定义压缩为 TS 风格签名
  * @param {Object} tool - OpenAI 工具定义
@@ -60,7 +62,8 @@ const compressSchemaType = (schema) => {
  */
 const compressToolDefinition = (tool) => {
   const fn = tool?.function || tool;
-  const name = fn?.name || 'unknown';
+  // 增加工具前缀，例如Write等工具会被千问保留，不让调用
+  const name = fn.name ? TOOL_PREFIX + fn.name : 'unknown';
   const description = (fn?.description || '').trim();
   const params = fn?.parameters || { type: 'object', properties: {} };
   const signature = compressSchemaType(params);
@@ -212,11 +215,14 @@ const parseToolCallPayload = (raw) => {
 
   try {
     const parsed = JSON.parse(text);
+
     if (!parsed || typeof parsed !== 'object') return null;
-    const name = parsed.name || parsed.tool || parsed.function;
+    let name = parsed.name || parsed.tool || parsed.function;
     const args = parsed.arguments ?? parsed.parameters ?? parsed.args ?? {};
     if (!name) return null;
-    return { name: String(name), arguments: args };
+    // 去掉工具前缀
+    name = name.replace(TOOL_PREFIX, '');
+    return { name, arguments: args };
   } catch (error) {
     logger.warning?.('解析 tool_call 负载失败', 'TOOL', text, error?.message);
     return null;
