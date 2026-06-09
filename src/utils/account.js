@@ -658,8 +658,9 @@ class Account {
      * @param {string} password - 密码
      * @returns {Promise<string|null>} 令牌或null
      */
-    async login(email, password) {
-        return await this.tokenManager.login(email, password)
+    async login(email, password, proxy) {
+        const accountLike = proxy ? { proxy } : undefined
+        return await this.tokenManager.login(email, password, accountLike)
     }
 
     /**
@@ -763,7 +764,7 @@ class Account {
             }
 
             // 尝试登录获取令牌
-            const token = await this.tokenManager.login(email, password)
+            const token = await this.tokenManager.login(email, password, proxy ? { proxy } : undefined)
             if (!token) {
                 logger.error(`账户 ${email} 登录失败，无法添加`, 'ACCOUNT')
                 return false

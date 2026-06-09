@@ -188,7 +188,7 @@ const processBatchAccountItem = async (task, account) => {
   updateBatchTaskMessage(task)
 
   try {
-    const authToken = await accountManager.login(email, password)
+    const authToken = await accountManager.login(email, password, proxy)
     if (!authToken) {
       throw new Error('登录失败')
     }
@@ -340,7 +340,7 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       return res.status(409).json({ error: '账号已存在' })
     }
 
-    const authToken = await accountManager.login(email, password)
+    const authToken = await accountManager.login(email, password, normalizedProxy)
     if (!authToken) {
       return res.status(401).json({ error: '登录失败' })
     }
