@@ -236,6 +236,18 @@
                     </span>
                   </div>
                 </template>
+                <template v-else-if="getStatusKind(token.email) === 'cli_pending'">
+                  <div class="flex items-baseline justify-between gap-2 w-full text-left">
+                    <span class="text-blue-400 border-b border-dotted border-blue-300 transition-colors"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliToday') }}:
+                    </span>
+                    <span class="font-medium text-blue-400 text-xs md:text-sm"
+                          :title="getStatusTooltip(token.email)">
+                      {{ t('dash.acct.cliPendingShort') }}
+                    </span>
+                  </div>
+                </template>
                 <button v-else type="button"
                         @click="toggleCliExpanded"
                         class="flex items-baseline justify-between gap-2 w-full text-left focus:outline-none">
@@ -248,7 +260,7 @@
                   </span>
                 </button>
                 <transition name="fade">
-                  <div v-if="cliExpanded && getStatusKind(token.email) !== 'cli_unsupported'" class="space-y-1 pt-1">
+                  <div v-if="cliExpanded && getStatusKind(token.email) !== 'cli_unsupported' && getStatusKind(token.email) !== 'cli_pending'" class="space-y-1 pt-1">
                     <div class="text-xs text-gray-500 text-right">
                       {{ t('dash.acct.cliSuccess') }}: {{ getAccountStats(token.email).cli.calls }}
                     </div>
@@ -643,7 +655,8 @@ const STATUS_EMOJI = Object.freeze({
   warn: '🟡',
   cooldown: '🔴',
   token_expiring: '🪫',
-  cli_unsupported: '⚪'
+  cli_unsupported: '⚪',
+  cli_pending: '🔵'
 })
 const nowTick = ref(Date.now())
 let tickInterval = null
@@ -695,6 +708,9 @@ const getStatusTooltip = (email) => {
   }
   if (kind === 'cli_unsupported') {
     return t('dash.acct.status.cliUnsupported')
+  }
+  if (kind === 'cli_pending') {
+    return t('dash.acct.status.cliPending')
   }
   return t('dash.acct.status.active')
 }

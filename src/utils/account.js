@@ -147,16 +147,15 @@ class Account {
             this.accountRotator.setAccounts(this.accountTokens)
 
             // 初始化 CLI 账户（后台执行，不阻塞 chat-flow init）
-            // CLI poll 在 upstream 504 时可挂 5 分钟（cli.manager.js pollForToken: 60 次 × 5 秒），
-            // 而 chat-flow（/v1/chat/completions, /v1/messages）不需要 cli_info，无需等待。
-            // routes/cli.chat.js:22 已正确过滤无 cli_info 的账户，所以 /cli/* 在 CLI init 未完成时
-            // 自然回退到「无可用账户」状态。
+            // 为所有账户启动 CLI 初始化，确保没有 CLI 额度的账号被正确标记为 unsupported
             if (this.accountTokens.length > 0) {
-                const randomIndex = Math.floor(Math.random() * this.accountTokens.length)
-                const randomAccount = this.accountTokens[randomIndex]
-                logger.info(`后台初始化 CLI 账户, 随机初始化账号: ${randomAccount.email}`, 'ACCOUNT')
-                this._initializeCliAccount(randomAccount).catch(err => {
-                    logger.error(`CLI 账户后台初始化失败: ${randomAccount.email}`, 'ACCOUNT', '', err)
+                logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
+                Promise.allSettled(
+                    this.accountTokens.map(account => this._initializeCliAccount(account))
+                ).then(() => {
+                    const cliReady = this.accountTokens.filter(a => a.cli_info).length
+                    const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
+                    logger.success(`CLI 初始化完成: ${cliReady} 个可用, ${cliUnsupported} 个不支持`, 'CLI')
                 })
             }
 
@@ -237,6 +236,8 @@ class Account {
                 logger.error(`CLI账户 ${account.email} 初始化失败：无效的响应数据`, 'CLI', '', cliAccount)
             }
         } catch (error) {
+            account.cli_info = null
+            account.cli_unavailable_reason = 'unsupported'
             logger.error(`CLI账户 ${account.email} 初始化失败`, 'CLI', '', error)
         }
     }
@@ -800,6 +801,11 @@ class Account {
             // 更新轮询器
             this.accountRotator.setAccounts(this.accountTokens)
 
+            // 后台初始化 CLI
+            this._initializeCliAccount(newAccount).catch(err => {
+                logger.error(`新账户 CLI 初始化失败: ${email}`, 'ACCOUNT', '', err)
+            })
+
             logger.success(`成功添加账户: ${email}`, 'ACCOUNT')
             return true
         } catch (error) {
@@ -850,6 +856,11 @@ class Account {
 
             // 更新轮询器
             this.accountRotator.setAccounts(this.accountTokens)
+
+            // 后台初始化 CLI
+            this._initializeCliAccount(newAccount).catch(err => {
+                logger.error(`新账户 CLI 初始化失败: ${email}`, 'ACCOUNT', '', err)
+            })
 
             logger.success(`成功添加账户: ${email}`, 'ACCOUNT')
             return true

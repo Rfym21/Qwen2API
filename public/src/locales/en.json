@@ -12,11 +12,13 @@
       "cliSuccess": "success",
       "cliToday": "CLI Today",
       "cliUnavailableShort": "Unavailable",
+      "cliPendingShort": "Initializing",
       "status": {
         "active": "active",
         "cooldown": "Cooling down ({until} remaining)",
         "tokenExpiring": "Token is about to expire",
         "cliUnsupported": "CLI calling is not supported",
+        "cliPending": "CLI initializing",
         "unitMin": "point",
         "unitSec": "Second",
         "warn": "There were recent errors ({code}, {ago} ago)",
