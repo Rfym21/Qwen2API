@@ -25,9 +25,20 @@ const getLatestModels = async (force = false) => {
     const requestConfig = {
         headers: {
             'Authorization': `Bearer ${account ? account.token : ''}`,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            ...(getSsxmodItna() && { 'Cookie': `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}` })
+            'sec-ch-ua-platform': '"Windows"',
+            'referer': `${chatBaseUrl}/`,
+            'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+            'content-type': 'application/json',
+            'bx-v': '2.5.36',
+            'accept': '*/*',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-language': 'zh-CN,zh;q=0.9',
+            ...(account?.token && {
+                'cookie': `token=${account.token};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`
+            }),
+            'origin': chatBaseUrl,
+            'host': chatBaseUrl.replace('https://', ''),
         }
     }
 

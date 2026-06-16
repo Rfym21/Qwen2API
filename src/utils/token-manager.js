@@ -43,10 +43,27 @@ class TokenManager {
                 requestConfig.proxy = false
             }
 
-            const response = await axios.post(this.loginEndpoint, {
+            const requestBody = {
                 email: email,
                 password: sha256Encrypt(password)
-            }, requestConfig)
+            }
+
+            console.log('登录请求:', {
+                url: this.loginEndpoint,
+                headers: requestConfig.headers,
+                body: { email: email, password: '***已加密***' },
+                proxy: requestConfig.proxy,
+                hasHttpsAgent: !!requestConfig.httpsAgent
+            })
+
+            const response = await axios.post(this.loginEndpoint, requestBody, requestConfig)
+
+            console.log('登录响应:', {
+                status: response.status,
+                headers: response.headers,
+                data: response.data,
+                hasToken: !!response.data?.token
+            })
 
             if (response.data && response.data.token) {
                 logger.success(`${email} 登录成功：${response.data.token}`, 'AUTH')

@@ -49,24 +49,25 @@ const sendChatRequest = async (body) => {
     // 构建请求配置
     const requestConfig = {
         headers: {
-            'Authorization': `Bearer ${currentToken}`,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-            "Connection": "keep-alive",
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Content-Type": "application/json",
-            "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
-            "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-            "source": "web",
-            "Version": "0.1.13",
-            "bx-v": "2.5.31",
-            "Origin": chatBaseUrl,
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-            "Referer": `${chatBaseUrl}/c/guest`,
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'authorization': `Bearer ${currentToken}`,
+            'X-Request-Id': crypto.randomUUID(),
+            'referer': `${chatBaseUrl}/`,
+            'origin': chatBaseUrl,
+            'accept': 'application/json, text/plain, */*',
+            'content-type': 'application/json',
+            'accept-language': 'zh-CN,zh;q=0.9',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+            'bx-v': '2.5.36',
+            'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            'host': chatBaseUrl.replace('https://', ''),
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'connection': 'keep-alive',
         },
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 60 * 1000,
@@ -82,6 +83,14 @@ const sendChatRequest = async (body) => {
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
     const payload = { ...body, stream: true, chat_id }
 
+    console.log('chat/completions 请求:', {
+        url: url,
+        headers: requestConfig.headers,
+        body: payload,
+        proxy: requestConfig.proxy,
+        hasHttpsAgent: !!requestConfig.httpsAgent
+    })
+
     const maxRetries = Math.max(0, parseInt(config.chatRetryCount, 10) || 0)
     const backoffMs = Math.max(0, parseInt(config.chatRetryBackoffMs, 10) || 0)
     const totalAttempts = maxRetries + 1
@@ -93,6 +102,11 @@ const sendChatRequest = async (body) => {
                 logger.network(`发送聊天请求`, 'REQUEST')
             }
             const response = await axios.post(url, payload, requestConfig)
+            console.log('chat/completions 响应:', {
+                status: response.status,
+                headers: response.headers,
+                responseType: typeof response.data
+            })
             if (response.status === 200) {
                 // 返回 currentAccount——调用方在消费完 stream 后据此累计 stats
                 // 注意：当前实现单次尝试都用同一个 currentAccount（不轮换），
@@ -170,24 +184,25 @@ const generateChatID = async (currentToken, model, account) => {
 
         const requestConfig = {
             headers: {
-                'Authorization': `Bearer ${currentToken}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-                "Connection": "keep-alive",
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Content-Type": "application/json",
-                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
-                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-                "source": "web",
-                "Version": "0.1.13",
-                "bx-v": "2.5.31",
-                "Origin": chatBaseUrl,
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": `${chatBaseUrl}/c/guest`,
-                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'authorization': `Bearer ${currentToken}`,
+                'X-Request-Id': crypto.randomUUID(),
+                'referer': `${chatBaseUrl}/`,
+                'origin': chatBaseUrl,
+                'accept': 'application/json, text/plain, */*',
+                'content-type': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'bx-v': '2.5.36',
+                'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                'host': chatBaseUrl.replace('https://', ''),
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'connection': 'keep-alive',
             }
         }
 
@@ -197,7 +212,7 @@ const generateChatID = async (currentToken, model, account) => {
             requestConfig.proxy = false
         }
 
-        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
+        const requestBody = {
             "title": "New Chat",
             "models": [
                 model
@@ -205,9 +220,23 @@ const generateChatID = async (currentToken, model, account) => {
             "chat_mode": "local",
             "chat_type": "t2i",
             "timestamp": new Date().getTime()
-        }, requestConfig)
+        }
 
-        // console.log(response_data.data)
+        console.log('创建聊天请求:', {
+            url: `${chatBaseUrl}/api/v2/chats/new`,
+            headers: requestConfig.headers,
+            body: requestBody,
+            proxy: requestConfig.proxy,
+            hasHttpsAgent: !!requestConfig.httpsAgent
+        })
+
+        const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, requestBody, requestConfig)
+
+        console.log('创建聊天响应:', {
+            status: response_data.status,
+            data: response_data.data,
+            chatId: response_data.data?.data?.id
+        })
 
         return response_data.data?.data?.id || null
 

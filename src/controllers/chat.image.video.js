@@ -1040,10 +1040,24 @@ const getChatDetail = async (chatID, token) => {
 
         const requestConfig = {
             headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'authorization': `Bearer ${token}`,
+                'referer': `${chatBaseUrl}/`,
+                'origin': chatBaseUrl,
+                'accept': 'application/json, text/plain, */*',
+                'content-type': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'bx-v': '2.5.36',
+                ...(cookieHeader && { 'cookie': cookieHeader }),
+                'host': chatBaseUrl.replace('https://', ''),
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'connection': 'keep-alive',
             }
         }
 
@@ -1376,24 +1390,24 @@ const generateImageVideoResult = async (payload) => {
 
         const requestConfig = {
             headers: {
-                'Authorization': `Bearer ${token}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-                "Connection": "keep-alive",
-                "Accept": upstreamStream ? "text/event-stream" : "application/json",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Content-Type": "application/json",
-                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
-                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-                "source": "web",
-                "Version": "0.1.13",
-                "bx-v": "2.5.31",
-                "Origin": chatBaseUrl,
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": `${chatBaseUrl}/c/guest`,
-                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                ...(cookieHeader && { "Cookie": cookieHeader }),
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'authorization': `Bearer ${token}`,
+                'referer': `${chatBaseUrl}/`,
+                'origin': chatBaseUrl,
+                'accept': 'application/json, text/plain, */*',
+                'content-type': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'bx-v': '2.5.36',
+                ...(cookieHeader && { 'cookie': cookieHeader }),
+                'host': chatBaseUrl.replace('https://', ''),
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'connection': 'keep-alive',
             },
             responseType: newChatType === 't2v' ? 'json' : (upstreamStream ? 'stream' : 'text'),
             timeout: 1000 * 60 * 5
@@ -1858,10 +1872,24 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
 
         const requestConfig = {
             headers: {
-                "Authorization": `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ...(cookieHeader && { 'Cookie': cookieHeader })
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'authorization': `Bearer ${token}`,
+                'referer': `${chatBaseUrl}/`,
+                'origin': chatBaseUrl,
+                'accept': 'application/json, text/plain, */*',
+                'content-type': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'bx-v': '2.5.36',
+                ...(cookieHeader && { 'cookie': cookieHeader }),
+                'host': chatBaseUrl.replace('https://', ''),
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'connection': 'keep-alive',
             }
         }
 
