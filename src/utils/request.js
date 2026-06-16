@@ -4,6 +4,7 @@ const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodItna, getSsxmodItna2 } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { generateUUID } = require('./tools.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -46,27 +47,34 @@ const sendChatRequest = async (body) => {
     const chatBaseUrl = getChatBaseUrl()
     const proxyAgent = getProxyAgent(currentAccount)
 
-    // 构建请求配置
+    // 构建请求配置（与通义千问 React Web 客户端完全一致）
     const requestConfig = {
         headers: {
-            'Authorization': `Bearer ${currentToken}`,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-            "Connection": "keep-alive",
-            "Accept": "application/json",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Content-Type": "application/json",
-            "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
-            "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-            "source": "web",
-            "Version": "0.1.13",
-            "bx-v": "2.5.31",
-            "Origin": chatBaseUrl,
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-            "Referer": `${chatBaseUrl}/c/guest`,
-            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            'sec-ch-ua-platform': '"Windows"',
+            'authorization': `Bearer ${currentToken}`,
+            'referer': `${chatBaseUrl}/`,
+            'accept-language': 'zh-CN,zh;q=0.9',
+            'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+            'content-type': 'application/json',
+            'bx-v': '2.5.36',
+            'accept': 'text/event-stream',
+            'accept-encoding': 'gzip, deflate, br, zstd',
+            // WAF 客户端标识头（必须与 React Web 客户端一致）
+            'source': 'web',
+            'version': '0.2.63',
+            'timezone': new Date().toString().replace(/GMT\+0800/, 'GMT+0800'),
+            'x-request-id': generateUUID(),
+            'connection': 'keep-alive',
+            // Cookie: JWT token + SSXMOD 反爬链（双重认证）
+            'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            'host': chatBaseUrl.replace('https://', ''),
+            'origin': chatBaseUrl,
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'x-accel-buffering': 'no',
         },
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
         timeout: 60 * 1000,
@@ -170,24 +178,30 @@ const generateChatID = async (currentToken, model, account) => {
 
         const requestConfig = {
             headers: {
-                'Authorization': `Bearer ${currentToken}`,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-                "Connection": "keep-alive",
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Content-Type": "application/json",
-                "Timezone": "Mon Dec 08 2025 17:28:55 GMT+0800",
-                "sec-ch-ua": "\"Microsoft Edge\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
-                "source": "web",
-                "Version": "0.1.13",
-                "bx-v": "2.5.31",
-                "Origin": chatBaseUrl,
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
-                "Referer": `${chatBaseUrl}/c/guest`,
-                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cookie": `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                'sec-ch-ua-platform': '"Windows"',
+                'authorization': `Bearer ${currentToken}`,
+                'referer': `${chatBaseUrl}/`,
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+                'sec-ch-ua-mobile': '?0',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+                'content-type': 'application/json',
+                'bx-v': '2.5.36',
+                'accept': '*/*',
+                'accept-encoding': 'gzip, deflate, br, zstd',
+                // WAF 客户端标识头
+                'source': 'web',
+                'version': '0.2.63',
+                'timezone': new Date().toString().replace(/GMT\+0800/, 'GMT+0800'),
+                'x-request-id': generateUUID(),
+                'connection': 'keep-alive',
+                // Cookie: JWT token + SSXMOD 反爬链
+                'cookie': `token=${currentToken};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+                'host': chatBaseUrl.replace('https://', ''),
+                'origin': chatBaseUrl,
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
             }
         }
 
@@ -206,8 +220,6 @@ const generateChatID = async (currentToken, model, account) => {
             "chat_type": "t2i",
             "timestamp": new Date().getTime()
         }, requestConfig)
-
-        // console.log(response_data.data)
 
         return response_data.data?.data?.id || null
 
