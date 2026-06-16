@@ -9,19 +9,6 @@ const { logger } = require('../utils/logger')
  */
 const processRequestBody = async (req, res, next) => {
   try {
-    // 构建请求体
-    const body = {
-      "stream": true,
-      "incremental_output": true,
-      "chat_type": "t2t",
-      "model": "qwen3-235b-a22b",
-      "messages": [],
-      "session_id": generateUUID(),
-      "id": generateUUID(),
-      "sub_chat_type": "t2t",
-      "chat_mode": "normal"
-    }
-
     // 获取请求体原始数据
     let {
       messages,            // 消息历史
@@ -34,6 +21,44 @@ const processRequestBody = async (req, res, next) => {
       tool_choice           // 工具调用控制
     } = req.body
 
+    const now = Math.floor(Date.now() / 1000)
+    const fid = generateUUID()
+    const thinkingConfig = isThinkingEnabled(model, enable_thinking, thinking_budget)
+
+    // 构建请求体 — 对齐 React 前端格式
+    const body = {
+      stream: stream !== false,
+      version: '2.1',
+      incremental_output: true,
+      chat_id: null,                    // 由 sendChatRequest 填充
+      chat_mode: 'normal',
+      model: await parserModel(model),
+      parent_id: null,
+      messages: [{
+        fid: fid,
+        parentId: null,
+        childrenIds: [],
+        role: 'user',                   // 取最后一条消息的角色
+        content: '',                    // 由下方 parserMessages 填充
+        user_action: 'chat',
+        files: [],
+        timestamp: now,
+        models: [await parserModel(model)],
+        chat_type: isChatType(model),
+        feature_config: {
+          thinking_enabled: thinkingConfig.thinking_enabled,
+          research_mode: 'normal',
+          auto_thinking: true,
+          thinking_mode: 'Auto',
+          thinking_format: 'detail',
+          auto_search: true
+        },
+        extra: { meta: { subChatType: isChatType(model) } },
+        sub_chat_type: isChatType(model)
+      }],
+      timestamp: now
+    }
+
     // 处理 stream 参数
     if (stream === true || stream === 'true') {
       body.stream = true
@@ -41,22 +66,13 @@ const processRequestBody = async (req, res, next) => {
       body.stream = false
     }
 
-    // 处理 chat_type 参数 : 聊天类型
-    body.chat_type = isChatType(model)
-
-    req.enable_web_search = body.chat_type === 'search' ? true : false
-
-    // 处理 model 参数 : 模型
-    body.model = await parserModel(model)
-
     // 处理 tools 参数 : 通过提示词为网页版模型注入工具调用能力
-    const hasTools = Array.isArray(tools) && tools.length > 0 && body.chat_type === 't2t'
+    const chatType = isChatType(model)
+    const hasTools = Array.isArray(tools) && tools.length > 0 && chatType === 't2t'
     let preparedMessages = messages
     let toolSystemPrompt = ''
     if (hasTools) {
       toolSystemPrompt = buildToolSystemPrompt(tools, { tool_choice })
-      // 仅折叠 assistant.tool_calls / role=tool 历史，不在此插入 system 消息，
-      // 避免被下游 parserMessages 折叠成 "system:<提示词>;user:..." 干扰模型理解。
       preparedMessages = foldToolMessages(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
@@ -64,35 +80,39 @@ const processRequestBody = async (req, res, next) => {
       req.has_tools = false
     }
 
-    // 处理 messages 参数 : 消息历史
-    body.messages = await parserMessages(preparedMessages, isThinkingEnabled(model, enable_thinking, thinking_budget), body.chat_type)
+    // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）
+    const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType)
 
-    // 工具提示词在 parserMessages 折叠完成后，作为前缀拼接到最终用户消息内容上，
-    // 这样既不会被角色前缀污染，也能让模型在每一轮都看到完整工具说明。
-    if (hasTools && toolSystemPrompt && Array.isArray(body.messages) && body.messages.length > 0) {
-      const last = body.messages[body.messages.length - 1]
-      if (typeof last.content === 'string') {
-        last.content = `${toolSystemPrompt}\n\n${last.content}`
-      } else if (Array.isArray(last.content)) {
-        const textIdx = last.content.findIndex(c => c?.type === 'text')
+    // 将解析后的消息填充到 React UI 格式的消息对象中
+    // 取最后一条用户消息作为主消息内容，历史消息通过 content 传递
+    const lastMessage = parsedMessages[parsedMessages.length - 1] || { role: 'user', content: '' }
+    body.messages[0].role = lastMessage.role || 'user'
+    body.messages[0].content = lastMessage.content || ''
+    body.messages[0].chat_type = chatType
+    body.messages[0].sub_chat_type = chatType
+    body.messages[0].feature_config.thinking_enabled = thinkingConfig.thinking_enabled
+
+    // 工具提示词拼接到用户消息内容上
+    if (hasTools && toolSystemPrompt) {
+      const msgContent = body.messages[0].content
+      if (typeof msgContent === 'string') {
+        body.messages[0].content = `${toolSystemPrompt}\n\n${msgContent}`
+      } else if (Array.isArray(msgContent)) {
+        const textIdx = msgContent.findIndex(c => c?.type === 'text')
         if (textIdx >= 0) {
-          last.content[textIdx].text = `${toolSystemPrompt}\n\n${last.content[textIdx].text || ''}`
+          msgContent[textIdx].text = `${toolSystemPrompt}\n\n${msgContent[textIdx].text || ''}`
         } else {
-          last.content.unshift({
-            type: 'text',
-            text: toolSystemPrompt,
-            chat_type: 't2t',
-            feature_config: { output_schema: 'phase', thinking_enabled: false }
-          })
+          msgContent.unshift({ type: 'text', text: toolSystemPrompt })
         }
       }
     }
-    
-    // 处理 enable_thinking 参数 : 是否启用思考
-    req.enable_thinking = isThinkingEnabled(model, enable_thinking, thinking_budget).thinking_enabled
-    
-    // 处理 sub_chat_type 参数 : 子聊天类型
-    body.sub_chat_type = body.chat_type
+
+    // 保存完整消息历史供下游使用（用于多轮对话上下文）
+    req.parsed_messages = parsedMessages
+    req.enable_web_search = chatType === 'search' ? true : false
+
+    // 顶层 chat_type 供路由选择器使用 (selectChatCompletion)
+    body.chat_type = chatType
 
     // 处理图片尺寸
     if (size) {

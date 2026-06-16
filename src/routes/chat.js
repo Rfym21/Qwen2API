@@ -33,7 +33,7 @@ const selectChatCompletion = (req, res, next) => {
     if (chatCompletion) {
         chatCompletion(req, res, next)
     } else {
-        handleImageCompletion(req, res, next)
+        handleImageVideoCompletion(req, res, next)
     }
 }
 
