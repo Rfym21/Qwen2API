@@ -1,202 +1,68 @@
-name: Build Multi-Architecture Docker Image
+name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main, develop ]
-    tags: [ 'v*' ]
-    paths:
-      - 'package.json'  
+    branches:
+      - master
+      - main
+      - study
+    tags:
+      - 'v*'
   pull_request:
-    branches: [ main ]
-    paths:
-      - 'package.json'
+    branches:
+      - master
+      - main
+      - study
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Record build start time
-      id: start-time
-      run: echo "start_time=$(date +%s)" >> $GITHUB_OUTPUT
-    
-    # 📦 从package.json读取name和version
-    - name: Extract package.json metadata
-      id: package-info
-      run: |
-        if [ -f "package.json" ]; then
-          NAME=$(node -p "require('./package.json').name")
-          VERSION=$(node -p "require('./package.json').version")
-          
-          # 清理name：移除scope前缀 (@scope/name → name)
-          CLEAN_NAME=$(echo "$NAME" | sed 's|^@[^/]*/||')
-          
-          echo "name=${NAME}" >> $GITHUB_OUTPUT
-          echo "clean_name=${CLEAN_NAME}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "has_package_json=true" >> $GITHUB_OUTPUT
-          
-          echo "📦 Package name: ${NAME}"
-          echo "📦 Clean name: ${CLEAN_NAME}"
-          echo "📦 Version: ${VERSION}"
-        else
-          # 如果没有package.json，回退到仓库名
-          REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          echo "clean_name=${REPO_NAME}" >> $GITHUB_OUTPUT
-          echo "has_package_json=false" >> $GITHUB_OUTPUT
-          echo "⚠️ No package.json found, using repository name: ${REPO_NAME}"
-        fi
-    
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      with:
-        platforms: linux/amd64,linux/arm64
-    
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v3
-      with:
-        platforms: arm64
-    
-    - name: Login to Docker Hub
-      if: github.event_name != 'pull_request'
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USERNAME }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-    
-    # 🏷️ 使用package.json的name构建镜像名
-    - name: Generate Docker tags
-      id: tags
-      run: |
-        # 使用package.json的name（清理后）作为镜像名
-        DOCKERHUB_REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.package-info.outputs.clean_name }}"
-        
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          # PR: 只生成PR标签用于测试
-          TAGS="${DOCKERHUB_REPO}:pr-${{ github.event.number }}"
-        else
-          # 总是包含latest标签
-          TAGS="${DOCKERHUB_REPO}:latest"
-          
-          # 如果有package.json，添加v前缀版本标签
-          if [ "${{ steps.package-info.outputs.has_package_json }}" = "true" ]; then
-            PACKAGE_VERSION="${{ steps.package-info.outputs.version }}"
-            TAGS="${TAGS},${DOCKERHUB_REPO}:v${PACKAGE_VERSION}"
-            echo "📦 Adding version tag: v${PACKAGE_VERSION}"
-          fi
-        fi
-        
-        echo "repository=${DOCKERHUB_REPO}" >> $GITHUB_OUTPUT
-        echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-        echo "🏷️ Docker repository: ${DOCKERHUB_REPO}"
-        echo "🏷️ Generated tags: ${TAGS}"
-    
-    # 🏗️ 构建和推送
-    - name: Build and push multi-architecture image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./docker/Dockerfile
-        platforms: linux/amd64,linux/arm64
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.tags.outputs.tags }}
-        # 添加构建标签
-        labels: |
-          org.opencontainers.image.title=${{ steps.package-info.outputs.name || github.event.repository.name }}
-          org.opencontainers.image.description=Auto-built from ${{ github.ref_name }}
-          org.opencontainers.image.version=${{ steps.package-info.outputs.version || 'unknown' }}
-          org.opencontainers.image.source=${{ github.event.repository.html_url }}
-          org.opencontainers.image.revision=${{ github.sha }}
-          org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        outputs: type=image,name=target
-    
-    # 📊 构建摘要
-    - name: Calculate build duration and summary
-      id: build-summary
-      run: |
-        start_time=${{ steps.start-time.outputs.start_time }}
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
-        minutes=$((duration / 60))
-        seconds=$((duration % 60))
-        
-        echo "Build completed in ${minutes}m ${seconds}s"
-        echo "build_duration=${duration}" >> $GITHUB_OUTPUT
-        echo "formatted_duration=${minutes}m ${seconds}s" >> $GITHUB_OUTPUT
-        
-        echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| **Event Type** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Branch/Tag** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Commit SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Build Duration** | **${minutes}m ${seconds}s** |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Architectures** | \`linux/amd64\`, \`linux/arm64\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Docker Repository** | \`${{ steps.tags.outputs.repository }}\` |" >> $GITHUB_STEP_SUMMARY
-        
-        if [ "${{ steps.package-info.outputs.has_package_json }}" = "true" ]; then
-          echo "| **Package Name** | \`${{ steps.package-info.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Package Version** | \`${{ steps.package-info.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| **Source** | Repository name (no package.json) |" >> $GITHUB_STEP_SUMMARY
-        fi
-        
-        if [ "${{ github.event_name }}" != "pull_request" ]; then
-          echo "| **Action** | ✅ **Built and Pushed** |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Registry** | Docker Hub |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Generated Tags:" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.tags.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🎯 Usage Examples:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "# Pull latest version (recommended)" >> $GITHUB_STEP_SUMMARY
-          echo "docker pull ${{ steps.tags.outputs.repository }}:latest" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.package-info.outputs.has_package_json }}" = "true" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "# Pull specific version" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ${{ steps.tags.outputs.repository }}:v${{ steps.package-info.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "# Run container" >> $GITHUB_STEP_SUMMARY
-          echo "docker run -p 3000:3000 ${{ steps.tags.outputs.repository }}:latest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| **Action** | 🔍 **Built Only (PR)** |" >> $GITHUB_STEP_SUMMARY
-        fi
-    
-    - name: Build performance check
-      if: steps.build-summary.outputs.build_duration > 600
-      run: |
-        echo "⚠️ Warning: Build took longer than 10 minutes (${{ steps.build-summary.outputs.formatted_duration }})"
-        echo "Consider optimizing:"
-        echo "- Review Dockerfile for unnecessary operations"
-        echo "- Check if cache is working properly" 
-        echo "- Consider using multi-stage builds"
+    permissions:
+      contents: read
+      packages: write
 
-    - name: Build success notification
-      run: |
-        echo "✅ Multi-architecture Docker image build completed successfully!"
-        echo "📊 Build Duration: ${{ steps.build-summary.outputs.formatted_duration }}"
-        echo "🏗️ Architectures: linux/amd64, linux/arm64"
-        echo "🐳 Docker Repository: ${{ steps.tags.outputs.repository }}"
-        
-        if [ "${{ github.event_name }}" != "pull_request" ]; then
-          echo "📤 Pushed to Docker Hub: ${{ steps.tags.outputs.repository }}"
-          echo "🏷️ Tags pushed:"
-          echo "  - latest (always updated)"
-          if [ "${{ steps.package-info.outputs.has_package_json }}" = "true" ]; then
-            echo "  - v${{ steps.package-info.outputs.version }} (from package.json)"
-            echo "📦 Package: ${{ steps.package-info.outputs.name }}"
-          fi
-        else
-          echo "🔍 PR Build: Images built but not pushed"
-        fi
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
