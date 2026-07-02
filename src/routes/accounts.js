@@ -266,9 +266,22 @@ const runBatchAccountTask = async (task, newAccounts) => {
   }
 }
 
+// 账号令牌（JWT）掩码占位符
+const ACCOUNT_TOKEN_MASK = '••••••••'
+
+/**
+ * 掩码账号令牌，避免 getAllAccounts 明文返回 JWT。
+ * JWT 相当于登录该 Qwen 账号的凭证，一旦管理密钥泄露即可被批量窃取。
+ * 令牌不会被前端回传（新增账号用 email+password 重新登录，编辑代理/刷新仅用 email），
+ * 故掩码不会破坏任何回写流程；账号仍可通过 email 区分，刷新是否成功可由 expires 变化判断。
+ * @param {string|null|undefined} token 原始 JWT
+ * @returns {string} 存在令牌时返回掩码占位符，否则返回空串
+ */
+const maskAccountToken = (token) => (token ? ACCOUNT_TOKEN_MASK : '')
+
 /**
  * 获取所有账号（分页）
- * 
+ *
  * @param {number} page 页码
  * @param {number} pageSize 每页数量
  * @returns {Object} 账号列表
@@ -291,7 +304,7 @@ router.get('/getAllAccounts', adminKeyVerify, async (req, res) => {
       return {
         email: account.email,
         password: account.password,
-        token: account.token,
+        token: maskAccountToken(account.token),
         expires: account.expires,
         proxy: account.proxy ?? null
       }
