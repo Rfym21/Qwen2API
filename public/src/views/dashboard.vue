@@ -196,7 +196,7 @@
                     <span class="text-gray-700 min-w-[96px] text-left font-semibold">🔐 Token:</span>
                     <span class="font-medium whitespace-nowrap text-left text-sm">{{ token.token }}</span>
                   </div>
-                  <button @click="copyToClipboard(token.token)" class="absolute right-2 opacity-0 hover:opacity-100 transition-opacity bg-blue-200 hover:bg-blue-300 rounded px-2 py-1 text-base">📋</button>
+                  <!-- token 已由后端掩码，复制按钮无意义，故移除 -->
                 </div>
                 <div class="relative flex items-center bg-blue-50/80 rounded-lg px-2 py-1">
                   <div class="overflow-x-auto scrollbar-hide flex-1 flex items-center space-x-2">
