@@ -152,6 +152,41 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         }
 
         /**
+         * 写一个推理增量（DeepSeek-R1 风格 reasoning_content 字段）
+         * @param {string} text - 推理文本
+         */
+        const writeReasoningDelta = (text) => {
+            if (!text) return
+            res.write(`data: ${JSON.stringify({
+                "id": `chatcmpl-${message_id}`,
+                "object": "chat.completion.chunk",
+                "created": Math.round(new Date().getTime() / 1000),
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": { "reasoning_content": text },
+                        "finish_reason": null
+                    }
+                ]
+            })}\n\n`)
+        }
+
+        /**
+         * 发送回复正文增量：有工具解析器则先过解析，否则直接写 content
+         * @param {string} text - 回复正文文本
+         */
+        const emitAnswerContent = (text) => {
+            if (!text) return
+            if (toolParser) {
+                const parsed = toolParser.push(text)
+                if (parsed.textDelta) writeContentDelta(parsed.textDelta)
+                if (parsed.completedCalls.length > 0) writeToolCallsDelta(parsed.completedCalls)
+            } else {
+                writeContentDelta(text)
+            }
+        }
+
+        /**
          * 写一个工具调用增量，按 OpenAI 规范分片：
          *   1) 头块：包含 index/id/type 与 function.name + 空 arguments
          *   2) 多个参数块：function.arguments 切片
@@ -265,34 +300,64 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             let content = delta.content
             completionContent += content
 
-            if (delta.phase === 'think' && !thinking_start) {
-                thinking_start = true
-                if (web_search_info) {
-                    content = `<think>\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n${content}`
-                } else {
-                    content = `<think>\n\n${content}`
+            if (config.legacyReasoningInContent) {
+                // 旧版：推理以 <think>...</think> 包裹并入 content
+                if (delta.phase === 'think' && !thinking_start) {
+                    thinking_start = true
+                    if (web_search_info) {
+                        content = `<think>\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n${content}`
+                    } else {
+                        content = `<think>\n\n${content}`
+                    }
                 }
+                if (delta.phase === 'answer' && !thinking_end && thinking_start) {
+                    thinking_end = true
+                    if (pendingImageMarkdownList.length > 0) {
+                        const pendingImageContent = `${pendingImageMarkdownList.join('\n\n')}\n\n`
+                        content = `\n\n</think>\n${pendingImageContent}${content}`
+                        completionContent += pendingImageContent
+                        pendingImageMarkdownList.forEach(item => emittedImageMarkdownSet.add(item))
+                        pendingImageMarkdownList = []
+                    } else {
+                        content = `\n\n</think>\n${content}`
+                    }
+                }
+
+                if (toolParser && delta.phase === 'answer') {
+                    const parsed = toolParser.push(content)
+                    if (parsed.textDelta) writeContentDelta(parsed.textDelta)
+                    if (parsed.completedCalls.length > 0) writeToolCallsDelta(parsed.completedCalls)
+                } else {
+                    writeContentDelta(content)
+                }
+                return
             }
-            if (delta.phase === 'answer' && !thinking_end && thinking_start) {
+
+            // 新版（默认）：推理走 reasoning_content，content 仅为回复正文
+            if (delta.phase === 'think') {
+                if (!thinking_start) {
+                    thinking_start = true
+                    if (web_search_info) {
+                        const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
+                        content = `${webSearchTable}\n\n${content}`
+                    }
+                }
+                writeReasoningDelta(content)
+                return
+            }
+
+            // delta.phase === 'answer'：首次进入 answer 时结束思考，并冲刷 think 阶段缓存的图片
+            if (!thinking_end && thinking_start) {
                 thinking_end = true
                 if (pendingImageMarkdownList.length > 0) {
                     const pendingImageContent = `${pendingImageMarkdownList.join('\n\n')}\n\n`
-                    content = `\n\n</think>\n${pendingImageContent}${content}`
                     completionContent += pendingImageContent
                     pendingImageMarkdownList.forEach(item => emittedImageMarkdownSet.add(item))
                     pendingImageMarkdownList = []
-                } else {
-                    content = `\n\n</think>\n${content}`
+                    content = `${pendingImageContent}${content}`
                 }
             }
-
-            if (toolParser && delta.phase === 'answer') {
-                const parsed = toolParser.push(content)
-                if (parsed.textDelta) writeContentDelta(parsed.textDelta)
-                if (parsed.completedCalls.length > 0) writeToolCallsDelta(parsed.completedCalls)
-            } else {
-                writeContentDelta(content)
-            }
+            emitAnswerContent(content)
         }
 
         /**
@@ -369,7 +434,12 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         }
 
         // 处理最终的搜索信息
-        if ((config.outThink === false || !enable_thinking) && web_search_info && config.searchInfoMode === "text") {
+        // 旧版：维持原行为（outThink 关闭或未思考时把搜索表格追加到 content 末尾）
+        // 新版：搜索表格已在 think 阶段写入 reasoning_content，思考开启时不再追加到 content，避免重复
+        const appendSearchToContent = config.legacyReasoningInContent
+            ? (config.outThink === false || !enable_thinking)
+            : !enable_thinking
+        if (appendSearchToContent && web_search_info && config.searchInfoMode === "text") {
             const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, "text")
             writeContentDelta(`\n\n---\n${webSearchTable}`)
         }
@@ -435,6 +505,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
     try {
         let fullContent = ''
+        let fullReasoning = '' // 新版模式下累积的推理内容（reasoning_content）
         let web_search_info = null
         let thinking_start = false
         let thinking_end = false
@@ -539,27 +610,48 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
 
                         let content = delta.content
 
-                        if (delta.phase === 'think' && !thinking_start) {
-                            thinking_start = true
-                            if (web_search_info) {
+                        if (config.legacyReasoningInContent) {
+                            // 旧版：推理以 <think>...</think> 包裹并入 content
+                            if (delta.phase === 'think' && !thinking_start) {
+                                thinking_start = true
+                                if (web_search_info) {
+                                    const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
+                                    content = `<think>\n\n${webSearchTable}\n\n${content}`
+                                } else {
+                                    content = `<think>\n\n${content}`
+                                }
+                            }
+                            if (delta.phase === 'answer' && !thinking_end && thinking_start) {
+                                thinking_end = true
+                                if (pendingImageMarkdownList.length > 0) {
+                                    content = `\n\n</think>\n${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
+                                    pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
+                                    pendingImageMarkdownList = []
+                                } else {
+                                    content = `\n\n</think>\n${content}`
+                                }
+                            }
+                            fullContent += content
+                        } else if (delta.phase === 'think') {
+                            // 新版：推理累积到 reasoning_content
+                            if (!thinking_start && web_search_info) {
                                 const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)
-                                content = `<think>\n\n${webSearchTable}\n\n${content}`
-                            } else {
-                                content = `<think>\n\n${content}`
+                                content = `${webSearchTable}\n\n${content}`
                             }
-                        }
-                        if (delta.phase === 'answer' && !thinking_end && thinking_start) {
-                            thinking_end = true
-                            if (pendingImageMarkdownList.length > 0) {
-                                content = `\n\n</think>\n${pendingImageMarkdownList.join('\n\n')}\n\n${content}`
-                                pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
-                                pendingImageMarkdownList = []
-                            } else {
-                                content = `\n\n</think>\n${content}`
+                            thinking_start = true
+                            fullReasoning += content
+                        } else {
+                            // 新版 answer 阶段：先冲刷缓存图片，再累积正文
+                            if (!thinking_end && thinking_start) {
+                                thinking_end = true
+                                if (pendingImageMarkdownList.length > 0) {
+                                    fullContent += `${pendingImageMarkdownList.join('\n\n')}\n\n`
+                                    pendingImageMarkdownList.forEach(it => appendedImageMarkdownSet.add(it))
+                                    pendingImageMarkdownList = []
+                                }
                             }
+                            fullContent += content
                         }
-
-                        fullContent += content
                     } catch (error) {
                         logger.error('非流式数据处理错误', 'CHAT', '', error)
                     }
@@ -612,15 +704,18 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             }
         }
 
-        // 处理最终的搜索信息
-        if ((config.outThink === false || !enable_thinking) && web_search_info && config.searchInfoMode === "text") {
+        // 处理最终的搜索信息（同流式分支：新版模式思考开启时搜索表格已在 reasoning_content，不再追加到 content）
+        const appendSearchToContent = config.legacyReasoningInContent
+            ? (config.outThink === false || !enable_thinking)
+            : !enable_thinking
+        if (appendSearchToContent && web_search_info && config.searchInfoMode === "text") {
             const webSearchTable = await accountManager.generateMarkdownTable(web_search_info, "text")
             assistantContent += `\n\n---\n${webSearchTable}`
         }
 
-        // 计算最终的token使用量
+        // 计算最终的token使用量（推理内容计入 completion，与 DeepSeek 一致；旧版 fullReasoning 为空）
         if (totalTokens.prompt_tokens === 0 && totalTokens.completion_tokens === 0) {
-            totalTokens = createUsageObject(requestBody?.messages || promptText, fullContent, null)
+            totalTokens = createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent, null)
             logger.info(`非流式使用tiktoken计算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
         } else {
             logger.info(`非流式使用上游真实Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
@@ -634,6 +729,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         attributeChatUsage(options.currentAccount, totalTokens)
 
         const assistantMessage = { role: 'assistant', content: assistantContent || null }
+        if (fullReasoning) {
+            assistantMessage.reasoning_content = fullReasoning
+        }
         if (toolCalls.length > 0) {
             assistantMessage.tool_calls = toolCalls
         }

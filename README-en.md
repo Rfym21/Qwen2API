@@ -99,6 +99,7 @@ PM2_MAX_MEMORY=1G             # PM2 memory limit (100M/1G/2G, etc.)
 # 🔍 Feature Configuration
 SEARCH_INFO_MODE=table        # Search info display mode (table/text)
 OUTPUT_THINK=true             # Whether to output thinking process (true/false)
+LEGACY_REASONING_IN_CONTENT=false # Reasoning format, false=reasoning_content field, true=legacy <think> inside content (true/false)
 SIMPLE_MODEL_MAP=false        # Simplify model mapping (true/false)
 
 # 🌐 Proxy and Reverse Proxy Configuration
@@ -126,6 +127,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `PM2_MAX_MEMORY` | PM2 memory limit | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | Search result display format | `table` or [text](file://d:\Code\Qwen2API\src\utils\tool-prompt.js#L206-L206) |
 | `OUTPUT_THINK` | Whether to show AI thinking process | `true` or `false` |
+| `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
 | `SIMPLE_MODEL_MAP` | Simplify model mapping, return basic models without variants only | `true` or `false` |
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Custom CLI API reverse proxy address | `https://your-cli-proxy.com` |
