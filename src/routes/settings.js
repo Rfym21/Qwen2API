@@ -22,6 +22,7 @@ router.get('/settings', adminKeyVerify, async (req, res) => {
     autoRefreshInterval: config.autoRefreshInterval,
     batchLoginConcurrency: config.batchLoginConcurrency,
     outThink: config.outThink,
+    legacyReasoningInContent: config.legacyReasoningInContent,
     searchInfoMode: config.searchInfoMode,
     simpleModelMap: config.simpleModelMap,
     chatRetryCount: config.chatRetryCount,
@@ -146,6 +147,25 @@ router.post('/setOutThink', adminKeyVerify, async (req, res) => {
     })
   } catch (error) {
     logger.error('更新思考输出设置失败', 'CONFIG', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// 更新推理输出格式（旧版：推理并入 content 的 <think> 标签；关闭：推理走 reasoning_content）
+router.post('/setLegacyReasoning', adminKeyVerify, async (req, res) => {
+  try {
+    const { legacyReasoningInContent } = req.body
+    if (typeof legacyReasoningInContent !== 'boolean') {
+      return res.status(400).json({ error: '无效的推理格式设置' })
+    }
+
+    config.legacyReasoningInContent = legacyReasoningInContent
+    res.json({
+      status: true,
+      message: '推理格式设置更新成功'
+    })
+  } catch (error) {
+    logger.error('更新推理格式设置失败', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })

@@ -99,6 +99,7 @@ PM2_MAX_MEMORY=1G             # PM2内存限制 (100M/1G/2G等)
 # 🔍 功能配置
 SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
 OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
+LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content字段，true=旧版<think>并入content (true/false)
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 
 # 🌐 代理与反代配置
@@ -126,6 +127,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `PM2_MAX_MEMORY` | PM2内存限制 | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | 搜索结果展示格式 | `table` 或 `text` |
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
+| `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |

@@ -119,6 +119,7 @@ PM2_MAX_MEMORY=1G             # Ограничение памяти PM2 (100M/1G
 # 🔍 Конфигурация функций
 SEARCH_INFO_MODE=table        # Режим отображения результатов поиска (table/text)
 OUTPUT_THINK=true             # Выводить ли процесс размышления (true/false)
+LEGACY_REASONING_IN_CONTENT=false # Формат рассуждений: false=поле reasoning_content, true=старый режим <think> внутри content (true/false)
 SIMPLE_MODEL_MAP=false        # Упрощенное сопоставление моделей (true/false)
 
 # 🌐 Прокси и обратный прокси
@@ -146,6 +147,7 @@ CACHE_MODE=default            # Режим кэширования изображ
 | `PM2_MAX_MEMORY` | Ограничение памяти PM2 | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | Формат отображения результатов поиска | `table` или `text` |
 | `OUTPUT_THINK` | Отображать ли процесс размышления AI | `true` или `false` |
+| `LEGACY_REASONING_IN_CONTENT` | Формат вывода рассуждений. По умолчанию `false` = рассуждения в отдельном поле `reasoning_content`; `true` = старый режим (`<think>` внутри `content`) | `true` или `false` |
 | `SIMPLE_MODEL_MAP` | Упрощенное сопоставление моделей, возвращает только базовые модели без вариантов | `true` или `false` |
 | `QWEN_CHAT_PROXY_URL` | Пользовательский адрес обратного прокси Chat API | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Пользовательский адрес обратного прокси CLI API | `https://your-cli-proxy.com` |

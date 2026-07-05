@@ -61,6 +61,7 @@ const serverInfo = {
   address: config.listenAddress || 'localhost',
   port: config.listenPort,
   outThink: config.outThink ? '开启' : '关闭',
+  legacyReasoning: config.legacyReasoningInContent ? '开启' : '关闭',
   searchInfoMode: config.searchInfoMode === 'table' ? '表格' : '文本',
   dataSaveMode: config.dataSaveMode,
   logLevel: config.logLevel,

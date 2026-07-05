@@ -104,6 +104,22 @@
                                 class="w-full mt-2 bg-black text-white rounded-lg py-2 hover:bg-white hover:text-black border border-black transition-all duration-300">{{ t('settings.save') }}</button>
                         </div>
                     </div>
+                    <!-- 推理输出格式 -->
+                    <div class="setting-card relative overflow-hidden rounded-2xl p-6 flex flex-col gap-4">
+                        <div class="absolute inset-0 bg-white/30 backdrop-blur-md border border-white/30 rounded-2xl">
+                        </div>
+                        <div class="relative flex flex-col gap-2">
+                            <label class="text-gray-700 font-semibold">{{ t('settings.reasoningFormat') }}</label>
+                            <div class="flex items-center gap-2">
+                                <input v-model="settings.legacyReasoningInContent" type="checkbox"
+                                    class="h-5 w-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500">
+                                <span>{{ t('settings.enableLegacyReasoning') }}</span>
+                            </div>
+                            <span class="text-xs text-gray-500">{{ t('settings.legacyReasoningHint') }}</span>
+                            <button @click="saveLegacyReasoning"
+                                class="w-full mt-2 bg-black text-white rounded-lg py-2 hover:bg-white hover:text-black border border-black transition-all duration-300">{{ t('settings.save') }}</button>
+                        </div>
+                    </div>
                     <!-- 搜索信息模式 -->
                     <div class="setting-card relative overflow-hidden rounded-2xl p-6 flex flex-col gap-4">
                         <div class="absolute inset-0 bg-white/30 backdrop-blur-md border border-white/30 rounded-2xl">
@@ -195,6 +211,7 @@ const settings = ref({
     autoRefreshInterval: 21600,
     batchLoginConcurrency: 5,
     outThink: false,
+    legacyReasoningInContent: false,
     searchInfoMode: 'table',
     simpleModelMap: false,
     chatRetryCount: 1,
@@ -220,6 +237,7 @@ const loadSettings = async () => {
         settings.value.autoRefreshInterval = res.data.autoRefreshInterval
         settings.value.batchLoginConcurrency = res.data.batchLoginConcurrency
         settings.value.outThink = res.data.outThink
+        settings.value.legacyReasoningInContent = res.data.legacyReasoningInContent
         settings.value.searchInfoMode = res.data.searchInfoMode
         settings.value.simpleModelMap = res.data.simpleModelMap
         if (res.data.chatRetryCount !== undefined) settings.value.chatRetryCount = res.data.chatRetryCount
@@ -272,6 +290,16 @@ const saveOutThink = async () => {
         alert(t('smsg.thinkSaved'))
     } catch (error) {
         alert(t('smsg.thinkFailed') + error.message)
+    }
+}
+const saveLegacyReasoning = async () => {
+    try {
+        await axios.post('/api/setLegacyReasoning', { legacyReasoningInContent: settings.value.legacyReasoningInContent }, {
+            headers: { 'Authorization': localStorage.getItem('apiKey') || '' }
+        })
+        alert(t('smsg.legacyReasoningSaved'))
+    } catch (error) {
+        alert(t('smsg.legacyReasoningFailed') + error.message)
     }
 }
 const saveSearchInfoMode = async () => {

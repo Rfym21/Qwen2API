@@ -30,6 +30,8 @@ const config = {
     listenPort: process.env.SERVICE_PORT || 3000,
     searchInfoMode: process.env.SEARCH_INFO_MODE === 'table' ? "table" : "text",
     outThink: process.env.OUTPUT_THINK === 'true' ? true : false,
+    // 推理输出格式：默认 false = 推理走 reasoning_content 字段；true = 旧版行为（<think> 并入 content）
+    legacyReasoningInContent: process.env.LEGACY_REASONING_IN_CONTENT === 'true' ? true : false,
     redisURL: process.env.REDIS_URL || null,
     autoRefresh: true,
     autoRefreshInterval: 6 * 60 * 60,

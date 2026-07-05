@@ -46,6 +46,7 @@ const processRequestBody = async (req, res, next) => {
         models: [await parserModel(model)],
         chat_type: isChatType(model),
         feature_config: {
+          output_schema: 'phase', // 必需：缺失时上游不再返回 delta.phase，chat.js 会丢弃全部增量（completion=0）
           thinking_enabled: thinkingConfig.thinking_enabled,
           research_mode: 'normal',
           auto_thinking: true,
