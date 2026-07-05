@@ -101,6 +101,7 @@ SEARCH_INFO_MODE=table        # Search info display mode (table/text)
 OUTPUT_THINK=true             # Whether to output thinking process (true/false)
 LEGACY_REASONING_IN_CONTENT=false # Reasoning format, false=reasoning_content field, true=legacy <think> inside content (true/false)
 SIMPLE_MODEL_MAP=false        # Simplify model mapping (true/false)
+MODELS_CACHE_TTL=3600         # Model list cache TTL in seconds, 0=never expires
 
 # 🌐 Proxy and Reverse Proxy Configuration
 QWEN_CHAT_PROXY_URL=          # Custom Chat API reverse proxy URL (default: https://chat.qwen.ai)
@@ -129,6 +130,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `OUTPUT_THINK` | Whether to show AI thinking process | `true` or `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
 | `SIMPLE_MODEL_MAP` | Simplify model mapping, return basic models without variants only | `true` or `false` |
+| `MODELS_CACHE_TTL` | Model list cache TTL in seconds; after expiry the next request refreshes it from upstream; `0` = never expires | `3600` |
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Custom CLI API reverse proxy address | `https://your-cli-proxy.com` |
 | `PROXY_URL` | Outbound request proxy address, supports HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
