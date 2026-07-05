@@ -4,13 +4,20 @@ const { getSsxmodItna, getSsxmodItna2 } = require('../utils/ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('../utils/proxy-helper')
 const { generateUUID } = require('../utils/tools.js')
 const { logger } = require('../utils/logger')
+const config = require('../config/index.js')
 
 let cachedModels = null
+let cachedModelsAt = 0
 let fetchPromise = null
 
+// 缓存是否已过期（modelsCacheTtl = 0 表示永不过期）
+const isCacheExpired = () => {
+    return config.modelsCacheTtl > 0 && Date.now() - cachedModelsAt > config.modelsCacheTtl * 1000
+}
+
 const getLatestModels = async (force = false) => {
-    // 如果有缓存且不强制刷新，直接返回
-    if (cachedModels && !force) {
+    // 如果有缓存、未过期且不强制刷新，直接返回
+    if (cachedModels && !force && !isCacheExpired()) {
         return cachedModels
     }
 
@@ -62,11 +69,17 @@ const getLatestModels = async (force = false) => {
 
     fetchPromise = axios.get(`${chatBaseUrl}/api/models`, requestConfig).then(response => {
         cachedModels = response.data.data
+        cachedModelsAt = Date.now()
         fetchPromise = null
         return cachedModels
     }).catch(error => {
         logger.error(`获取模型列表失败: ${error.message}`, 'MODEL')
         fetchPromise = null
+        // 刷新失败时回退到旧缓存，避免返回空列表；重置时间戳以免每个请求都重试
+        if (cachedModels) {
+            cachedModelsAt = Date.now()
+            return cachedModels
+        }
         return []
     })
 

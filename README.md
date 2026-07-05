@@ -101,6 +101,7 @@ SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
 OUTPUT_THINK=true             # 是否输出思考过程 (true/false)
 LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content字段，true=旧版<think>并入content (true/false)
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
+MODELS_CACHE_TTL=3600         # 模型列表缓存有效期（秒），0=永不过期
 
 # 🌐 代理与反代配置
 QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
@@ -129,6 +130,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
+| `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
 | `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |

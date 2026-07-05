@@ -121,6 +121,7 @@ SEARCH_INFO_MODE=table        # Режим отображения результ
 OUTPUT_THINK=true             # Выводить ли процесс размышления (true/false)
 LEGACY_REASONING_IN_CONTENT=false # Формат рассуждений: false=поле reasoning_content, true=старый режим <think> внутри content (true/false)
 SIMPLE_MODEL_MAP=false        # Упрощенное сопоставление моделей (true/false)
+MODELS_CACHE_TTL=3600         # Срок жизни кэша списка моделей (сек), 0=бессрочно
 
 # 🌐 Прокси и обратный прокси
 QWEN_CHAT_PROXY_URL=          # Пользовательский URL обратного прокси Chat API (по умолчанию: https://chat.qwen.ai)
@@ -149,6 +150,7 @@ CACHE_MODE=default            # Режим кэширования изображ
 | `OUTPUT_THINK` | Отображать ли процесс размышления AI | `true` или `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Формат вывода рассуждений. По умолчанию `false` = рассуждения в отдельном поле `reasoning_content`; `true` = старый режим (`<think>` внутри `content`) | `true` или `false` |
 | `SIMPLE_MODEL_MAP` | Упрощенное сопоставление моделей, возвращает только базовые модели без вариантов | `true` или `false` |
+| `MODELS_CACHE_TTL` | Срок жизни кэша списка моделей (в секундах); по истечении следующий запрос обновит список; `0` = бессрочный кэш | `3600` |
 | `QWEN_CHAT_PROXY_URL` | Пользовательский адрес обратного прокси Chat API | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Пользовательский адрес обратного прокси CLI API | `https://your-cli-proxy.com` |
 | `PROXY_URL` | Адрес прокси для исходящих запросов, поддержка HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
