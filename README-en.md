@@ -91,11 +91,6 @@ SERVICE_PORT=3000             # Service port
 API_KEY=sk-123456,sk-456789   # API key (required, supports multiple keys)
 ACCOUNTS=                     # Account configuration (format: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
 
-# 🚀 PM2 Multi-process Configuration
-PM2_INSTANCES=1               # Number of PM2 processes (1/number/max)
-PM2_MAX_MEMORY=1G             # PM2 memory limit (100M/1G/2G, etc.)
-                              # Note: All processes in PM2 cluster mode share the same port
-
 # 🔍 Feature Configuration
 SEARCH_INFO_MODE=table        # Search info display mode (table/text)
 OUTPUT_THINK=true             # Whether to output thinking process (true/false)
@@ -115,6 +110,12 @@ BATCH_LOGIN_CONCURRENCY=5     # Login concurrency during batch account addition
 
 # 📸 Cache Configuration
 CACHE_MODE=default            # Image cache mode (default/file)
+
+# 🌐 Temp Chat Mode
+ENABLE_TEMP_CHATS=false       # Enable temporary local chat mode (true/false)
+
+# 🌐 Temp Chat Mode
+ENABLE_TEMP_CHATS=false       # Enable temporary local chat mode (true/false)
 ```
 
 #### 📋 Configuration Description
@@ -124,8 +125,6 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `LISTEN_ADDRESS` | Service listen address | `localhost` or `0.0.0.0` |
 | [SERVICE_PORT](file://d:\Code\Qwen2API\src\start.js#L12-L12) | Service running port | `3000` |
 | `API_KEY` | API access key, supports multi-key configuration. The first is the admin key (can access frontend management page), others are regular keys (API calls only). Multiple keys separated by commas | `sk-admin123,sk-user456,sk-user789` |
-| [PM2_INSTANCES](file://d:\Code\Qwen2API\src\start.js#L11-L11) | Number of PM2 processes | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | PM2 memory limit | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | Search result display format | `table` or [text](file://d:\Code\Qwen2API\src\utils\tool-prompt.js#L206-L206) |
 | `OUTPUT_THINK` | Whether to show AI thinking process | `true` or `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
@@ -140,6 +139,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `REDIS_URL` | Redis database connection address, use `rediss://` protocol when using TLS encryption | `redis://localhost:6379` or `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | Login concurrency during batch account addition, can be adjusted dynamically in frontend system settings | `5` |
 | `CACHE_MODE` | Image cache storage method | `default`/`file` |
+| `ENABLE_TEMP_CHATS` | Enable temporary local chat mode (bypasses persistent session creation) | `true` or `false` |
 | [LOG_LEVEL](file://d:\Code\Qwen2API\backend\core\config.py#L30-L30) | Log level | `DEBUG`/`INFO`/`WARN`/`ERROR` |
 | `ENABLE_FILE_LOG` | Enable file logging | `true` or `false` |
 | `LOG_DIR` | Log file directory | `./logs` |
@@ -241,32 +241,22 @@ git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
 # Install dependencies
-npm install
+pnpm install
 
 # Configure environment variables
 cp .env.example .env
 # Edit .env file
 
-# Smart start (recommended - automatically determines single/multi-process)
-npm start
+# Start (recommended)
+pnpm start
 
 # Development mode
-npm run dev
+pnpm dev
 ```
-
-### 🚀 PM2 Multi-Process Deployment
-
-Use PM2 for production environment multi-process deployment, providing better performance and stability.
-
-**Important Note**: In PM2 cluster mode, all processes share the same port, and PM2 automatically performs load balancing.
 
 ### 🤖 Smart Start Mode
 
-Using `npm start` can automatically determine the startup method:
-
-- When `PM2_INSTANCES=1`, uses single-process mode
-- When `PM2_INSTANCES>1`, uses Node.js cluster mode
-- Automatically limits process count to no more than CPU cores
+Using `pnpm start` starts the server directly with Node.js:
 
 ### ☁️ Hugging Face Deployment
 
@@ -300,8 +290,9 @@ DATA_SAVE_MODE=none
 Qwen2API/
 ├── README.md
 ├── README-en.md
-├── ecosystem.config.js              # PM2 configuration file
 ├── package.json
+├── pnpm-workspace.yaml            # pnpm workspace configuration
+├── pnpm-workspace.yaml            # pnpm workspace configuration
 │
 ├── docker/                          # Docker configuration directory
 │   ├── Dockerfile
@@ -317,7 +308,7 @@ Qwen2API/
 │
 ├── src/                             # Backend source code directory
 │   ├── server.js                    # Main server file
-│   ├── start.js                     # Smart start script (automatically determines single/multi-process)
+│   ├── start.js                     # Server entry point
 │   ├── config/
 │   │   └── index.js                 # Configuration file
 │   ├── controllers/                 # Controllers directory
@@ -375,7 +366,7 @@ Qwen2API/
     │       ├── dashboard.vue        # Dashboard page
     │       └── settings.vue         # Settings page
     ├── package.json                 # Frontend dependency configuration
-    ├── package-lock.json
+    ├── pnpm-lock.yaml
     ├── index.html                   # Frontend entry HTML
     ├── postcss.config.js            # PostCSS configuration
     ├── tailwind.config.js           # TailwindCSS configuration
