@@ -66,7 +66,7 @@ const processRequestBody = async (req, res, next) => {
       incremental_output: true,
       chat_id: null,                    // 由 sendChatRequest 填充
       chatId: null,
-      chat_mode: 'normal',
+      chat_mode: req.body.chat_mode === 'local' ? 'local' : (config.enableTempChats ? 'local' : 'normal'),
       model: await parserModel(model),
       parent_id: null,
       parentId: null,
@@ -190,11 +190,11 @@ const processRequestBody = async (req, res, next) => {
 
     next()
   } catch (e) {
-    logger.error('处理请求体时发生错误', 'MIDDLEWARE', '', e)
+    logger.error('Error processing request body', 'MIDDLEWARE', '', e)
     res.status(500)
       .json({
         status: 500,
-        message: "在处理请求体时发生错误 ~ ~ ~"
+        message: "在Error processing request body ~ ~ ~"
       })
   }
 }

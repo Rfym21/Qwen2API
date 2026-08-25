@@ -19,7 +19,7 @@ const saveAccounts = async (email, password, token, expires, proxy = null) => {
   try {
     // 参数验证
     if (!email || !password) {
-      logger.error('保存账户失败: 邮箱和密码不能为空', 'SETTING')
+      logger.error('Failed to save account: email and password cannot be empty', 'SETTING')
       return false
     }
 
@@ -27,14 +27,14 @@ const saveAccounts = async (email, password, token, expires, proxy = null) => {
     const success = await accountManager.addAccount(email, password, proxy)
 
     if (success) {
-      logger.success(`账户 ${email} 保存成功`, 'SETTING')
+      logger.success(`Account ${email} saved successfully`, 'SETTING')
       return true
     } else {
-      logger.error(`账户 ${email} 保存失败`, 'SETTING')
+      logger.error(`Failed to save account ${email}`, 'SETTING')
       return false
     }
   } catch (error) {
-    logger.error(`保存账户 ${email} 时发生错误`, 'SETTING', '', error)
+    logger.error(`Error while saving account ${email}`, 'SETTING', '', error)
     return false
   }
 }
@@ -48,7 +48,7 @@ const deleteAccount = async (email) => {
   try {
     // 参数验证
     if (!email) {
-      logger.error('删除账户失败: 邮箱不能为空', 'SETTING')
+      logger.error('Failed to delete account: email cannot be empty', 'SETTING')
       return false
     }
 
@@ -56,14 +56,14 @@ const deleteAccount = async (email) => {
     const success = await accountManager.removeAccount(email)
 
     if (success) {
-      logger.success(`账户 ${email} 删除成功`, 'SETTING')
+      logger.success(`Account ${email} deleted successfully`, 'SETTING')
       return true
     } else {
-      logger.error(`账户 ${email} 删除失败`, 'SETTING')
+      logger.error(`Failed to delete account ${email}`, 'SETTING')
       return false
     }
   } catch (error) {
-    logger.error(`删除账户 ${email} 时发生错误`, 'SETTING', '', error)
+    logger.error(`Error while deleting account ${email}`, 'SETTING', '', error)
     return false
   }
 }
@@ -76,7 +76,7 @@ const getAllAccounts = () => {
   try {
     return accountManager.getAllAccountKeys()
   } catch (error) {
-    logger.error('获取账户列表时发生错误', 'SETTING', '', error)
+    logger.error('Error while getting account list', 'SETTING', '', error)
     return []
   }
 }
@@ -89,7 +89,7 @@ const getAccountHealth = () => {
   try {
     return accountManager.getHealthStats()
   } catch (error) {
-    logger.error('获取账户健康状态时发生错误', 'SETTING', '', error)
+    logger.error('Error while getting account health status', 'SETTING', '', error)
     return {
       accounts: { total: 0, valid: 0, expired: 0, expiringSoon: 0, invalid: 0 },
       rotation: { total: 0, available: 0, inCooldown: 0 },
@@ -106,21 +106,21 @@ const getAccountHealth = () => {
 const refreshAccountToken = async (email) => {
   try {
     if (!email) {
-      logger.error('刷新令牌失败: 邮箱不能为空', 'SETTING')
+      logger.error('Token refresh failed: email cannot be empty', 'SETTING')
       return false
     }
 
     const success = await accountManager.refreshAccountToken(email)
 
     if (success) {
-      logger.success(`账户 ${email} 令牌刷新成功`, 'SETTING')
+      logger.success(`Account ${email} token refreshed successfully`, 'SETTING')
       return true
     } else {
-      logger.error(`账户 ${email} 令牌刷新失败`, 'SETTING')
+      logger.error(`Account ${email} token refresh failed`, 'SETTING')
       return false
     }
   } catch (error) {
-    logger.error(`刷新账户 ${email} 令牌时发生错误`, 'SETTING', '', error)
+    logger.error(`Error while refreshing token for account ${email}`, 'SETTING', '', error)
     return false
   }
 }

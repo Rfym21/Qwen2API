@@ -120,11 +120,11 @@ class Account {
 
             this.isInitialized = true
             this.initError = null
-            logger.success(`账户管理器初始化完成，共加载 ${this.accountTokens.length} 个账户`, 'ACCOUNT')
+            logger.success(`Account manager initialized, loaded ${this.accountTokens.length}  accounts`, 'ACCOUNT')
         } catch (error) {
             this.isInitialized = false
             this.initError = error
-            logger.error('账户管理器初始化失败', 'ACCOUNT', '', error)
+            logger.error('Account manager init failed', 'ACCOUNT', '', error)
         }
     }
 
@@ -171,29 +171,29 @@ class Account {
             // 为所有账户启动 CLI 初始化，确保没有 CLI 额度的账号被正确标记为 unsupported
             if (this.accountTokens.length > 0) {
                 if (config.cliEnabled) {
-                    logger.info(`后台初始化所有 ${this.accountTokens.length} 个账户的 CLI`, 'ACCOUNT')
+                    logger.info(`Background init all ${this.accountTokens.length} accounts CLI`, 'ACCOUNT')
                     Promise.allSettled(
                         this.accountTokens.map(account => this._initializeCliAccount(account))
                     ).then(() => {
                         const cliReady = this.accountTokens.filter(a => a.cli_info).length
                         const cliUnsupported = this.accountTokens.filter(a => a.cli_unavailable_reason === 'unsupported').length
-                        logger.success(`CLI 初始化完成: ${cliReady} 个可用, ${cliUnsupported} 个不支持`, 'CLI')
+                        logger.success(`CLI init complete: ${cliReady} available, ${cliUnsupported} unsupported`, 'CLI')
                     })
                 } else {
                     // CLI 关闭时也要标记账户：cli_unavailable_reason 为空的账户会被
                     // cli-support.js 判定为 cli_pending，管理面板会一直显示「CLI 初始化中」。
                     // 该字段不落盘（见 data-persistence 的字段白名单），所以每次启动都要重新标记。
                     this.accountTokens.forEach(account => this._markCliDisabled(account))
-                    logger.info(`CLI 已关闭，${this.accountTokens.length} 个账户标记为 disabled`, 'CLI')
+                    logger.info(`CLI disabled, ${this.accountTokens.length} accounts marked as disabled`, 'CLI')
                 }
             }
 
             // 设置cli定时器 每天00:00:00刷新请求次数
             this._setupDailyResetTimer()
 
-            logger.success(`成功加载 ${this.accountTokens.length} 个账户`, 'ACCOUNT')
+            logger.success(`Successfully loaded ${this.accountTokens.length}  accounts`, 'ACCOUNT')
         } catch (error) {
-            logger.error('加载账户令牌失败', 'ACCOUNT', '', error)
+            logger.error('Failed to load account tokens', 'ACCOUNT', '', error)
             this.accountTokens = []
             this.accountRotator.setAccounts(this.accountTokens)
             throw error
@@ -263,25 +263,25 @@ class Account {
                                 account.cli_info.access_token = refreshToken.access_token
                                 account.cli_info.refresh_token = refreshToken.refresh_token
                                 account.cli_info.expiry_date = refreshToken.expiry_date
-                                logger.info(`CLI账户 ${account.email} 令牌刷新成功`, 'CLI')
+                                logger.info(`CLI account ${account.email} token refresh successful`, 'CLI')
                             }
                         } catch (error) {
-                            logger.error(`CLI账户 ${account.email} 令牌刷新失败`, 'CLI', '', error)
+                            logger.error(`CLI account ${account.email} token refresh failed`, 'CLI', '', error)
                         }
                         // 每2小时刷新一次
                     }, 1000 * 60 * 60 * 2),
                     request_number: 0
                 }
-                logger.success(`CLI账户 ${account.email} 初始化成功`, 'CLI')
+                logger.success(`CLI account ${account.email} init successful`, 'CLI')
             } else {
                 account.cli_info = null
                 account.cli_unavailable_reason = 'unsupported'
-                logger.error(`CLI账户 ${account.email} 初始化失败：无效的响应数据`, 'CLI', '', cliAccount)
+                logger.error(`CLI account ${account.email} init failed: invalid response data`, 'CLI', '', cliAccount)
             }
         } catch (error) {
             account.cli_info = null
             account.cli_unavailable_reason = 'unsupported'
-            logger.error(`CLI账户 ${account.email} 初始化失败`, 'CLI', '', error)
+            logger.error(`CLI account ${account.email} init failed`, 'CLI', '', error)
         }
     }
 
@@ -290,14 +290,14 @@ class Account {
      * @private
      */
     _setupDailyResetTimer() {
-        logger.info('设置每日 00:00 重置定时器（CLI 请求次数 + daily stats）', 'CLI')
+        logger.info('Set daily 00:00 reset timer (CLI request count + daily stats)', 'CLI')
 
         // 计算到下一天00:00:00的毫秒数
         const now = new Date()
         const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0)
         const timeDiff = tomorrow.getTime() - now.getTime()
 
-        logger.info(`距离下次重置还有 ${Math.round(timeDiff / 1000 / 60)} 分钟`, 'CLI')
+        logger.info(`Time until next reset: ${Math.round(timeDiff / 1000 / 60)}  minutes`, 'CLI')
 
         // 首次执行使用setTimeout
         this.cliRequestNumberInterval = setTimeout(() => {
@@ -375,7 +375,7 @@ class Account {
         try {
             await this.dataPersistence.saveAllAccounts(this.accountTokens)
         } catch (error) {
-            logger.error('每日重置后 persist 失败', 'ACCOUNT', '', error)
+            logger.error('Persist failed after daily reset', 'ACCOUNT', '', error)
         }
     }
 
@@ -426,7 +426,7 @@ class Account {
                 validAccounts.push(account)
             } else if (account.email && account.password) {
                 // 尝试重新登录
-                logger.info(`令牌无效，尝试重新登录: ${account.email}`, 'TOKEN', '🔄')
+                logger.info(`Token invalid, retrying login: ${account.email}`, 'TOKEN', '🔄')
                 const newToken = await this.tokenManager.login(account.email, account.password, account)
                 if (newToken) {
                     const decoded = this.tokenManager.validateToken(newToken)
@@ -450,11 +450,11 @@ class Account {
      */
     async autoRefreshTokens(thresholdHours = 24) {
         if (!this.isInitialized) {
-            logger.warn('账户管理器尚未初始化，跳过自动刷新', 'TOKEN')
+            logger.warn('Account manager not initialized, skipping auto-refresh', 'TOKEN')
             return 0
         }
 
-        logger.info('开始自动刷新令牌...', 'TOKEN', '🔄')
+        logger.info('Starting auto token refresh...', 'TOKEN', '🔄')
 
         // 获取需要刷新的账户
         const needsRefresh = this.accountTokens.filter(account =>
@@ -462,11 +462,11 @@ class Account {
         )
 
         if (needsRefresh.length === 0) {
-            logger.info('没有需要刷新的令牌', 'TOKEN')
+            logger.info('No tokens need refreshing', 'TOKEN')
             return 0
         }
 
-        logger.info(`发现 ${needsRefresh.length} 个令牌需要刷新`, 'TOKEN')
+        logger.info(`Found ${needsRefresh.length}  tokens needing refresh`, 'TOKEN')
 
         let successCount = 0
         let failedCount = 0
@@ -494,17 +494,17 @@ class Account {
                     this.accountRotator.resetFailures(account.email)
                     successCount++
 
-                    logger.info(`账户 ${account.email} 令牌刷新并保存成功 (${successCount}/${needsRefresh.length})`, 'TOKEN', '✅')
+                    logger.info(`Account ${account.email} token refresh and save successful (${successCount}/${needsRefresh.length})`, 'TOKEN', '✅')
                 } else {
                     // 记录失败的账户
                     this.accountRotator.recordFailure(account.email)
                     failedCount++
-                    logger.error(`账户 ${account.email} 令牌刷新失败 (${failedCount} 个失败)`, 'TOKEN', '❌')
+                    logger.error(`Account ${account.email} token refresh failed (${failedCount} failures)`, 'TOKEN', '❌')
                 }
             } catch (error) {
                 this.accountRotator.recordFailure(account.email)
                 failedCount++
-                logger.error(`账户 ${account.email} 刷新过程中出错`, 'TOKEN', '', error)
+                logger.error(`Account ${account.email} error during refresh`, 'TOKEN', '', error)
             }
 
             // 添加延迟避免请求过于频繁
@@ -514,7 +514,7 @@ class Account {
         // 更新轮询器
         this.accountRotator.setAccounts(this.accountTokens)
 
-        logger.success(`令牌刷新完成: 成功 ${successCount} 个，失败 ${failedCount} 个`, 'TOKEN')
+        logger.success(`Token refresh complete: succeeded ${successCount} , failed ${failedCount}`, 'TOKEN')
         return successCount
     }
 
@@ -524,18 +524,18 @@ class Account {
      */
     getAccount() {
         if (!this.isInitialized) {
-            logger.warn('账户管理器尚未初始化完成', 'ACCOUNT')
+            logger.warn('Account manager not fully initialized', 'ACCOUNT')
             return null
         }
 
         if (this.accountTokens.length === 0) {
-            logger.error('没有可用的账户令牌', 'ACCOUNT')
+            logger.error('No available account tokens', 'ACCOUNT')
             return null
         }
 
         const account = this.accountRotator.getNextAccount()
         if (!account) {
-            logger.error('所有账户令牌都不可用', 'ACCOUNT')
+            logger.error('All account tokens unavailable', 'ACCOUNT')
         }
 
         return account
@@ -594,7 +594,7 @@ class Account {
                 })
             }
         } catch (error) {
-            logger.error('保存更新后的账户数据失败', 'ACCOUNT', '', error)
+            logger.error('Failed to save updated account data', 'ACCOUNT', '', error)
         }
     }
 
@@ -606,7 +606,7 @@ class Account {
     async refreshAccountToken(email) {
         const account = this.accountTokens.find(acc => acc.email === email)
         if (!account) {
-            logger.error(`未找到邮箱为 ${email} 的账户`, 'ACCOUNT')
+            logger.error(`Account with email ${email} not found`, 'ACCOUNT')
             return false
         }
 
@@ -779,7 +779,7 @@ class Account {
         try {
             this.dataPersistence.saveAccountStats(email, account.stats)
         } catch (error) {
-            logger.error(`accumulateStats persist 调度失败 (${email})`, 'STATS', '', error)
+            logger.error(`accumulateStats persist scheduling failed (${email})`, 'STATS', '', error)
         }
     }
 
@@ -803,20 +803,20 @@ class Account {
             // 检查账户是否已存在
             const existingAccount = this.accountTokens.find(acc => acc.email === email)
             if (existingAccount) {
-                logger.warn(`账户 ${email} 已存在`, 'ACCOUNT')
+                logger.warn(`Account ${email} already exists`, 'ACCOUNT')
                 return false
             }
 
             // 尝试登录获取令牌
             const token = await this.tokenManager.login(email, password, proxy ? { proxy } : undefined)
             if (!token) {
-                logger.error(`账户 ${email} 登录失败，无法添加`, 'ACCOUNT')
+                logger.error(`Account ${email} login failed, cannot add`, 'ACCOUNT')
                 return false
             }
 
             const decoded = this.tokenManager.validateToken(token)
             if (!decoded) {
-                logger.error(`账户 ${email} 令牌无效，无法添加`, 'ACCOUNT')
+                logger.error(`Account ${email} token invalid, cannot add`, 'ACCOUNT')
                 return false
             }
 
@@ -838,7 +838,7 @@ class Account {
             if (!saved) {
                 this.accountTokens.splice(insertedIndex, 1)
                 this.accountRotator.setAccounts(this.accountTokens)
-                logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
+                logger.error(`Account ${email} persistence failed, rolled back in-memory data`, 'ACCOUNT')
                 return false
             }
 
@@ -847,13 +847,13 @@ class Account {
 
             // 后台初始化 CLI
             this._initializeCliAccount(newAccount).catch(err => {
-                logger.error(`新账户 CLI 初始化失败: ${email}`, 'ACCOUNT', '', err)
+                logger.error(`New Account CLI init failed: ${email}`, 'ACCOUNT', '', err)
             })
 
-            logger.success(`成功添加账户: ${email}`, 'ACCOUNT')
+            logger.success(`Successfully added account: ${email}`, 'ACCOUNT')
             return true
         } catch (error) {
-            logger.error(`添加账户失败 (${email})`, 'ACCOUNT', '', error)
+            logger.error(`Failed to add account (${email})`, 'ACCOUNT', '', error)
             return false
         }
     }
@@ -872,7 +872,7 @@ class Account {
             // 检查账户是否已存在
             const existingAccount = this.accountTokens.find(acc => acc.email === email)
             if (existingAccount) {
-                logger.warn(`账户 ${email} 已存在`, 'ACCOUNT')
+                logger.warn(`Account ${email} already exists`, 'ACCOUNT')
                 return false
             }
 
@@ -894,7 +894,7 @@ class Account {
             if (!saved) {
                 this.accountTokens.splice(insertedIndex, 1)
                 this.accountRotator.setAccounts(this.accountTokens)
-                logger.error(`账户 ${email} 持久化失败，已回滚内存数据`, 'ACCOUNT')
+                logger.error(`Account ${email} persistence failed, rolled back in-memory data`, 'ACCOUNT')
                 return false
             }
 
@@ -903,13 +903,13 @@ class Account {
 
             // 后台初始化 CLI
             this._initializeCliAccount(newAccount).catch(err => {
-                logger.error(`新账户 CLI 初始化失败: ${email}`, 'ACCOUNT', '', err)
+                logger.error(`New Account CLI init failed: ${email}`, 'ACCOUNT', '', err)
             })
 
-            logger.success(`成功添加账户: ${email}`, 'ACCOUNT')
+            logger.success(`Successfully added account: ${email}`, 'ACCOUNT')
             return true
         } catch (error) {
-            logger.error(`添加账户失败 (${email})`, 'ACCOUNT', '', error)
+            logger.error(`Failed to add account (${email})`, 'ACCOUNT', '', error)
             return false
         }
     }
@@ -925,7 +925,7 @@ class Account {
         try {
             const account = this.accountTokens.find(acc => acc.email === email)
             if (!account) {
-                logger.warn(`账户 ${email} 不存在`, 'ACCOUNT')
+                logger.warn(`Account ${email} does not exist`, 'ACCOUNT')
                 return false
             }
 
@@ -933,7 +933,7 @@ class Account {
             const newProxy = (typeof proxy === 'string' && proxy.trim()) ? proxy.trim() : null
 
             if (oldProxy === newProxy) {
-                logger.info(`账户 ${email} 代理未变化，无需更新`, 'ACCOUNT')
+                logger.info(`Account ${email} proxy unchanged, no update needed`, 'ACCOUNT')
                 return true
             }
 
@@ -947,7 +947,7 @@ class Account {
             })
             if (!saved) {
                 account.proxy = oldProxy
-                logger.error(`账户 ${email} 代理持久化失败，已回滚内存数据`, 'ACCOUNT')
+                logger.error(`Account ${email} proxy persistence failed, rolled back in-memory data`, 'ACCOUNT')
                 return false
             }
 
@@ -959,10 +959,10 @@ class Account {
                 invalidateProxyAgent(oldProxy)
             }
 
-            logger.success(`账户 ${email} 代理更新成功 (${oldProxy || '无'} → ${newProxy || '无'})`, 'ACCOUNT')
+            logger.success(`Account ${email} proxy update successful (${oldProxy || 'none'} -> ${newProxy || 'none'})`, 'ACCOUNT')
             return true
         } catch (error) {
-            logger.error(`更新账户 ${email} 代理失败`, 'ACCOUNT', '', error)
+            logger.error(`Updating account ${email} proxy update failed`, 'ACCOUNT', '', error)
             return false
         }
     }
@@ -976,7 +976,7 @@ class Account {
         try {
             const index = this.accountTokens.findIndex(acc => acc.email === email)
             if (index === -1) {
-                logger.warn(`账户 ${email} 不存在`, 'ACCOUNT')
+                logger.warn(`Account ${email} does not exist`, 'ACCOUNT')
                 return false
             }
 
@@ -986,10 +986,10 @@ class Account {
             // 更新轮询器
             this.accountRotator.setAccounts(this.accountTokens)
 
-            logger.success(`成功移除账户: ${email}`, 'ACCOUNT')
+            logger.success(`Successfully removed account: ${email}`, 'ACCOUNT')
             return true
         } catch (error) {
-            logger.error(`移除账户失败 (${email})`, 'ACCOUNT', '', error)
+            logger.error(`Failed to remove account (${email})`, 'ACCOUNT', '', error)
             return false
         }
     }
@@ -1016,7 +1016,7 @@ class Account {
      */
     async initializeCliForAccount(account) {
         if (!account) {
-            logger.error('账户对象不能为空', 'CLI')
+            logger.error('Account object cannot be empty', 'CLI')
             return false
         }
 
@@ -1024,7 +1024,7 @@ class Account {
             await this._initializeCliAccount(account)
             return true
         } catch (error) {
-            logger.error(`为账户 ${account.email} 初始化CLI失败`, 'CLI', '', error)
+            logger.error(`Initializing CLI for account ${account.email} initializing CLI failed`, 'CLI', '', error)
             return false
         }
     }
@@ -1068,13 +1068,13 @@ class Account {
         })
 
         this.accountRotator.reset()
-        logger.info('账户管理器已清理资源', 'ACCOUNT', '🧹')
+        logger.info('Account manager resources cleaned up', 'ACCOUNT', '🧹')
     }
 
 }
 
 if (!(process.env.API_KEY || config.apiKey)) {
-    logger.error('请务必设置 API_KEY 环境变量', 'CONFIG', '⚙️')
+    logger.error('Please set API_KEY environment variable', 'CONFIG', '⚙️')
     process.exit(1)
 }
 

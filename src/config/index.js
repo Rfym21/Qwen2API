@@ -59,6 +59,8 @@ const config = {
         6,
         Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
     ),
+    // 是否启用临时本地聊天模式(chat_mode=local);可被单个请求的 chat_mode 字段覆盖
+    enableTempChats: process.env.ENABLE_TEMP_CHATS === 'true',
     // chat.qwen.ai 的 WAF 会在 JSON 请求体接近 128 KiB 时返回 captcha。
     // 提前把 Agent 全量历史外置成文本文档，给协议头和当前回合留出安全余量。
     agentContextFileThresholdBytes: Math.max(

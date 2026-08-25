@@ -100,7 +100,7 @@ class CliAuthManager {
                 }
             } else {
                 const responseBody = await this.readResponseBody(response)
-                logger.error('CLI设备授权初始化失败', 'CLI', '', {
+                logger.error('CLI device authorization init failed', 'CLI', '', {
                     status: response.status,
                     statusText: response.statusText,
                     body: responseBody
@@ -108,7 +108,7 @@ class CliAuthManager {
                 throw new Error('device_flow_failed')
             }
         } catch (error) {
-            logger.error('CLI设备授权流程异常', 'CLI', '', {
+            logger.error('CLI device authorization flow error', 'CLI', '', {
                 url: `${chatBaseUrl}/api/v1/oauth2/device/code`,
                 message: error.message
             })
@@ -155,7 +155,7 @@ class CliAuthManager {
                 return true
             } else {
                 const responseBody = await this.readResponseBody(response)
-                logger.error('CLI设备授权确认失败', 'CLI', '', {
+                logger.error('CLI device authorization confirmation failed', 'CLI', '', {
                     status: response.status,
                     statusText: response.statusText,
                     body: responseBody
@@ -163,7 +163,7 @@ class CliAuthManager {
                 throw new Error('authorize_failed')
             }
         } catch (error) {
-            logger.error('CLI设备授权确认异常', 'CLI', '', {
+            logger.error('CLI device authorization confirmation error', 'CLI', '', {
                 url: `${chatBaseUrl}/api/v2/oauth2/authorize`,
                 message: error.message
             })
@@ -216,14 +216,14 @@ class CliAuthManager {
                     }
 
                     if (!credentials.access_token || !credentials.refresh_token || !credentials.expiry_date) {
-                        logger.error('CLI轮询令牌成功但返回数据不完整', 'CLI', '', tokenData)
+                        logger.error('CLI poll token succeeded but returned incomplete data', 'CLI', '', tokenData)
                     }
 
                     return credentials
                 }
 
                 const responseBody = await this.readResponseBody(response)
-                logger.warn(`CLI轮询令牌未完成 (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
+                logger.warn(`CLI poll token incomplete (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
                     status: response.status,
                     statusText: response.statusText,
                     body: responseBody
@@ -234,7 +234,7 @@ class CliAuthManager {
             } catch (error) {
                 // 等待5秒, 然后继续轮询
                 await new Promise(resolve => setTimeout(resolve, pollInterval))
-                logger.error(`CLI轮询令牌异常 (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
+                logger.error(`CLI poll token exception (${attempt + 1}/${maxAttempts})`, 'CLI', '', {
                     url: `${chatBaseUrl}/api/v1/oauth2/token`,
                     message: error.message
                 })
@@ -259,7 +259,7 @@ class CliAuthManager {
     async initCliAccount(access_token, account) {
         const deviceFlow = await this.initiateDeviceFlow(account)
         if (!deviceFlow.status) {
-            logger.error('CLI账户初始化失败：设备授权流程未成功启动', 'CLI')
+            logger.error('CLI account init failed: device auth flow not started', 'CLI')
             return {
                 status: false,
                 access_token: null,
@@ -269,7 +269,7 @@ class CliAuthManager {
         }
 
         if (!await this.authorizeLogin(deviceFlow.user_code, access_token, account)) {
-            logger.error('CLI账户初始化失败：设备授权确认未通过', 'CLI', '', {
+            logger.error('CLI account init failed: device auth confirmation not passed', 'CLI', '', {
                 user_code: deviceFlow.user_code
             })
             return {
@@ -282,7 +282,7 @@ class CliAuthManager {
 
         const cliToken = await this.pollForToken(deviceFlow.device_code, deviceFlow.code_verifier, account)
         if (!cliToken.access_token || !cliToken.refresh_token || !cliToken.expiry_date) {
-            logger.error('CLI账户初始化失败：轮询令牌返回数据不完整', 'CLI', '', cliToken)
+            logger.error('CLI account init failed: poll token returned incomplete data', 'CLI', '', cliToken)
         }
         return cliToken
     }

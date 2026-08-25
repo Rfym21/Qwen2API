@@ -17,7 +17,7 @@ class imgCacheManager {
         return fs.existsSync(cachePath)
       }
     } catch (e) {
-      logger.error('缓存检查失败', 'CACHE', '', e)
+      logger.error('Cache check failed', 'CACHE', '', e)
       return false
     }
   }
@@ -41,7 +41,7 @@ class imgCacheManager {
 
       }
     } catch (e) {
-      logger.error('添加缓存失败', 'CACHE', '', e)
+      logger.error('Failed to add cache', 'CACHE', '', e)
       return false
     }
   }
@@ -71,7 +71,7 @@ class imgCacheManager {
         }
       }
     } catch (e) {
-      logger.error('获取缓存失败', 'CACHE', '', e)
+      logger.error('Failed to get cache', 'CACHE', '', e)
       return {
         status: 500,
         url: null

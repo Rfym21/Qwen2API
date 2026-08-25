@@ -48,9 +48,9 @@ router.post('/addRegularKey', adminKeyVerify, async (req, res) => {
 
     const persisted = await dataPersistence.saveSettings({ apiKeys: config.apiKeys })
 
-    res.json({ message: 'API Key添加成功', persisted })
+    res.json({ message: 'API Key added successfully', persisted })
   } catch (error) {
-    logger.error('添加API Key失败', 'CONFIG', '', error)
+    logger.error('Failed to add API Key', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -78,9 +78,9 @@ router.post('/deleteRegularKey', adminKeyVerify, async (req, res) => {
 
     const persisted = await dataPersistence.saveSettings({ apiKeys: config.apiKeys })
 
-    res.json({ message: 'API Key删除成功', persisted })
+    res.json({ message: 'API Key deleted successfully', persisted })
   } catch (error) {
-    logger.error('删除API Key失败', 'CONFIG', '', error)
+    logger.error('Failed to delete API Key', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -107,7 +107,7 @@ router.post('/setAutoRefresh', adminKeyVerify, async (req, res) => {
       message: '自动刷新设置更新成功'
     })
   } catch (error) {
-    logger.error('更新自动刷新设置失败', 'CONFIG', '', error)
+    logger.error('Failed to update auto-refresh settings', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -127,7 +127,7 @@ router.post('/setBatchLoginConcurrency', adminKeyVerify, async (req, res) => {
       message: '批量登录并发数更新成功'
     })
   } catch (error) {
-    logger.error('更新批量登录并发数失败', 'CONFIG', '', error)
+    logger.error('Failed to update batch login concurrency', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -146,7 +146,7 @@ router.post('/setOutThink', adminKeyVerify, async (req, res) => {
       message: '思考输出设置更新成功'
     })
   } catch (error) {
-    logger.error('更新思考输出设置失败', 'CONFIG', '', error)
+    logger.error('Failed to update thinking output settings', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -165,7 +165,7 @@ router.post('/setLegacyReasoning', adminKeyVerify, async (req, res) => {
       message: '推理格式设置更新成功'
     })
   } catch (error) {
-    logger.error('更新推理格式设置失败', 'CONFIG', '', error)
+    logger.error('Failed to update reasoning format settings', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -184,7 +184,7 @@ router.post('/search-info-mode', adminKeyVerify, async (req, res) => {
       message: '搜索信息模式更新成功'
     })
   } catch (error) {
-    logger.error('更新搜索信息模式失败', 'CONFIG', '', error)
+    logger.error('Failed to update search info mode', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -224,7 +224,7 @@ router.post('/setRetryConfig', adminKeyVerify, async (req, res) => {
       persisted
     })
   } catch (error) {
-    logger.error('更新聊天 retry 配置失败', 'CONFIG', '', error)
+    logger.error('Failed to update chat retry config', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -243,7 +243,7 @@ router.post('/simple-model-map', adminKeyVerify, async (req, res) => {
       message: '简化模型映射设置更新成功'
     })
   } catch (error) {
-    logger.error('更新简化模型映射设置失败', 'CONFIG', '', error)
+    logger.error('Failed to update simplified model mapping settings', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })

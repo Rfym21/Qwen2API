@@ -91,7 +91,7 @@ class Logger {
         fs.mkdirSync(this.options.logDir, { recursive: true })
       }
     } catch (error) {
-      console.error('创建日志目录失败:', error.message)
+      console.error('Failed to create log directory:', error.message)
     }
   }
 
@@ -171,7 +171,7 @@ class Logger {
       
       fs.appendFileSync(logFile, logEntry, 'utf8')
     } catch (error) {
-      console.error('写入日志文件失败:', error.message)
+      console.error('Failed to write log file:', error.message)
     }
   }
 
@@ -196,7 +196,7 @@ class Logger {
         this.cleanOldLogFiles()
       }
     } catch (error) {
-      console.error('日志文件轮转失败:', error.message)
+      console.error('Log file rotation failed:', error.message)
     }
   }
 
@@ -223,7 +223,7 @@ class Logger {
         })
       }
     } catch (error) {
-      console.error('清理旧日志文件失败:', error.message)
+      console.error('Failed to clean old log files:', error.message)
     }
   }
 

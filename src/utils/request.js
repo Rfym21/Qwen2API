@@ -300,7 +300,7 @@ const externalizeOversizedAgentContext = async (
     try {
         file = await uploader(originalContent, currentToken, currentAccount, options)
     } catch (error) {
-        logger.error('Agent 长上下文附件上传/解析失败，回退到最近上下文', 'REQUEST', '', error)
+        logger.error('Agent long-context attachment upload/parse failed, falling back to recent context', 'REQUEST', '', error)
         const fallbackMessage = replaceMessageTextContent(
             message,
             compactAgentContextFallback(originalContent, options.livePromptBytes)
@@ -428,9 +428,9 @@ const sendChatRequest = async (body, options = {}) => {
     )
     const payload = contextResult.payload
     if (contextResult.externalized) {
-        logger.info(`Agent 上下文已外置为 Qwen 文档（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST', '📎')
+        logger.info(`Agent context exported as Qwen doc (original request ${contextResult.serializedBytes} bytes)`, 'REQUEST', '📎')
     } else if (contextResult.compacted) {
-        logger.warn(`Agent 上下文附件失败，已保留最近上下文（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST')
+        logger.warn(`Agent context attachment failed, kept recent context (original request ${contextResult.serializedBytes} bytes)`, 'REQUEST')
     }
 
     const maxRetries = Math.max(0, parseInt(config.chatRetryCount, 10) || 0)
@@ -499,11 +499,11 @@ const sendChatRequest = async (body, options = {}) => {
         } else {
             // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown
             const status = lastError.response?.status
-            logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
+            logger.error('Failed to send chat request', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)
         }
     } else if (lastError) {
-        logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
+        logger.error('Failed to send chat request', 'REQUEST', '', lastError.message)
     }
 
     return {
@@ -570,7 +570,7 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
         return response_data.data?.data?.id || null
 
     } catch (error) {
-        logger.error('生成chat_id失败', 'CHAT', '', error.message)
+        logger.error('Failed to generate chat_id', 'CHAT', '', error.message)
         return null
     }
 }

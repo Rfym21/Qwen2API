@@ -55,12 +55,12 @@ const createRedisConfig = () => ({
   // 重试策略
   retryStrategy(times) {
     if (times > REDIS_CONFIG.maxRetries) {
-      logger.error(`Redis连接重试次数超限: ${times}`, 'REDIS')
+      logger.error(`Redis connection retry count exceeded: ${times}`, 'REDIS')
       return null
     }
 
     const delay = Math.min(100 * Math.pow(2, times), 3000)
-    logger.info(`Redis重试连接: ${times}, 延迟: ${delay}ms`, 'REDIS', '🔄')
+    logger.info(`Redis retrying connection: ${times}, delay: ${delay}ms`, 'REDIS', '🔄')
     return delay
   },
 
@@ -83,11 +83,11 @@ const verifyRedisCommandChannel = async (client) => {
     try {
       const pong = await client.ping()
       if (pong !== 'PONG') {
-        throw new Error(`PING 返回异常: ${pong}`)
+        throw new Error(`PING returned anomaly: ${pong}`)
       }
 
       if (attempt > 1) {
-        logger.info(`Redis命令通道在第 ${attempt} 次校验时恢复正常`, 'REDIS', '✅')
+        logger.info(`Redis command channel recovered on attempt ${attempt}`, 'REDIS', '✅')
       }
 
       return
@@ -98,12 +98,12 @@ const verifyRedisCommandChannel = async (client) => {
         break
       }
 
-      logger.warn(`Redis命令通道校验失败，第 ${attempt} 次后准备重试: ${error.message}`, 'REDIS')
+      logger.warn(`Redis command channel check failed, retrying after ${attempt} attempt(s): ${error.message}`, 'REDIS')
       await new Promise(resolve => setTimeout(resolve, REDIS_VERIFY_RETRY_DELAY))
     }
   }
 
-  throw new Error(`Redis命令通道不可用: ${lastError ? lastError.message : '未知错误'}`)
+  throw new Error(`Redis command channel unavailable: ${lastError ? lastError.message : 'unknown error'}`)
 }
 
 /**
@@ -175,7 +175,7 @@ const updateActivity = () => {
   // 设置新的空闲定时器
   idleTimer = setTimeout(() => {
     if (redis && Date.now() - lastActivity > IDLE_TIMEOUT) {
-      logger.info('Redis连接空闲超时，断开连接', 'REDIS', '🔌')
+      logger.info('Redis connection idle timeout, closing connection', 'REDIS', '🔌')
       disconnectRedis()
     }
   }, IDLE_TIMEOUT)
@@ -187,22 +187,22 @@ const updateActivity = () => {
  */
 const bindRedisEvents = (client) => {
   client.on('connect', () => {
-    logger.success('Redis连接建立', 'REDIS')
+    logger.success('Redis connection established', 'REDIS')
   })
 
   client.on('ready', () => {
-    logger.success('Redis准备就绪', 'REDIS')
+    logger.success('Redis is ready', 'REDIS')
     if (redis === client) {
       updateActivity()
     }
   })
 
   client.on('error', (err) => {
-    logger.error('Redis连接错误', 'REDIS', '', err)
+    logger.error('Redis connection error', 'REDIS', '', err)
   })
 
   client.on('close', () => {
-    logger.info('Redis连接关闭', 'REDIS', '🔌')
+    logger.info('Redis connection closed', 'REDIS', '🔌')
     if (redis === client) {
       redis = null
       clearIdleTimer()
@@ -210,7 +210,7 @@ const bindRedisEvents = (client) => {
   })
 
   client.on('end', () => {
-    logger.info('Redis连接结束', 'REDIS', '🔌')
+    logger.info('Redis connection ended', 'REDIS', '🔌')
     if (redis === client) {
       redis = null
       clearIdleTimer()
@@ -218,7 +218,7 @@ const bindRedisEvents = (client) => {
   })
 
   client.on('reconnecting', (delay) => {
-    logger.info(`Redis重新连接中...延迟: ${delay}ms`, 'REDIS', '🔄')
+    logger.info(`Redis reconnecting... delay: ${delay}ms`, 'REDIS', '🔄')
   })
 }
 
@@ -257,7 +257,7 @@ const connectRedis = async () => {
     let newRedis = null
 
     try {
-      logger.info('建立Redis连接...', 'REDIS', '🔌')
+      logger.info('Establishing Redis connection...', 'REDIS', '🔌')
 
       newRedis = new Redis(config.redisURL, createRedisConfig())
       redis = newRedis
@@ -279,7 +279,7 @@ const connectRedis = async () => {
         }
       }
 
-      logger.error('Redis连接失败', 'REDIS', '', error)
+      logger.error('Redis connection failed', 'REDIS', '', error)
       throw error
     } finally {
       isConnecting = false
@@ -301,9 +301,9 @@ const disconnectRedis = async () => {
 
     try {
       currentRedis.disconnect()
-      logger.info('Redis连接已断开', 'REDIS', '🔌')
+      logger.info('Redis disconnected', 'REDIS', '🔌')
     } catch (error) {
-      logger.error('断开Redis连接时出错', 'REDIS', '', error)
+      logger.error('Error disconnecting Redis', 'REDIS', '', error)
     } finally {
       if (redis === currentRedis) {
         redis = null
@@ -320,8 +320,8 @@ const disconnectRedis = async () => {
  */
 const ensureConnection = async () => {
   if (config.dataSaveMode !== 'redis') {
-    logger.error('当前数据保存模式不是Redis', 'REDIS')
-    throw new Error('当前数据保存模式不是Redis')
+    logger.error('Current data save mode is not Redis', 'REDIS')
+    throw new Error('Current data save mode is not Redis')
   }
 
   if (!redis || redis.status !== 'ready') {
@@ -329,7 +329,7 @@ const ensureConnection = async () => {
   }
 
   if (Date.now() - lastActivity > STALE_CONNECTION_THRESHOLD) {
-    logger.info('Redis连接空闲时间过长，主动重建连接', 'REDIS', '🔄')
+    logger.info('Redis connection idle time too long, proactively rebuilding connection', 'REDIS', '🔄')
     await disconnectRedis()
     return await connectRedis()
   }
@@ -357,7 +357,7 @@ const getAllAccounts = async () => {
     } while (cursor !== '0')
 
     if (!keys.length) {
-      logger.info('没有找到任何账户', 'REDIS', '✅')
+      logger.info('No accounts found', 'REDIS', '✅')
       return []
     }
 
@@ -369,7 +369,7 @@ const getAllAccounts = async () => {
 
     const results = await pipeline.exec()
     if (!results) {
-      logger.error('获取账户数据失败', 'REDIS')
+      logger.error('Failed to get account data', 'REDIS')
       return []
     }
 
@@ -377,11 +377,11 @@ const getAllAccounts = async () => {
       // result格式为[err, value]
       const [err, accountData] = result
       if (err) {
-        logger.error(`获取账户 ${keys[index]} 数据失败`, 'REDIS', '', err)
+        logger.error(`Failed to get data for account ${keys[index]}`, 'REDIS', '', err)
         return null
       }
       if (!accountData || Object.keys(accountData).length === 0) {
-        logger.error(`账户 ${keys[index]} 数据为空`, 'REDIS')
+        logger.error(`Account ${keys[index]} data is empty`, 'REDIS')
         return null
       }
       // stats 以 JSON 字符串存储于 HSET——malformed/missing 返回 undefined，由上层 ensureStats 补默认
@@ -390,7 +390,7 @@ const getAllAccounts = async () => {
         try {
           stats = JSON.parse(accountData.stats)
         } catch (parseError) {
-          logger.warn(`账户 ${keys[index]} stats JSON 解析失败，使用默认值: ${parseError.message}`, 'REDIS')
+          logger.warn(`Account ${keys[index]} stats JSON parsing failed, using default: ${parseError.message}`, 'REDIS')
           stats = undefined
         }
       }
@@ -400,7 +400,7 @@ const getAllAccounts = async () => {
         try {
           statsHistory = JSON.parse(accountData.statsHistory)
         } catch (parseError) {
-          logger.warn(`账户 ${keys[index]} statsHistory JSON 解析失败，使用默认值: ${parseError.message}`, 'REDIS')
+          logger.warn(`Account ${keys[index]} statsHistory JSON parsing failed, using default: ${parseError.message}`, 'REDIS')
           statsHistory = undefined
         }
       }
@@ -415,10 +415,10 @@ const getAllAccounts = async () => {
       }
     }).filter(Boolean) // 过滤掉null值
 
-    logger.success(`获取所有账户成功，共 ${accounts.length} 个账户`, 'REDIS')
+    logger.success(`Successfully fetched all accounts, total ${accounts.length} accounts`, 'REDIS')
     return accounts
   } catch (err) {
-    logger.error('获取账户时出错', 'REDIS', '', err)
+    logger.error('Error getting accounts', 'REDIS', '', err)
     throw err
   }
 }
@@ -446,16 +446,16 @@ const setAccount = async (key, value) => {
     if (statsHistory !== undefined) payload.statsHistory = JSON.stringify(statsHistory)
 
     if (Object.keys(payload).length === 0) {
-      logger.warn(`账户 ${key} setAccount 收到空 payload，跳过写入`, 'REDIS')
+      logger.warn(`Account ${key} setAccount received empty payload, skipping write`, 'REDIS')
       return true
     }
 
     await client.hset(`user:${key}`, payload)
 
-    logger.success(`账户 ${key} 设置成功`, 'REDIS')
+    logger.success(`Account ${key} set successfully`, 'REDIS')
     return true
   } catch (err) {
-    logger.error(`设置账户 ${key} 失败`, 'REDIS', '', err)
+    logger.error(`Failed to set account ${key}`, 'REDIS', '', err)
     return false
   }
 }
@@ -471,14 +471,14 @@ const deleteAccount = async (key) => {
 
     const result = await client.del(`user:${key}`)
     if (result > 0) {
-      logger.success(`账户 ${key} 删除成功`, 'REDIS')
+      logger.success(`Account ${key} deleted successfully`, 'REDIS')
       return true
     } else {
-      logger.warn(`账户 ${key} 不存在`, 'REDIS')
+      logger.warn(`Account ${key} does not exist`, 'REDIS')
       return false
     }
   } catch (err) {
-    logger.error(`删除账户 ${key} 失败`, 'REDIS', '', err)
+    logger.error(`Failed to delete account ${key}`, 'REDIS', '', err)
     return false
   }
 }
@@ -495,7 +495,7 @@ const getSettings = async () => {
     const data = await client.hgetall(SETTINGS_KEY)
     return JSON.parse(data.json)
   } catch (err) {
-    logger.error('获取运行时设置失败', 'REDIS', '', err)
+    logger.error('Failed to get runtime settings', 'REDIS', '', err)
     return {}
   }
 }
@@ -514,7 +514,7 @@ const setSettings = async (partial) => {
     await client.hset(SETTINGS_KEY, stringified)
     return true
   } catch (err) {
-    logger.error('保存运行时设置失败', 'REDIS', '', err)
+    logger.error('Failed to save runtime settings', 'REDIS', '', err)
     return false
   }
 }
@@ -531,10 +531,10 @@ const checkKeyExists = async (key = 'headers') => {
     const exists = await client.exists(key)
     const result = exists === 1
 
-    logger.info(`键 "${key}" ${result ? '存在' : '不存在'}`, 'REDIS', result ? '✅' : '❌')
+    logger.info(`Key "${key}" ${result ? 'exists' : 'does not exist'}`, 'REDIS', result ? '✅' : '❌')
     return result
   } catch (err) {
-    logger.error(`检查键 "${key}" 时出错`, 'REDIS', '', err)
+    logger.error(`Error checking key "${key}"`, 'REDIS', '', err)
     return false
   }
 }
@@ -557,7 +557,7 @@ const getConnectionStatus = () => {
  * 手动断开连接（用于应用关闭时清理）
  */
 const cleanup = async () => {
-  logger.info('清理Redis连接...', 'REDIS', '🧹')
+  logger.info('Cleaning up Redis connection...', 'REDIS', '🧹')
   await disconnectRedis()
 }
 

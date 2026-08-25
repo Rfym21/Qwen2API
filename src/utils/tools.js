@@ -18,8 +18,8 @@ const sleep = async (ms) => {
 
 const sha256Encrypt = (text) => {
   if (typeof text !== 'string') {
-    logger.error('输入必须是字符串类型', 'TOOLS')
-    throw new Error('输入必须是字符串类型')
+    logger.error('Input must be a string', 'TOOLS')
+    throw new Error('Input must be a string')
   }
   const hash = crypto.createHash('sha256')
   hash.update(text, 'utf-8')
@@ -31,7 +31,7 @@ const JwtDecode = (token) => {
     const decoded = jwtDecode(token, { complete: true })
     return decoded
   } catch (error) {
-    logger.error('解析JWT失败', 'JWT', '', error)
+    logger.error('Failed to parse JWT', 'JWT', '', error)
     return null
   }
 }

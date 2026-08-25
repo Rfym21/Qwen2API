@@ -49,19 +49,19 @@ class TokenManager {
             }, requestConfig)
 
             if (response.data && response.data.token) {
-                logger.success(`${email} 登录成功：${response.data.token}`, 'AUTH')
+                logger.success(`${email} login successful: ${response.data.token}`, 'AUTH')
                 return response.data.token
             } else {
-                logger.error(`${email} 登录响应缺少令牌`, 'AUTH')
+                logger.error(`${email} login response missing token`, 'AUTH')
                 return null
             }
         } catch (error) {
             if (error.response) {
-                logger.error(`${email} 登录失败 (${error.response.status})`, 'AUTH', '', error)
+                logger.error(`${email} login failed (${error.response.status})`, 'AUTH', '', error)
             } else if (error.request) {
-                logger.error(`${email} 登录失败: 网络请求超时或无响应`, 'AUTH')
+                logger.error(`${email} login failed: network timeout or no response`, 'AUTH')
             } else {
-                logger.error(`${email} 登录失败`, 'AUTH', '', error)
+                logger.error(`${email} login failed`, 'AUTH', '', error)
             }
             return null
         }
@@ -88,7 +88,7 @@ class TokenManager {
 
             return decoded
         } catch (error) {
-            logger.error('令牌验证失败', 'TOKEN', '', error)
+            logger.error('Token validation failed', 'TOKEN', '', error)
             return null
         }
     }
@@ -136,7 +136,7 @@ class TokenManager {
 
             const decoded = this.validateToken(newToken)
             if (!decoded) {
-                logger.error(`刷新后的令牌无效: ${account.email}`, 'TOKEN')
+                logger.error(`Refreshed token is invalid: ${account.email}`, 'TOKEN')
                 return null
             }
 
@@ -147,11 +147,11 @@ class TokenManager {
             }
 
             const remainingHours = this.getTokenRemainingHours(newToken)
-            logger.success(`令牌刷新成功: ${account.email} (有效期: ${remainingHours}小时)`, 'TOKEN')
+            logger.success(`Token refresh successful: ${account.email} (expires in: ${remainingHours} hours)`, 'TOKEN')
 
             return updatedAccount
         } catch (error) {
-            logger.error(`刷新令牌失败 (${account.email})`, 'TOKEN', '', error)
+            logger.error(`Token refresh failed (${account.email})`, 'TOKEN', '', error)
             return null
         }
     }
@@ -169,11 +169,11 @@ class TokenManager {
         )
 
         if (needsRefresh.length === 0) {
-            logger.info('没有需要刷新的令牌', 'TOKEN')
+            logger.info('No tokens need refreshing', 'TOKEN')
             return { refreshed: [], failed: [] }
         }
 
-        logger.info(`发现 ${needsRefresh.length} 个令牌需要刷新`, 'TOKEN')
+        logger.info(`Found ${needsRefresh.length} tokens needing refresh`, 'TOKEN')
 
         const refreshed = []
         const failed = []
@@ -190,7 +190,7 @@ class TokenManager {
                     try {
                         await onEachRefresh(updatedAccount, i + 1, needsRefresh.length)
                     } catch (error) {
-                        logger.error(`刷新回调函数执行失败 (${account.email})`, 'TOKEN', '', error)
+                        logger.error(`Refresh callback execution failed (${account.email})`, 'TOKEN', '', error)
                     }
                 }
             } else {
@@ -201,7 +201,7 @@ class TokenManager {
             await this._delay(1000)
         }
 
-        logger.success(`令牌刷新完成: 成功 ${refreshed.length} 个，失败 ${failed.length} 个`, 'TOKEN')
+        logger.success(`Token refresh complete: ${refreshed.length} succeeded, ${failed.length} failed`, 'TOKEN')
         return { refreshed, failed }
     }
 

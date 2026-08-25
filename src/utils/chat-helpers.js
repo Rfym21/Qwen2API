@@ -175,7 +175,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
 
         return buildNormalizedMediaItem(mediaType, uploadResult.file_url)
     } catch (error) {
-        logger.error(`${mediaType === 'video' ? '视频' : '图片'}上传失败`, 'UPLOAD', '', error)
+        logger.error(`${mediaType === 'video' ? 'video' : 'image'} upload failed`, 'UPLOAD', '', error)
         return null
     }
 }
@@ -404,7 +404,7 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
         }
 
     } catch (e) {
-        logger.error('消息解析失败', 'PARSER', '', e)
+        logger.error('Message parsing failed', 'PARSER', '', e)
         return [
             {
                 "role": "user",

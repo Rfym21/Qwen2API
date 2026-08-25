@@ -30,9 +30,9 @@ function refreshCookies() {
             ssxmod_itna2: result.ssxmod_itna2,
             timestamp: result.timestamp
         };
-        logger.info(`SSXMOD Cookie 已刷新`, 'SSXMOD');
+        logger.info(`SSXMOD Cookie refreshed`, 'SSXMOD');
     } catch (error) {
-        logger.error('SSXMOD Cookie 刷新失败', 'SSXMOD', '', error.message);
+        logger.error('SSXMOD Cookie refresh failed', 'SSXMOD', '', error.message);
     }
 }
 
@@ -50,7 +50,7 @@ function initSsxmodManager() {
     }
     refreshTimer = setInterval(refreshCookies, REFRESH_INTERVAL);
 
-    logger.info(`SSXMOD 管理器已启动，刷新间隔: ${REFRESH_INTERVAL / 1000 / 60} 分钟`, 'SSXMOD');
+    logger.info(`SSXMOD manager started, refresh interval: ${REFRESH_INTERVAL / 1000 / 60} minutes`, 'SSXMOD');
 }
 
 /**
@@ -84,7 +84,7 @@ function stopRefresh() {
     if (refreshTimer) {
         clearInterval(refreshTimer);
         refreshTimer = null;
-        logger.info('SSXMOD 定时刷新已停止', 'SSXMOD');
+        logger.info('SSXMOD periodic refresh stopped', 'SSXMOD');
     }
 }
 

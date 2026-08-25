@@ -642,7 +642,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         upstreamEventCount = retryResult.eventCount;
       }
     } catch (e) {
-      logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
+      logger.error('Anthropic stream retry failed', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
     }
   }
@@ -865,7 +865,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
       }
     } catch (e) {
-      logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
+      logger.error('Anthropic non-stream retry failed', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
     }
   }
@@ -989,7 +989,7 @@ const handleAnthropicMessages = async (req, res) => {
       await handleAnthropicNonStream(res, ctx, upstreamResp.response);
     }
   } catch (error) {
-    logger.error('Anthropic Messages 处理错误', 'ANTHROPIC', '', error);
+    logger.error('Anthropic Messages processing error', 'ANTHROPIC', '', error);
     if (!res.headersSent) {
       res.status(500).json({
         type: 'error',

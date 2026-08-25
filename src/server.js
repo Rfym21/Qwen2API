@@ -43,16 +43,16 @@ app.use(express.static(path.join(__dirname, '../public/dist')))
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/dist/index.html'), (err) => {
     if (err) {
-      logger.error('管理页面加载失败', 'SERVER', '', err)
-      res.status(500).send('服务器内部错误')
+      logger.error('Failed to load admin page', 'SERVER', '', err)
+      res.status(500).send('Internal server error')
     }
   })
 })
 
 // 处理错误中间件（必须放在所有路由之后）
 app.use((err, req, res, next) => {
-  logger.error('服务器内部错误', 'SERVER', '', err)
-  res.status(500).send('服务器内部错误')
+  logger.error('Internal server error', 'SERVER', '', err)
+  res.status(500).send('Internal server error')
 })
 
 
@@ -86,22 +86,22 @@ const applyPersistedSettings = async () => {
       config.adminKey = persisted.apiKeys[0];
     }
   } catch (err) {
-    logger.warn('加载持久化设置失败, 使用 env/默认值', 'CONFIG', '', err.message)
+    logger.warn('Failed to load persisted settings, using env/default values', 'CONFIG', '', err.message)
   }
 }
 
 const startServer = () => {
   if (config.listenAddress) {
     app.listen(config.listenPort, config.listenAddress, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+      logger.server('Server started successfully', 'SERVER', serverInfo)
+      logger.info('GitHub: https://github.com/Rfym21/Qwen2API', 'INFO')
+      logger.info('Telegram group: https://t.me/nodejs_project', 'INFO')
     })
   } else {
     app.listen(config.listenPort, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+      logger.server('Server started successfully', 'SERVER', serverInfo)
+      logger.info('GitHub: https://github.com/Rfym21/Qwen2API', 'INFO')
+      logger.info('Telegram group: https://t.me/nodejs_project', 'INFO')
     })
   }
 }
