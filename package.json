@@ -1,6 +1,6 @@
 {
   "name": "qwen2api",
-  "version": "2026.08.20.18.50",
+  "version": "2026.08.26.12.30",
   "main": "src/server.js",
   "packageManager": "pnpm@11.22.0",
   "scripts": {
@@ -17,6 +17,7 @@
     "axios": "^1.11.0",
     "body-parser": "^1.20.3",
     "cors": "^2.8.5",
+    "csrf": "^3.1.0",
     "dotenv": "^16.4.7",
     "express": "^4.22.2",
     "form-data": "^4.0.2",

@@ -59,8 +59,12 @@ const config = {
         6,
         Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
     ),
-    // 是否启用临时本地聊天模式(chat_mode=local);可被单个请求的 chat_mode 字段覆盖
-    enableTempChats: process.env.ENABLE_TEMP_CHATS === 'true',
+    // 面向 Anthropic 风格客户端的回合门禁放宽开关，默认关闭，严格模式行为不变。
+    // Anthropic Messages API 允许同一条 assistant 消息同时携带 text 与 tool_use，
+    // 所以一个完全合规的 Anthropic 客户端在严格模式下反而会被判为无效回合。
+    agentTurnAllowProseWithTools: process.env.AGENT_TURN_ALLOW_PROSE_WITH_TOOLS === 'true',
+    // 把没有 <agent_final> 包装但确有可见正文的回合视为正常结束，而不是 bare。
+    agentTurnAcceptBareFinal: process.env.AGENT_TURN_ACCEPT_BARE_FINAL === 'true',
     // chat.qwen.ai 的 WAF 会在 JSON 请求体接近 128 KiB 时返回 captcha。
     // 提前把 Agent 全量历史外置成文本文档，给协议头和当前回合留出安全余量。
     agentContextFileThresholdBytes: Math.max(

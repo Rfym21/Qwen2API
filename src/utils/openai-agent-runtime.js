@@ -285,7 +285,8 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
     return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
   }
   if (attempt.toolCalls.length > 0) {
-    if (attempt.controlKind !== 'empty' || attempt.visibleText.trim()) {
+    if (!config.agentTurnAllowProseWithTools &&
+        (attempt.controlKind !== 'empty' || attempt.visibleText.trim())) {
       return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
     }
     return { accepted: true, finishReason: 'tool_calls', retryReason: null }
@@ -304,6 +305,9 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
   }
   if (attempt.controlKind === 'invalid_control') {
     return { accepted: false, finishReason: null, retryReason: 'invalid_control' }
+  }
+  if (config.agentTurnAcceptBareFinal && attempt.visibleText.trim()) {
+    return { accepted: true, finishReason: 'stop', retryReason: null }
   }
   return { accepted: false, finishReason: null, retryReason: 'bare' }
 }

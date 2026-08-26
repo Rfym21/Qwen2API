@@ -2,12 +2,14 @@ const express = require('express')
 const bodyParser = require('body-parser')
 const config = require('./config/index.js')
 const cors = require('cors')
+const Tokens = require('csrf')
 const { logger } = require('./utils/logger')
 const { initSsxmodManager } = require('./utils/ssxmod-manager')
 const DataPersistence = require('./utils/data-persistence')
 const app = express()
 const path = require('path')
 const fs = require('fs')
+const csrfTokens = new Tokens()
 const modelsRouter = require('./routes/models.js')
 const chatRouter = require('./routes/chat.js')
 const cliChatRouter = require('./routes/cli.chat.js')
@@ -28,6 +30,32 @@ initSsxmodManager()
 app.use(bodyParser.json({ limit: '128mb' }))
 app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))
 app.use(cors())
+
+// CSRF token endpoint: browser clients GET a token tied to a per-request secret
+app.get('/api/csrf-token', (req, res) => {
+  const secret = csrfTokens.secretSync()
+  const token = csrfTokens.create(secret)
+  // Return both so the client can store the secret in sessionStorage and send
+  // both back on state-changing requests via X-CSRF-Token and X-CSRF-Secret headers
+  res.json({ csrfToken: token, csrfSecret: secret })
+})
+
+// 没有凭证可用的公开端点：管理面板登录接口
+const CSRF_EXEMPT_PATHS = new Set(['/verify'])
+
+// CSRF validation middleware for state-changing browser requests
+// API key clients (Authorization / x-api-key header) are exempt
+const csrfProtect = (req, res, next) => {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next()
+  // 登录请求本身没有凭证可带——它就是登录。放行后仍由 /verify 自己校验 apiKey。
+  if (CSRF_EXEMPT_PATHS.has(req.path)) return next()
+  if (req.headers['authorization'] || req.headers['x-api-key']) return next()
+  const secret = req.headers['x-csrf-secret']
+  const token = req.headers['x-csrf-token']
+  if (secret && token && csrfTokens.verify(secret, token)) return next()
+  return res.status(403).json({ error: 'Invalid CSRF token' })
+}
+app.use(csrfProtect)
 
 // API路由
 app.use(modelsRouter)

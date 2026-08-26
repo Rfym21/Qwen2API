@@ -1018,3 +1018,92 @@ test('interleaved multi-response frames are not merged into a duplicated answer'
   await handleNonStreamResponse(nonStreamRes, Readable.from(dualResponseFrames), false, false, { messages: [] }, {})
   assert.equal(JSON.parse(nonStreamRes.output).choices[0].message.content, '巴黎')
 })
+
+// ---------------------------------------------------------------------------
+// 回合门禁放宽开关（默认关闭，严格行为不变）
+// ---------------------------------------------------------------------------
+const agentTurnConfig = require('../src/config/index.js')
+const { evaluateOpenAIAgentAttempt: evaluateAgentTurn } = require('../src/utils/openai-agent-runtime.js')
+
+const buildAttempt = (overrides = {}) => ({
+  upstreamFinishReason: null,
+  toolErrors: [],
+  toolCalls: [],
+  controlKind: 'empty',
+  visibleText: '',
+  ...overrides
+})
+
+const withAgentTurnFlags = (flags, fn) => {
+  const saved = {
+    agentTurnAllowProseWithTools: agentTurnConfig.agentTurnAllowProseWithTools,
+    agentTurnAcceptBareFinal: agentTurnConfig.agentTurnAcceptBareFinal
+  }
+  Object.assign(agentTurnConfig, flags)
+  try {
+    return fn()
+  } finally {
+    Object.assign(agentTurnConfig, saved)
+  }
+}
+
+test('默认严格模式：工具调用附带可见正文仍判为 invalid_tool_call', () => {
+  const attempt = buildAttempt({
+    toolCalls: [{ id: 'call_1', function: { name: 'read', arguments: '{}' } }],
+    controlKind: 'bare',
+    visibleText: '我先看一下这个文件。'
+  })
+  withAgentTurnFlags({ agentTurnAllowProseWithTools: false }, () => {
+    assert.deepEqual(evaluateAgentTurn(attempt), {
+      accepted: false,
+      finishReason: null,
+      retryReason: 'invalid_tool_call'
+    })
+  })
+})
+
+test('AGENT_TURN_ALLOW_PROSE_WITH_TOOLS 打开后接受正文与工具调用共存', () => {
+  const attempt = buildAttempt({
+    toolCalls: [{ id: 'call_1', function: { name: 'read', arguments: '{}' } }],
+    controlKind: 'bare',
+    visibleText: '我先看一下这个文件。'
+  })
+  withAgentTurnFlags({ agentTurnAllowProseWithTools: true }, () => {
+    assert.deepEqual(evaluateAgentTurn(attempt), {
+      accepted: true,
+      finishReason: 'tool_calls',
+      retryReason: null
+    })
+  })
+})
+
+test('打开放宽开关也不会接受非法工具调用', () => {
+  const attempt = buildAttempt({
+    toolErrors: [{ message: 'truncated tool_call' }],
+    visibleText: '正文'
+  })
+  withAgentTurnFlags({ agentTurnAllowProseWithTools: true, agentTurnAcceptBareFinal: true }, () => {
+    assert.equal(evaluateAgentTurn(attempt).accepted, false)
+    assert.equal(evaluateAgentTurn(attempt).retryReason, 'invalid_tool_call')
+  })
+})
+
+test('默认严格模式：缺少 <agent_final> 包装的正文判为 bare', () => {
+  const attempt = buildAttempt({ controlKind: 'bare', visibleText: '已经改完了。' })
+  withAgentTurnFlags({ agentTurnAcceptBareFinal: false }, () => {
+    assert.equal(evaluateAgentTurn(attempt).retryReason, 'bare')
+  })
+})
+
+test('AGENT_TURN_ACCEPT_BARE_FINAL 打开后按 stop 接受，空正文仍判为 bare', () => {
+  withAgentTurnFlags({ agentTurnAcceptBareFinal: true }, () => {
+    assert.deepEqual(
+      evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '已经改完了。' })),
+      { accepted: true, finishReason: 'stop', retryReason: null }
+    )
+    assert.equal(
+      evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '   ' })).retryReason,
+      'bare'
+    )
+  })
+})

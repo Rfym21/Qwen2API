@@ -103,6 +103,8 @@ LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 MODELS_CACHE_TTL=3600         # 模型列表缓存有效期（秒），0=永不过期
 AGENT_TURN_MAX_ATTEMPTS=3     # 单个 Agent 回合生成有效工具调用/最终态的最大尝试数（2-6）
+AGENT_TURN_ALLOW_PROSE_WITH_TOOLS=false  # 允许工具调用回合同时带可见正文（Anthropic 客户端）
+AGENT_TURN_ACCEPT_BARE_FINAL=false       # 允许没有 <agent_final> 包装的可见正文作为正常结束
 AGENT_CONTEXT_FILE_THRESHOLD_BYTES=92160 # 超过阈值时外置完整 Agent 上下文
 AGENT_CONTEXT_LIVE_PROMPT_BYTES=49152     # 外置后仍内联保留的关键任务状态大小
 
@@ -134,6 +136,8 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
 | `SIMPLE_MODEL_MAP` | 简化模型映射，只返回基础模型不包含变体 | `true` 或 `false` |
 | `MODELS_CACHE_TTL` | 模型列表缓存有效期（秒），过期后下次请求自动向上游刷新；`0` 表示永不过期 | `3600` |
+| `AGENT_TURN_ALLOW_PROSE_WITH_TOOLS` | 放宽回合门禁：允许同一回合既有有效工具调用又有可见正文。Anthropic Messages API 允许 `text` 与 `tool_use` 共存，Claude Code 等客户端因此会被严格模式反复判为 `invalid_tool_call` | `false` |
+| `AGENT_TURN_ACCEPT_BARE_FINAL` | 放宽回合门禁：把有可见正文但缺少 `<agent_final>` 包装的回合按 `finish_reason=stop` 接受，而不是判为 `bare` 并重试 | `false` |
 | `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后非流式请求返回 HTTP 429/503，SSE 请求返回显式错误帧，绝不伪装成正常 `stop` | `3` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
