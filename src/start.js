@@ -25,88 +25,88 @@ if (PM2_INSTANCES === 'max') {
 
 // 限制进程数不能超过CPU核心数
 if (instances > cpuCores) {
-  logger.warn(`配置的进程数(${instances})超过CPU核心数(${cpuCores})，自动调整为${cpuCores}`, 'AUTO')
+  logger.warn(`Configured processes(${instances}) exceeds CPU cores(${cpuCores}), auto-adjusting to ${cpuCores}`, 'AUTO')
   instances = cpuCores
 }
 
-logger.info('🚀 Qwen2API 智能启动', 'AUTO')
-logger.info(`CPU核心数: ${cpuCores}`, 'AUTO')
-logger.info(`配置的进程数: ${PM2_INSTANCES}`, 'AUTO')
-logger.info(`实际启动进程数: ${instances}`, 'AUTO')
-logger.info(`服务端口: ${SERVICE_PORT}`, 'AUTO')
+logger.info('🚀 Qwen2API Smart Boot', 'AUTO')
+logger.info(`CPU cores: ${cpuCores}`, 'AUTO')
+logger.info(`Configured processes: ${PM2_INSTANCES}`, 'AUTO')
+logger.info(`Actual started processes: ${instances}`, 'AUTO')
+logger.info(`Service port: ${SERVICE_PORT}`, 'AUTO')
 
 // 智能判断启动方式
 if (instances === 1) {
-  logger.info('📦 使用单进程模式启动', 'AUTO')
+  logger.info('📦 Starting in single-process mode', 'AUTO')
   // 直接启动服务器
   require('./server.js')
 } else {
   // 检查是否通过PM2启动
   if (process.env.PM2_USAGE || process.env.pm_id !== undefined) {
-    logger.info(`PM2进程启动 - 进程ID: ${process.pid}, 工作进程ID: ${process.env.pm_id || 'unknown'}`, 'PM2')
+    logger.info(`PM2 process started - PID: ${process.pid}, Worker PID: ${process.env.pm_id || 'unknown'}`, 'PM2')
     require('./server.js')
   } else if (cluster.isMaster) {
-    logger.info(`🔥 使用Node.js集群模式启动 (${instances}个进程)`, 'AUTO')
+    logger.info(`🔥 Starting with Node.js cluster mode (${instances} processes)`, 'AUTO')
 
-    logger.info(`启动主进程 - PID: ${process.pid}`, 'CLUSTER')
-    logger.info(`运行环境: ${NODE_ENV}`, 'CLUSTER')
+    logger.info(`Starting master process - PID: ${process.pid}`, 'CLUSTER')
+    logger.info(`Runtime environment: ${NODE_ENV}`, 'CLUSTER')
 
-    // 创建工作进程
+    // Create worker processes
     for (let i = 0; i < instances; i++) {
       const worker = cluster.fork()
-      logger.info(`启动工作进程 ${i + 1}/${instances} - PID: ${worker.process.pid}`, 'CLUSTER')
+      logger.info(`Starting worker process ${i + 1}/${instances} - PID: ${worker.process.pid}`, 'CLUSTER')
     }
 
-    // 监听工作进程退出
+    // Listen for worker exit
     cluster.on('exit', (worker, code, signal) => {
-      logger.error(`工作进程 ${worker.process.pid} 已退出 - 退出码: ${code}, 信号: ${signal}`, 'CLUSTER')
+      logger.error(`Worker process ${worker.process.pid} exited - code: ${code}, signal: ${signal}`, 'CLUSTER')
 
-      // 自动重启工作进程
+      // Auto-restart worker
       if (!worker.exitedAfterDisconnect) {
-        logger.info('正在重启工作进程...', 'CLUSTER')
+        logger.info('Restarting worker process...', 'CLUSTER')
         const newWorker = cluster.fork()
-        logger.info(`新工作进程已启动 - PID: ${newWorker.process.pid}`, 'CLUSTER')
+        logger.info(`New worker process started - PID: ${newWorker.process.pid}`, 'CLUSTER')
       }
     })
 
-    // 监听工作进程在线
+    // Listen for worker online
     cluster.on('online', (worker) => {
-      logger.info(`工作进程 ${worker.process.pid} 已上线`, 'CLUSTER')
+      logger.info(`Worker process ${worker.process.pid} is online`, 'CLUSTER')
     })
 
-    // 监听工作进程断开连接
+    // Listen for worker disconnect
     cluster.on('disconnect', (worker) => {
-      logger.warn(`工作进程 ${worker.process.pid} 已断开连接`, 'CLUSTER')
+      logger.warn(`Worker process ${worker.process.pid} disconnected`, 'CLUSTER')
     })
 
-    // 优雅关闭处理
+    // Graceful shutdown
     process.on('SIGTERM', () => {
-      logger.info('收到SIGTERM信号，正在优雅关闭...', 'CLUSTER')
+      logger.info('Received SIGTERM, shutting down gracefully...', 'CLUSTER')
       cluster.disconnect(() => {
         process.exit(0)
       })
     })
 
     process.on('SIGINT', () => {
-      logger.info('收到SIGINT信号，正在优雅关闭...', 'CLUSTER')
+      logger.info('Received SIGINT, shutting down gracefully...', 'CLUSTER')
       cluster.disconnect(() => {
         process.exit(0)
       })
     })
 
   } else {
-    // 工作进程逻辑
-    logger.info(`工作进程启动 - PID: ${process.pid}`, 'WORKER')
+    // Worker process logic
+    logger.info(`Worker process started - PID: ${process.pid}`, 'WORKER')
     require('./server.js')
 
-    // 工作进程优雅关闭处理
+    // Worker graceful shutdown
     process.on('SIGTERM', () => {
-      logger.info(`工作进程 ${process.pid} 收到SIGTERM信号，正在关闭...`, 'WORKER')
+      logger.info(`Worker process ${process.pid} received SIGTERM, closing...`, 'WORKER')
       process.exit(0)
     })
 
     process.on('SIGINT', () => {
-      logger.info(`工作进程 ${process.pid} 收到SIGINT信号，正在关闭...`, 'WORKER')
+      logger.info(`Worker process ${process.pid} received SIGINT, closing...`, 'WORKER')
       process.exit(0)
     })
   }

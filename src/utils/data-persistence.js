@@ -62,11 +62,11 @@ class DataPersistence {
         case 'none':
           return await this._loadFromEnv()
         default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
-          throw new Error(`不支持的数据保存模式: ${config.dataSaveMode}`)
+          logger.error(`Unsupported data save mode: ${config.dataSaveMode}`, 'DATA')
+          throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
       }
     } catch (error) {
-      logger.error('加载账户数据失败', 'DATA', '', error)
+      logger.error('Failed to load account data', 'DATA', '', error)
       throw error
     }
   }
@@ -85,14 +85,14 @@ class DataPersistence {
         case 'file':
           return await this._saveToFile(email, accountData)
         case 'none':
-          logger.warn('环境变量模式不支持保存账户数据', 'DATA')
+          logger.warn('Environment variable mode does not support saving account data', 'DATA')
           return false
         default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
-          throw new Error(`不支持的数据保存模式: ${config.dataSaveMode}`)
+          logger.error(`Unsupported data save mode: ${config.dataSaveMode}`, 'DATA')
+          throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
       }
     } catch (error) {
-      logger.error(`保存账户数据失败 (${email})`, 'DATA', '', error)
+      logger.error(`Failed to save account data (${email})`, 'DATA', '', error)
       return false
     }
   }
@@ -112,11 +112,11 @@ class DataPersistence {
         case 'none':
           return {}
         default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
+          logger.error(`Unsupported data save mode: ${config.dataSaveMode}`, 'DATA')
           return {}
       }
     } catch (error) {
-      logger.error('加载运行时设置失败', 'DATA', '', error)
+      logger.error('Failed to load runtime settings', 'DATA', '', error)
       return {}
     }
   }
@@ -134,14 +134,14 @@ class DataPersistence {
         case 'file':
           return await this._saveSettingsToFile(partial)
         case 'none':
-          logger.warn('环境变量模式不支持保存运行时设置', 'DATA')
+          logger.warn('Environment variable mode does not support saving runtime settings', 'DATA')
           return false
         default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
+          logger.error(`Unsupported data save mode: ${config.dataSaveMode}`, 'DATA')
           return false
       }
     } catch (error) {
-      logger.error('保存运行时设置失败', 'DATA', '', error)
+      logger.error('Failed to save runtime settings', 'DATA', '', error)
       return false
     }
   }
@@ -175,14 +175,14 @@ class DataPersistence {
         case 'file':
           return await this._saveAllToFile(accounts)
         case 'none':
-          logger.warn('环境变量模式不支持保存账户数据', 'DATA')
+          logger.warn('Environment variable mode does not support saving account data', 'DATA')
           return false
         default:
-          logger.error(`不支持的数据保存模式: ${config.dataSaveMode}`, 'DATA')
-          throw new Error(`不支持的数据保存模式: ${config.dataSaveMode}`)
+          logger.error(`Unsupported data save mode: ${config.dataSaveMode}`, 'DATA')
+          throw new Error(`Unsupported data save mode: ${config.dataSaveMode}`)
       }
     } catch (error) {
-      logger.error('批量保存账户数据失败', 'DATA', '', error)
+      logger.error('Failed to batch save account data', 'DATA', '', error)
       return false
     }
   }
@@ -342,7 +342,7 @@ class DataPersistence {
       try {
         await this.saveAccount(email, { stats: payload })
       } catch (error) {
-        logger.error(`stats 持久化失败 (${email})`, 'STATS', '', error)
+        logger.error(`stats persistence failed (${email})`, 'STATS', '', error)
       }
     }, STATS_PERSIST_DEBOUNCE_MS)
 
@@ -402,7 +402,7 @@ class DataPersistence {
         '损坏文件已原样保留，请人工修复后重启服务',
         'DATA'
       )
-      throw new Error(`数据文件 ${this.dataFilePath} 损坏且无可用备份: ${parseError.message}`)
+      throw new Error(`Data file ${this.dataFilePath} is corrupted and no backup available: ${parseError.message}`)
     }
 
     // 先给损坏文件留证（copy 而非 rename——避免中途崩溃导致 data.json 缺失），再用备份覆盖
@@ -411,12 +411,12 @@ class DataPersistence {
     try {
       await fs.copyFile(this.dataFilePath, quarantinePath)
     } catch (copyError) {
-      logger.warn(`损坏文件留证失败: ${quarantinePath}`, 'DATA', '', copyError)
+      logger.warn(`Failed to quarantine corrupted file: ${quarantinePath}`, 'DATA', '', copyError)
     }
 
     await this._writeFileAtomic(this.dataFilePath, backupContent)
     logger.warn(
-      `已用备份恢复数据文件（${(backupData.accounts || []).length} 个账户）；` +
+      `已用备份恢复数据文件（${(backupData.accounts || []).length} accounts）；` +
       `损坏副本: ${quarantinePath}`,
       'DATA'
     )
@@ -506,7 +506,7 @@ class DataPersistence {
     try {
       await this._writeFileAtomic(this.backupFilePath, content)
     } catch (error) {
-      logger.warn('备份文件写入失败（不影响主数据文件）', 'DATA', '', error)
+      logger.warn('Backup file write failed (does not affect main data file)', 'DATA', '', error)
     }
   }
 
@@ -518,7 +518,7 @@ class DataPersistence {
     try {
       await fs.access(this.dataFilePath)
     } catch (error) {
-      logger.info('数据文件不存在，正在创建默认文件...', 'FILE', '📁')
+      logger.info('Data file does not exist, creating default file...', 'FILE', '📁')
 
       // 确保目录存在
       const dirPath = path.dirname(this.dataFilePath)
@@ -532,7 +532,7 @@ class DataPersistence {
       }
 
       await this._writeFileAtomic(this.dataFilePath, JSON.stringify(defaultData, null, 2))
-      logger.success('默认数据文件创建成功', 'FILE')
+      logger.success('Default data file created successfully', 'FILE')
     }
   }
 }

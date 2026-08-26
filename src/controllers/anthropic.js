@@ -2,7 +2,7 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer, resolveChatMode, buildFeChatMessage } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -213,7 +213,7 @@ const flattenAnthropicMessages = (messages) => {
  * @returns {Promise<{body: Object, hasTools: boolean, toolChoice: any, allowedToolNames: string[], enable_thinking: boolean, model: string}>} 转换结果
  */
 const buildInternalRequest = async (anthropicReq) => {
-  const { model, messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
+  const { model, messages, system, tools, tool_choice, stream, thinking, chat_mode } = anthropicReq;
 
   const normalizedTools = normalizeAnthropicTools(tools);
   const internalToolChoice = normalizeAnthropicToolChoice(tool_choice);
@@ -260,16 +260,26 @@ const buildInternalRequest = async (anthropicReq) => {
     }
   }
 
+  // 网页上游只接受一条当前消息（历史已由 parserMessages 折叠进 content），
+  // 且消息必须是完整 FE 形状，否则 WAF 按指纹判定为机器人并返回 captcha
+  const lastParsed = parsedMessages[parsedMessages.length - 1] || { role: 'user', content: '' };
   const body = {
     stream: !!stream,
+    version: '2.1',
     incremental_output: true,
     chat_type: chatType,
-    sub_chat_type: chatType,
-    chat_mode: 'normal',
+    chat_mode: resolveChatMode(chat_mode),
     model: parsedModel,
-    messages: parsedMessages,
-    session_id: generateUUID(),
-    id: generateUUID()
+    messages: [
+      buildFeChatMessage({
+        role: lastParsed.role || 'user',
+        content: lastParsed.content || '',
+        chatType,
+        thinkingEnabled: thinkingCfg.thinking_enabled,
+        modelId: parsedModel
+      })
+    ],
+    timestamp: Math.floor(Date.now() / 1000)
   };
 
   return {
@@ -642,7 +652,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         upstreamEventCount = retryResult.eventCount;
       }
     } catch (e) {
-      logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
+      logger.error('Anthropic stream retry failed', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
     }
   }
@@ -865,7 +875,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
       }
     } catch (e) {
-      logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
+      logger.error('Anthropic non-stream retry failed', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
     }
   }
@@ -989,7 +999,7 @@ const handleAnthropicMessages = async (req, res) => {
       await handleAnthropicNonStream(res, ctx, upstreamResp.response);
     }
   } catch (error) {
-    logger.error('Anthropic Messages 处理错误', 'ANTHROPIC', '', error);
+    logger.error('Anthropic Messages processing error', 'ANTHROPIC', '', error);
     if (!res.headersSent) {
       res.status(500).json({
         type: 'error',

@@ -86,13 +86,13 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
     try {
         // 参数验证
         if (!filename || !authToken) {
-            logger.error('文件名和认证Token不能为空', 'UPLOAD')
-            throw new Error('文件名和认证Token不能为空')
+            logger.error('Filename and auth token cannot be empty', 'UPLOAD')
+            throw new Error('Filename and auth token cannot be empty')
         }
 
         if (!validateFileSize(filesize)) {
-            logger.error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`, 'UPLOAD')
-            throw new Error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
+            logger.error(`File size exceeds limit, max allowed ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`, 'UPLOAD')
+            throw new Error(`File size exceeds limit, max allowed ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
         }
 
         const requestId = generateUUID()
@@ -123,13 +123,13 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             requestConfig.proxy = false
         }
 
-        logger.info(`请求STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
+        logger.info(`Requesting STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
 
         const response = await axios.post(UPLOAD_CONFIG.stsTokenUrl, payload, requestConfig)
 
         if (response.status === 200 && response.data) {
             if (response.data.success === false) {
-                throw new Error(response.data?.data?.message || response.data?.message || 'STS Token 请求被上游拒绝')
+                throw new Error(response.data?.data?.message || response.data?.message || 'STS Token request rejected by upstream')
             }
             // 同时兼容旧版直接字段与 FE 0.2.81 的 {success,data} 包装。
             const stsData = unwrapApiData(response)
@@ -157,24 +157,24 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             const missingFileInfo = requiredFileInfo.filter(key => !fileInfo[key])
 
             if (missingCredentials.length > 0 || missingFileInfo.length > 0) {
-                logger.error(`STS响应数据不完整: 缺少 ${[...missingCredentials, ...missingFileInfo].join(', ')}`, 'UPLOAD')
-                throw new Error(`STS响应数据不完整: 缺少 ${[...missingCredentials, ...missingFileInfo].join(', ')}`)
+                logger.error(`STS response incomplete: missing ${[...missingCredentials, ...missingFileInfo].join(', ')}`, 'UPLOAD')
+                throw new Error(`STS response incomplete: missing ${[...missingCredentials, ...missingFileInfo].join(', ')}`)
             }
 
-            logger.success('STS Token获取成功', 'UPLOAD')
+            logger.success('STS Token obtained successfully', 'UPLOAD')
             return { credentials, file_info: fileInfo }
         } else {
-            logger.error(`获取STS Token失败，状态码: ${response.status}`, 'UPLOAD')
-            throw new Error(`获取STS Token失败，状态码: ${response.status}`)
+            logger.error(`Failed to get STS Token, status code: ${response.status}`, 'UPLOAD')
+            throw new Error(`Failed to get STS Token, status code: ${response.status}`)
         }
     } catch (error) {
-        logger.error(`请求STS Token失败 (重试: ${retryCount})`, 'UPLOAD', '', error)
+        logger.error(`Failed to request STS Token (retry: ${retryCount})`, 'UPLOAD', '', error)
 
         // 403错误特殊处理
         if (error.response?.status === 403) {
-            logger.error('403 Forbidden错误，可能是Token权限问题', 'UPLOAD')
-            logger.error('认证失败，请检查Token权限', 'UPLOAD')
-            throw new Error('认证失败，请检查Token权限')
+            logger.error('403 Forbidden, possible token permission issue', 'UPLOAD')
+            logger.error('Auth failed, please check token permissions', 'UPLOAD')
+            throw new Error('Auth failed, please check token permissions')
         }
 
         // 重试逻辑
@@ -183,7 +183,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
                 error.response?.status >= 500)) {
 
             const delayMs = UPLOAD_CONFIG.retryDelay * Math.pow(2, retryCount)
-            logger.warn(`等待 ${delayMs}ms 后重试...`, 'UPLOAD', '⏳')
+            logger.warn(`Retrying in ${delayMs}ms...`, 'UPLOAD', '⏳')
             await delay(delayMs)
 
             return requestStsToken(filename, filesize, filetypeSimple, authToken, retryCount + 1, account)
@@ -206,8 +206,8 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
     try {
         // 参数验证
         if (!fileBuffer || !stsCredentials || !ossInfo) {
-            logger.error('缺少必要的上传参数', 'UPLOAD')
-            throw new Error('缺少必要的上传参数')
+            logger.error('Missing required upload parameters', 'UPLOAD')
+            throw new Error('Missing required upload parameters')
         }
 
         const client = new OSS({
@@ -220,7 +220,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             timeout: UPLOAD_CONFIG.timeout
         })
 
-        logger.info(`上传文件到OSS: ${ossInfo.path} (${fileBuffer.length} bytes)`, 'UPLOAD', '📤')
+        logger.info(`Uploading file to OSS: ${ossInfo.path} (${fileBuffer.length} bytes)`, 'UPLOAD', '📤')
 
         const result = await client.put(ossInfo.path, fileBuffer, {
             headers: {
@@ -229,19 +229,19 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
         })
 
         if (result.res && result.res.status === 200) {
-            logger.success('文件上传到OSS成功', 'UPLOAD')
+            logger.success('File uploaded to OSS successfully', 'UPLOAD')
             return { success: true, result }
         } else {
-            logger.error(`OSS上传失败，状态码: ${result.res?.status || 'unknown'}`, 'UPLOAD')
-            throw new Error(`OSS上传失败，状态码: ${result.res?.status || 'unknown'}`)
+            logger.error(`OSS upload failed, status code: ${result.res?.status || 'unknown'}`, 'UPLOAD')
+            throw new Error(`OSS upload failed, status code: ${result.res?.status || 'unknown'}`)
         }
     } catch (error) {
-        logger.error(`OSS上传失败 (重试: ${retryCount})`, 'UPLOAD', '', error)
+        logger.error(`OSS upload failed (retry: ${retryCount})`, 'UPLOAD', '', error)
 
         // 重试逻辑
         if (retryCount < UPLOAD_CONFIG.maxRetries) {
             const delayMs = UPLOAD_CONFIG.retryDelay * Math.pow(2, retryCount)
-            logger.warn(`等待 ${delayMs}ms 后重试OSS上传...`, 'UPLOAD', '⏳')
+            logger.warn(`Retrying in ${delayMs}ms... (OSS retry)`, 'UPLOAD', '⏳')
             await delay(delayMs)
 
             return uploadToOssWithSts(fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount + 1)
@@ -264,8 +264,8 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
     try {
         // 参数验证
         if (!fileBuffer || !originalFilename || !authToken) {
-            logger.error('缺少必要的上传参数', 'UPLOAD')
-            throw new Error('缺少必要的上传参数')
+            logger.error('Missing required upload parameters', 'UPLOAD')
+            throw new Error('Missing required upload parameters')
         }
 
         const filesize = fileBuffer.length
@@ -274,11 +274,11 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
 
         // 文件大小验证
         if (!validateFileSize(filesize)) {
-            logger.error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`, 'UPLOAD')
-            throw new Error(`文件大小超出限制，最大允许 ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
+            logger.error(`File size exceeds limit, max allowed ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`, 'UPLOAD')
+            throw new Error(`File size exceeds limit, max allowed ${UPLOAD_CONFIG.maxFileSize / 1024 / 1024}MB`)
         }
 
-        logger.info(`开始上传文件: ${originalFilename} (${filesize} bytes, ${mimeType})`, 'UPLOAD', '📤')
+        logger.info(`Starting file upload: ${originalFilename} (${filesize} bytes, ${mimeType})`, 'UPLOAD', '📤')
 
         // 第一步：获取STS Token
         const { credentials, file_info } = await requestStsToken(
@@ -293,7 +293,7 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
         // 第二步：上传到OSS
         await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType)
 
-        logger.success('文件上传流程完成', 'UPLOAD')
+        logger.success('File upload process complete', 'UPLOAD')
 
         return {
             status: 200,
@@ -302,7 +302,7 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
             message: '文件上传成功'
         }
     } catch (error) {
-        logger.error('文件上传流程失败', 'UPLOAD', '', error)
+        logger.error('File upload process failed', 'UPLOAD', '', error)
         throw error
     }
 }
@@ -316,7 +316,7 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
  * @param {Object} [options]
  */
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
-    if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
+    if (!fileId || !authToken) throw new Error('Parsed document missing fileId or auth token')
 
     const baseUrl = getChatBaseUrl()
     const requestConfig = applyProxyToAxiosConfig({
@@ -341,12 +341,12 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
 
         if (status === 'success' || status === 'completed' || status === 'done') return true
         if (status === 'failed' || status === 'error') {
-            throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
+            throw new Error(record?.error_msg || record?.message || 'Qwen document parsing failed')
         }
         if (attempt < maxAttempts) await delay(intervalMs)
     }
 
-    throw new Error(`Qwen 文档解析超时: ${fileId}`)
+    throw new Error(`Qwen document parsing timeout: ${fileId}`)
 }
 
 /**
@@ -395,7 +395,7 @@ const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
  */
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
-    if (content.length === 0) throw new Error('Agent 上下文为空')
+    if (content.length === 0) throw new Error('Agent context is empty')
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
     await parseUploadedTextFile(uploaded.file_id, authToken, account, options)

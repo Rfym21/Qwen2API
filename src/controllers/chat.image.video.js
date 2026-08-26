@@ -111,7 +111,7 @@ const parseUpstreamImageError = (data) => {
         const errorData = payload.data
         if (errorData.code === 'RateLimited') {
             const waitHours = errorData.num
-            logger.error(`图片/视频生成额度已用尽，需等待约 ${waitHours || '未知'} 小时`, 'CHAT', '', {
+            logger.error(`Image/video generation quota exhausted, waiting approximately ${waitHours || 'unknown'}  hours`, 'CHAT', '', {
                 parsed_error: errorData,
                 raw_response_body: rawPayload
             })
@@ -123,7 +123,7 @@ const parseUpstreamImageError = (data) => {
             }
         }
 
-        logger.error('请求上游服务时出现错误', 'CHAT', '', {
+        logger.error('Error occurred when requesting upstream service', 'CHAT', '', {
             parsed_error: errorData,
             raw_response_body: rawPayload
         })
@@ -749,7 +749,7 @@ const buildInternalMediaItem = (mediaType, mediaURL) => {
  */
 const uploadMultipartMediaFile = async (file, mediaType) => {
     if (!file?.buffer) {
-        throw new Error('上传文件内容为空')
+        throw new Error('Upload file content is empty')
     }
 
     const fallbackExtension = mediaType === 'video' ? 'mp4' : 'png'
@@ -758,7 +758,7 @@ const uploadMultipartMediaFile = async (file, mediaType) => {
     const uploadResult = await uploadFileToQwenOss(file.buffer, originalFilename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
-        throw new Error('文件上传失败')
+        throw new Error('File upload failed')
     }
 
     return buildInternalMediaItem(mediaType, uploadResult.file_url)
@@ -792,7 +792,7 @@ const normalizeInlineMediaItem = async (value, mediaType) => {
     const uploadResult = await uploadFileToQwenOss(Buffer.from(base64Content, 'base64'), `upload.${fileExtension}`, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
     if (!uploadResult || uploadResult.status !== 200) {
-        throw new Error('文件上传失败')
+        throw new Error('File upload failed')
     }
 
     return buildInternalMediaItem(mediaType, uploadResult.file_url)
@@ -1055,7 +1055,7 @@ const getChatDetail = async (chatID, token) => {
         const responseData = await axios.get(`${chatBaseUrl}/api/v2/chats/${chatID}`, requestConfig)
         return responseData.data || null
     } catch (error) {
-        logger.error(`获取聊天详情失败 (${chatID})`, 'CHAT', '', buildAxiosErrorLog(error))
+        logger.error(`Chat detail fetch failed (${chatID})`, 'CHAT', '', buildAxiosErrorLog(error))
         return null
     }
 }
@@ -1134,7 +1134,7 @@ const resolveImageResultContentUrl = async (responseData, chatID, token) => {
     let contentUrl = upstreamContentUrl
 
     if (!contentUrl && chatID) {
-        logger.info(`图片上游未直接返回链接，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
+        logger.info(`Image upstream did not directly return link, trying to get from chat details, chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
         for (let attempt = 1; attempt <= 5; attempt++) {
             const chatDetail = await getChatDetail(chatID, token)
@@ -1149,8 +1149,8 @@ const resolveImageResultContentUrl = async (responseData, chatID, token) => {
     }
 
     if (!contentUrl) {
-        logger.warn(`图片上游响应未解析出图片链接，responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-        throw new Error('上游未返回图片链接')
+        logger.warn(`Image upstream response did not parse image link, responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
+        throw new Error('upstream did not return image link')
     }
 
     return contentUrl
@@ -1177,7 +1177,7 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
     let resolvedTaskCandidates = [...videoTaskCandidates]
 
     if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
-        logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
+        logger.info(`Video upstream did not directly return task info, trying to get from chat details, chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
         for (let attempt = 1; attempt <= 5; attempt++) {
             const chatDetail = await getChatDetail(chatID, token)
@@ -1206,17 +1206,17 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
     }
 
     if (resolvedTaskCandidates.length === 0) {
-        logger.warn(`视频上游响应未解析出任务信息，contentUrl=${resolvedContentUrl || '空'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-        throw new Error('上游未返回视频任务 ID 或视频链接')
+        logger.warn(`Video upstream response did not parse task info, contentUrl=${resolvedContentUrl || 'empty'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
+        throw new Error('upstream did not return video task ID or video link')
     }
 
-    logger.info(`视频任务候选ID: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
+    logger.info(`Video task candidate IDs: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
 
     const maxAttempts = 60
     const delay = 20 * 1000
 
     for (const taskCandidate of resolvedTaskCandidates) {
-        logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
+        logger.info(`Starting to poll video task ID: ${taskCandidate}`, 'CHAT')
 
         for (let i = 0; i < maxAttempts; i++) {
             const content = await getVideoTaskStatus(taskCandidate, token)
@@ -1228,7 +1228,7 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
         }
     }
 
-    logger.error(`视频任务 ${JSON.stringify(resolvedTaskCandidates)} 轮询超时`, 'CHAT')
+    logger.error(`Video task ${JSON.stringify(resolvedTaskCandidates)} polling timeout`, 'CHAT')
     throw {
         status: 504,
         error: '视频生成超时，请稍后再试'
@@ -1269,7 +1269,7 @@ const generateImageVideoResult = async (payload) => {
         const chatID = await generateChatID(token, model, account, chat_type)
 
         if (!chatID) {
-            throw new Error('生成 chat_id 失败')
+            throw new Error('Failed to generate chat_id')
         }
 
         reqBody.chat_id = chatID
@@ -1364,15 +1364,15 @@ const generateImageVideoResult = async (payload) => {
         const proxyAgent = getProxyAgent(account)
         const cookieHeader = buildUpstreamCookieHeader(token)
 
-        logger.info('发送图片视频请求', 'CHAT')
-        logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
-        logger.info(`使用提示: ${reqBody.messages[0].content}`, 'CHAT')
+        logger.info('Sending image/video request', 'CHAT')
+        logger.info(`Selected image: ${selectedImageList[selectedImageList.length - 1] || 'no image selected, switching to generate image/video mode'}`, 'CHAT')
+        logger.info(`Using prompt: ${reqBody.messages[0].content}`, 'CHAT')
 
         const newChatType = reqBody.messages[0].chat_type
         const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
         reqBody.stream = upstreamStream
 
-        logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
+        logger.info(`Image/video streaming strategy: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
 
         const requestConfig = {
             headers: {
@@ -1412,17 +1412,17 @@ const generateImageVideoResult = async (payload) => {
 
                 const inlineUpstreamError = parseUpstreamImageError(responseData.data)
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
-                    logger.warn(`图片/视频请求上游返回业务错误包，准备第 ${attempt + 1} 次重试，请求ID: ${inlineUpstreamError.request_id || '未知'}`, 'CHAT')
+                    logger.warn(`Image/video request upstream returned business error, preparing attempt ${attempt + 1} retry, request ID: ${inlineUpstreamError.request_id || 'unknown'}`, 'CHAT')
                     await sleep(800)
                     continue
                 }
 
                 break
             } catch (error) {
-                logger.error('图片/视频请求失败', 'CHAT', '', buildAxiosErrorLog(error))
+                logger.error('Image/video request failed', 'CHAT', '', buildAxiosErrorLog(error))
                 const upstreamError = parseUpstreamImageError(error.response?.data)
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(upstreamError)) {
-                    logger.warn(`图片/视频请求上游返回瞬时内部错误，准备第 ${attempt + 1} 次重试`, 'CHAT')
+                    logger.warn(`Image/video request upstream returned transient internal error, preparing attempt ${attempt + 1} retry`, 'CHAT')
                     await sleep(800)
                     continue
                 }
@@ -1451,9 +1451,9 @@ const generateImageVideoResult = async (payload) => {
             }
         }
 
-        throw new Error('不支持的图片/视频类型')
+        throw new Error('Unsupported image/video type')
     } catch (error) {
-        logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
+        logger.error('Image/video main process error', 'CHAT', '', buildAxiosErrorLog(error))
 
         if (error?.error) {
             throw error
@@ -1502,7 +1502,7 @@ const handleImageVideoCompletion = async (req, res) => {
             clearInterval(keepAliveTimer)
         }
 
-        logger.error('图片视频资源处理错误', 'CHAT', '', error)
+        logger.error('Image/video resource processing error', 'CHAT', '', error)
 
         if (downstreamStream) {
             return returnResponse(res, req.body.model, error?.error || error?.message || 'Service error, please try again later', true)
@@ -1527,7 +1527,7 @@ const returnResponse = (res, model, content, stream) => {
         setResponseHeaders(res, stream)
     }
 
-    logger.info(`返回响应: ${content}`, 'CHAT')
+    logger.info(`Returning response: ${content}`, 'CHAT')
 
     if (stream) {
         const responseID = `chatcmpl-${new Date().getTime()}`
@@ -1622,7 +1622,7 @@ const handleOpenAIImagesGeneration = async (req, res) => {
             data: [imageData]
         })
     } catch (error) {
-        logger.error('OpenAI 图片生成端点处理失败', 'CHAT', '', error)
+        logger.error('OpenAI image generation endpoint failed', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
     }
 }
@@ -1671,7 +1671,7 @@ const handleOpenAIImagesEdit = async (req, res) => {
             data: [imageData]
         })
     } catch (error) {
-        logger.error('OpenAI 图片编辑端点处理失败', 'CHAT', '', error)
+        logger.error('OpenAI image edit endpoint failed', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
     }
 }
@@ -1718,7 +1718,7 @@ const handleOpenAIVideoGeneration = async (req, res) => {
             ]
         })
     } catch (error) {
-        logger.error('OpenAI 视频生成端点处理失败', 'CHAT', '', error)
+        logger.error('OpenAI video generation endpoint failed', 'CHAT', '', error)
         return sendOpenAIErrorResponse(res, error)
     }
 }
@@ -1762,7 +1762,7 @@ const handleVideoCompletion = async (res, responseStream, token, model, downstre
         let resolvedTaskCandidates = [...videoTaskCandidates]
 
         if (!resolvedContentUrl && resolvedTaskCandidates.length === 0 && chatID) {
-            logger.info(`视频上游未直接返回任务信息，尝试从聊天详情补取，chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
+            logger.info(`Video upstream did not directly return task info, trying to get from chat details, chat_id=${chatID} responseIDs=${JSON.stringify(responseIDs)}`, 'CHAT')
 
             for (let attempt = 1; attempt <= 5; attempt++) {
                 const chatDetail = await getChatDetail(chatID, token)
@@ -1795,17 +1795,17 @@ const handleVideoCompletion = async (res, responseStream, token, model, downstre
         }
 
         if (resolvedTaskCandidates.length === 0) {
-            logger.warn(`视频上游响应未解析出任务信息，contentUrl=${resolvedContentUrl || '空'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
-            throw new Error('上游未返回视频任务 ID 或视频链接')
+            logger.warn(`Video upstream response did not parse task info, contentUrl=${resolvedContentUrl || 'empty'} candidates=${JSON.stringify(resolvedTaskCandidates)} responseIDs=${JSON.stringify(responseIDs)} preview=${rawPreview}`, 'CHAT')
+            throw new Error('upstream did not return video task ID or video link')
         }
 
-        logger.info(`视频任务候选ID: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
+        logger.info(`Video task candidate IDs: ${JSON.stringify(resolvedTaskCandidates)}`, 'CHAT')
 
         const maxAttempts = 60
         const delay = 20 * 1000
 
         for (const taskCandidate of resolvedTaskCandidates) {
-            logger.info(`开始轮询视频任务ID: ${taskCandidate}`, 'CHAT')
+            logger.info(`Starting to poll video task ID: ${taskCandidate}`, 'CHAT')
 
             for (let i = 0; i < maxAttempts; i++) {
                 const content = await getVideoTaskStatus(taskCandidate, token)
@@ -1821,7 +1821,7 @@ const handleVideoCompletion = async (res, responseStream, token, model, downstre
             }
         }
 
-        logger.error(`视频任务 ${JSON.stringify(resolvedTaskCandidates)} 轮询超时`, 'CHAT')
+        logger.error(`Video task ${JSON.stringify(resolvedTaskCandidates)} polling timeout`, 'CHAT')
         if (keepAliveTimer) {
             clearInterval(keepAliveTimer)
         }
@@ -1836,7 +1836,7 @@ const handleVideoCompletion = async (res, responseStream, token, model, downstre
             clearInterval(keepAliveTimer)
         }
 
-        logger.error('获取视频任务状态失败', 'CHAT', '', error)
+        logger.error('Failed to get video task status', 'CHAT', '', error)
 
         const errorMessage = error.response?.data?.data?.code || error.message || '可能该帐号今日生成次数已用完'
 
@@ -1874,13 +1874,13 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
 
         if (response_data.data?.task_status == "success") {
             const contentUrl = extractResourceUrlFromPayload(response_data.data)
-            logger.info('获取视频任务状态成功', 'CHAT', contentUrl || response_data.data?.content)
+            logger.info('Successfully got video task status', 'CHAT', contentUrl || response_data.data?.content)
             return contentUrl
         }
-        logger.info(`获取视频任务 ${videoTaskID} 状态: ${response_data.data?.task_status}`, 'CHAT')
+        logger.info(`Got video task ${videoTaskID} status: ${response_data.data?.task_status}`, 'CHAT')
         return null
     } catch (error) {
-        logger.error(`查询视频任务状态失败 (${videoTaskID})`, 'CHAT', '', buildAxiosErrorLog(error))
+        logger.error(`Failed to query video task status (${videoTaskID})`, 'CHAT', '', buildAxiosErrorLog(error))
         return null
     }
 }

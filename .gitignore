@@ -1,5 +1,4 @@
 node_modules
-package-lock.json
 .tmp/
 mitm_mcp_traffic.db
 .env

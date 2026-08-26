@@ -71,7 +71,7 @@ const getLatestModels = async (force = false) => {
         fetchPromise = null
         return cachedModels
     }).catch(error => {
-        logger.error(`获取模型列表失败: ${error.message}`, 'MODEL')
+        logger.error(`Failed to get model list: ${error.message}`, 'MODEL')
         fetchPromise = null
         // 刷新失败时回退到旧缓存，避免返回空列表；重置时间戳以免每个请求都重试
         if (cachedModels) {

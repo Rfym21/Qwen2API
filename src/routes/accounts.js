@@ -190,13 +190,13 @@ const processBatchAccountItem = async (task, account) => {
   try {
     const authToken = await accountManager.login(email, password, proxy)
     if (!authToken) {
-      throw new Error('登录失败')
+      throw new Error('Login failed')
     }
 
     const decoded = JwtDecode(authToken)
     const saved = await accountManager.addAccountWithToken(email, password, authToken, decoded.exp, proxy)
     if (!saved) {
-      throw new Error('保存失败')
+      throw new Error('Save failed')
     }
 
     task.success++
@@ -217,7 +217,7 @@ const processBatchAccountItem = async (task, account) => {
       message: error.message || '登录失败'
     })
 
-    logger.error(`批量登录账号失败: ${email}`, 'ACCOUNT', '', error)
+    logger.error(`Batch login failed: ${email}`, 'ACCOUNT', '', error)
   } finally {
     task.processed++
     task.completed++
@@ -260,7 +260,7 @@ const runBatchAccountTask = async (task, newAccounts) => {
     task.status = 'failed'
     task.finishedAt = Date.now()
     task.message = error.message || '批量添加执行失败'
-    logger.error('批量创建账号失败', 'ACCOUNT', '', error)
+    logger.error('Batch create account failed', 'ACCOUNT', '', error)
     scheduleBatchTaskCleanup(task.id)
     return task
   }
@@ -317,7 +317,7 @@ router.get('/getAllAccounts', adminKeyVerify, async (req, res) => {
       data: accounts
     })
   } catch (error) {
-    logger.error('获取账号列表失败', 'ACCOUNT', '', error)
+    logger.error('Failed to get account list', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -372,7 +372,7 @@ router.post('/setAccount', adminKeyVerify, async (req, res) => {
       res.status(500).json({ error: '账号创建失败' })
     }
   } catch (error) {
-    logger.error('创建账号失败', 'ACCOUNT', '', error)
+    logger.error('Failed to create account', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -398,12 +398,12 @@ router.delete('/deleteAccount', adminKeyVerify, async (req, res) => {
     const success = await deleteAccount(email)
 
     if (success) {
-      res.json({ message: '账号删除成功' })
+      res.json({ message: 'Account deleted successfully' })
     } else {
       res.status(500).json({ error: '账号删除失败' })
     }
   } catch (error) {
-    logger.error('删除账号失败', 'ACCOUNT', '', error)
+    logger.error('Failed to delete account', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -466,7 +466,7 @@ router.post('/setAccounts', adminKeyVerify, async (req, res) => {
       ...getBatchTaskSnapshot(task)
     })
   } catch (error) {
-    logger.error('批量创建账号失败', 'ACCOUNT', '', error)
+    logger.error('Batch create account failed', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -529,7 +529,7 @@ router.post('/updateAccountProxy', adminKeyVerify, async (req, res) => {
       res.status(500).json({ error: '账号代理更新失败' })
     }
   } catch (error) {
-    logger.error('更新账号代理失败', 'ACCOUNT', '', error)
+    logger.error('Failed to update account proxy', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -567,7 +567,7 @@ router.post('/refreshAccount', adminKeyVerify, async (req, res) => {
       res.status(500).json({ error: '账号令牌刷新失败' })
     }
   } catch (error) {
-    logger.error('刷新账号令牌失败', 'ACCOUNT', '', error)
+    logger.error('Failed to refresh account token', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -592,7 +592,7 @@ router.post('/refreshAllAccounts', adminKeyVerify, async (req, res) => {
       thresholdHours: thresholdHours
     })
   } catch (error) {
-    logger.error('批量刷新账号令牌失败', 'ACCOUNT', '', error)
+    logger.error('Batch refresh account token failed', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -614,7 +614,7 @@ router.post('/forceRefreshAllAccounts', adminKeyVerify, async (req, res) => {
       totalAccounts: accountManager.getAllAccountKeys().length
     })
   } catch (error) {
-    logger.error('强制刷新账号令牌失败', 'ACCOUNT', '', error)
+    logger.error('Force refresh account token failed', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -663,7 +663,7 @@ router.get('/accountStats', adminKeyVerify, async (req, res) => {
       cliQuotaLimit
     })
   } catch (error) {
-    logger.error('获取账户 stats 失败', 'ACCOUNT', '', error)
+    logger.error('Failed to get account stats', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -733,7 +733,7 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
 
     res.json({ today, accounts })
   } catch (error) {
-    logger.error('获取 statsHistory 失败', 'ACCOUNT', '', error)
+    logger.error('Failed to get statsHistory', 'ACCOUNT', '', error)
     res.status(500).json({ error: error.message })
   }
 })
@@ -762,11 +762,11 @@ if (process.env.ENABLE_STATS_DEBUG_ARCHIVE === 'true') {
       if (error && error.message && error.message.includes('not initialized')) {
         return res.status(503).json({ error: 'account manager not initialized, try again' })
       }
-      logger.error('debug/archiveYesterday 失败', 'ACCOUNT', '', error)
+      logger.error('debug/archiveYesterday failed', 'ACCOUNT', '', error)
       res.status(500).json({ error: error.message })
     }
   })
-  logger.info('已启用 debug/archiveYesterday 端点 (ENABLE_STATS_DEBUG_ARCHIVE=true)', 'ACCOUNT')
+  logger.info('debug/archiveYesterday endpoint enabled (ENABLE_STATS_DEBUG_ARCHIVE=true)', 'ACCOUNT')
 }
 
 module.exports = router

@@ -63,7 +63,7 @@ const setResponseHeaders = (res, stream) => {
             })
         }
     } catch (e) {
-        logger.error('处理聊天请求时发生错误', 'CHAT', '', e)
+        logger.error('Error processing chat request', 'CHAT', '', e)
     }
 }
 
@@ -326,7 +326,7 @@ const handleOpenAIAgentStream = async (
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
-        logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
+        logger.error('OpenAI Agent turn processing failed', 'AGENT', '', error)
         writeOpenAIHttpError(res, {
             status: 502,
             message: error.publicMessage || '上游 Agent 回合处理失败',
@@ -432,7 +432,7 @@ const handleOpenAIAgentNonStream = async (
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
-        logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
+        logger.error('OpenAI non-stream Agent turn processing failed', 'AGENT', '', error)
         writeOpenAIHttpError(res, {
             status: 502,
             message: error.publicMessage || '上游 Agent 回合处理失败',
@@ -789,7 +789,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 try {
                     await processSSEPayload(frame.data)
                 } catch (error) {
-                    logger.error('流式数据处理错误', 'CHAT', '', error)
+                    logger.error('Streaming data processing error', 'CHAT', '', error)
                     throw error
                 }
             })
@@ -841,7 +841,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     await pipeUpstream(retryResp.response)
                 }
             } catch (e) {
-                logger.error('Agent 补偿重试失败', 'CHAT', '', e)
+                logger.error('Agent compensation retry failed', 'CHAT', '', e)
                 if (e.publicMessage) throw e
             }
         }
@@ -904,9 +904,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         // 计算最终的token使用量
         if (totalTokens.prompt_tokens === 0 && totalTokens.completion_tokens === 0) {
             totalTokens = createUsageObject(requestBody?.messages || promptText, completionContent, null)
-            logger.info(`流式使用tiktoken计算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
+            logger.info(`Streaming using tiktoken calculation - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
         } else {
-            logger.info(`流式使用上游真实Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
+            logger.info(`Streaming using upstream real token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
         }
 
         totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
@@ -942,7 +942,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.write(`data: [DONE]\n\n`)
         res.end()
     } catch (error) {
-        logger.error('聊天处理错误', 'CHAT', '', error)
+        logger.error('Chat processing error', 'CHAT', '', error)
         if (res.headersSent) {
             if (!res.writableEnded) {
                 writeOpenAIStreamError(
@@ -1207,7 +1207,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                     ]
                 }
             } catch (e) {
-                logger.error('Agent 补偿重试失败', 'CHAT', '', e)
+                logger.error('Agent compensation retry failed', 'CHAT', '', e)
                 if (e.publicMessage) throw e
             }
         }
@@ -1261,9 +1261,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         // 计算最终的token使用量（推理内容计入 completion，与 DeepSeek 一致；旧版 fullReasoning 为空）
         if (totalTokens.prompt_tokens === 0 && totalTokens.completion_tokens === 0) {
             totalTokens = createUsageObject(requestBody?.messages || promptText, fullReasoning + fullContent, null)
-            logger.info(`非流式使用tiktoken计算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
+            logger.info(`Non-streaming using tiktoken calculation - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
         } else {
-            logger.info(`非流式使用上游真实Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
+            logger.info(`Non-streaming using upstream real token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`, 'CHAT')
         }
 
         totalTokens.prompt_tokens = Math.max(0, totalTokens.prompt_tokens || 0)
@@ -1297,7 +1297,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         }
         res.json(bodyTemplate)
     } catch (error) {
-        logger.error('非流式聊天处理错误', 'CHAT', '', error)
+        logger.error('Non-streaming Chat processing error', 'CHAT', '', error)
         if (!res.headersSent) {
             res.status(502).json({
                 error: {
@@ -1362,7 +1362,7 @@ const handleChatCompletion = async (req, res) => {
         }
 
     } catch (error) {
-        logger.error('聊天处理错误', 'CHAT', '', error)
+        logger.error('Chat processing error', 'CHAT', '', error)
         res.status(500)
             .json({
                 error: "Invalid token, request failed"

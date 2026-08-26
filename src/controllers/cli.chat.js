@@ -289,7 +289,7 @@ const handleCliChatCompletion = async (req, res) => {
         const isStream = body.stream === true
 
         // 打印当前使用的账号邮箱
-        logger.info(`CLI请求使用账号[${req.account.email}]开始处理`, 'CLI', '🚀')
+        logger.info(`CLI request using account [${req.account.email}] starting processing`, 'CLI', '🚀')
 
         // 无论成功失败都增加请求计数
         req.account.cli_info.request_number++
@@ -348,7 +348,7 @@ const handleCliChatCompletion = async (req, res) => {
         // 检查响应状态
         if (response.status !== 200) {
             const errorDetails = await normalizeCliErrorDetails(response.data)
-            logger.error(`CLI请求使用账号[${req.account.email}]转发失败 - 状态码: ${response.status} - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '❌', {
+            logger.error(`CLI request using account [${req.account.email}] forwarding failed - status code: ${response.status} - current request count: ${req.account.cli_info.request_number}`, 'CLI', '❌', {
                 status: response.status,
                 statusText: response.statusText,
                 requestBody: body,
@@ -402,18 +402,18 @@ const handleCliChatCompletion = async (req, res) => {
             }
 
             if (!streamResult.sawDone) res.write('data: [DONE]\n\n')
-            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (流式) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+            logger.success(`CLI request using account [${req.account.email}] forwarding succeeded (streaming) - current request count: ${req.account.cli_info.request_number}`, 'CLI')
             attributeCliUsage(req.account.email, cliUsage)
             res.end()
         } else {
             // 处理JSON响应
             const cliUsage = response.data?.usage
             res.json(formatCliJsonResponse(response.data, body.model))
-            logger.success(`CLI请求使用账号[${req.account.email}]转发成功 (JSON) - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI')
+            logger.success(`CLI request using account [${req.account.email}] forwarding succeeded (JSON) - current request count: ${req.account.cli_info.request_number}`, 'CLI')
             attributeCliUsage(req.account.email, cliUsage)
         }
     } catch (error) {
-        logger.error(`CLI请求使用账号[${req.account.email}]处理异常 - 当前请求数: ${req.account.cli_info.request_number}`, 'CLI', '💥', {
+        logger.error(`CLI request using account [${req.account.email}] processing exception - current request count: ${req.account.cli_info.request_number}`, 'CLI', '💥', {
             requestBody: body,
             ...(await buildCliAxiosErrorLog(error))
         })

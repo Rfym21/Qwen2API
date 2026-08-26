@@ -23,8 +23,8 @@ class AccountRotator {
    */
   setAccounts(accounts) {
     if (!Array.isArray(accounts)) {
-      logger.error('账户列表必须是数组', 'ACCOUNT')
-      throw new Error('账户列表必须是数组')
+      logger.error('Account list must be an array', 'ACCOUNT')
+      throw new Error('Account list must be an array')
     }
     
     this.accounts = [...accounts]
@@ -40,13 +40,13 @@ class AccountRotator {
    */
   getNextAccount() {
     if (this.accounts.length === 0) {
-      logger.error('没有可用的账户', 'ACCOUNT')
+      logger.error('No available accounts', 'ACCOUNT')
       return null
     }
 
     const availableAccounts = this._getAvailableAccounts()
     if (availableAccounts.length === 0) {
-      logger.warn('所有账户都不可用，使用轮询策略', 'ACCOUNT')
+      logger.warn('All accounts unavailable, using round-robin strategy', 'ACCOUNT')
       return this._getAccountByRoundRobin()
     }
 
@@ -74,12 +74,12 @@ class AccountRotator {
   getAccountByEmail(email) {
     const account = this.accounts.find(acc => acc.email === email)
     if (!account) {
-      logger.error(`未找到邮箱为 ${email} 的账户`, 'ACCOUNT')
+      logger.error(`Account with email not found: ${email} 's account`, 'ACCOUNT')
       return null
     }
 
     if (!this._isAccountAvailable(account)) {
-      logger.warn(`账户 ${email} 当前不可用`, 'ACCOUNT')
+      logger.warn(`Account ${email} is currently unavailable`, 'ACCOUNT')
       return null
     }
 
@@ -117,7 +117,7 @@ class AccountRotator {
     // 达到阈值的瞬间标记 cooldown 起点（独立于 lastUsedTimes，CLI-only 失败也正确）
     if (nextFailures >= this.maxFailures && !this.cooldownStartedAt.has(email)) {
       this.cooldownStartedAt.set(email, Date.now())
-      logger.warn(`账户 ${email} 失败次数达到上限，将进入冷却期`, 'ACCOUNT')
+      logger.warn(`Account ${email} failure count reached limit, entering cooldown`, 'ACCOUNT')
     }
   }
 
