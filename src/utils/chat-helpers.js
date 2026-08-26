@@ -1,9 +1,10 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
 const { uploadFileToQwenOss } = require('./upload.js')
-const { getLatestModels } = require('../models/models-map.js')
+const { getLatestModels, getDefaultModelByChatType } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
+const config = require('../config/index.js')
 
 const MODEL_SUFFIXES = [
     '-thinking-search',
@@ -244,20 +245,23 @@ const isThinkingEnabled = async (model, enable_thinking, thinking_budget) => {
 
 /**
  * 解析模型名称,移除特殊后缀
+ * 未指定模型时动态取上游列表中首个支持 t2t 的模型，而非硬编码
  * @param {string} model - 原始模型名称
  * @returns {string} 解析后的模型名称
  */
 const parserModel = async (model) => {
-    if (!model) return 'qwen3-coder-plus'
+    const { baseModel } = splitModelSuffix(model)
 
     try {
-        const { baseModel } = splitModelSuffix(model)
+        if (!baseModel) {
+            // 客户端未指定模型 — 动态选择上游默认 t2t 模型
+            return await getDefaultModelByChatType('t2t') || 'qwen3-coder-plus'
+        }
         const latestModels = await getLatestModels()
         const matchedModel = findMatchedModel(latestModels, baseModel)
 
         return matchedModel?.id || baseModel
     } catch (e) {
-        const { baseModel } = splitModelSuffix(model)
         return baseModel || 'qwen3-coder-plus'
     }
 }
@@ -502,6 +506,57 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
  * @returns {boolean}
  */
 const isThinkPhase = (phase) => phase === 'think' || phase === 'thinking' || phase === 'thinking_summary'
+
+/**
+ * 解析 chat_mode 的唯一决策点（single source of truth）
+ * 优先级：客户端显式 'normal' > 客户端 'local' 或全局 ENABLE_TEMP_CHATS > 默认 'normal'
+ * @param {string} [requested] - 请求中的 chat_mode
+ * @returns {'local'|'normal'}
+ */
+const resolveChatMode = (requested) => {
+    if (requested === 'normal') return 'normal'
+    if (requested === 'local' || config.enableTempChats) return 'local'
+    return 'normal'
+}
+
+/**
+ * 构建对齐 Qwen React 前端格式的单条消息（FE 0.2.81 抓包形状）。
+ * 上游 WAF 会按请求体指纹识别非浏览器客户端，所有入口必须用此工厂，
+ * 不要手写消息字面量。
+ * @param {Object} params
+ * @param {string} [params.role] - 消息角色
+ * @param {string|Array} [params.content] - 消息内容
+ * @param {string} [params.chatType] - 聊天类型（t2t 等）
+ * @param {boolean} [params.thinkingEnabled] - 是否启用思考
+ * @param {string} [params.modelId] - 解析后的模型 ID
+ * @returns {object} FE 格式消息对象
+ */
+const buildFeChatMessage = ({ role = 'user', content = '', chatType = 't2t', thinkingEnabled = false, modelId = null } = {}) => ({
+    id: null,
+    fid: generateUUID(),
+    parentId: null,
+    parent_id: null,
+    childrenIds: [generateUUID()],
+    role,
+    content,
+    user_action: 'chat',
+    files: [],
+    timestamp: Math.floor(Date.now() / 1000),
+    models: [modelId],
+    model: '',
+    chat_type: chatType,
+    feature_config: {
+        output_schema: 'phase', // 必需：缺失时上游不再返回 delta.phase
+        thinking_enabled: thinkingEnabled,
+        research_mode: 'normal',
+        auto_thinking: true,
+        thinking_mode: 'Auto',
+        thinking_format: 'summary', // 与官方 FE + Max 模型 meta 一致
+        auto_search: true
+    },
+    extra: { meta: { subChatType: chatType } },
+    sub_chat_type: chatType
+})
 const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
 
 /**
@@ -552,5 +607,7 @@ module.exports = {
     parserMessages,
     formatHistoryMessages,
     isThinkPhase,
+    resolveChatMode,
+    buildFeChatMessage,
     createUpstreamDeltaNormalizer
 }

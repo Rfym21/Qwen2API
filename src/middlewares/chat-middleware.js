@@ -1,5 +1,4 @@
-const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, resolveChatMode, buildFeChatMessage } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
@@ -56,8 +55,8 @@ const processRequestBody = async (req, res, next) => {
     } = req.body
 
     const now = Math.floor(Date.now() / 1000)
-    const fid = generateUUID()
     const thinkingConfig = await isThinkingEnabled(model, enable_thinking, thinking_budget)
+    const resolvedModelId = await parserModel(model)
 
     // 构建请求体 — 对齐 React 前端格式
     const body = {
@@ -66,36 +65,17 @@ const processRequestBody = async (req, res, next) => {
       incremental_output: true,
       chat_id: null,                    // 由 sendChatRequest 填充
       chatId: null,
-      chat_mode: req.body.chat_mode === 'local' ? 'local' : (config.enableTempChats ? 'local' : 'normal'),
-      model: await parserModel(model),
+      chat_mode: resolveChatMode(req.body.chat_mode),
+      model: resolvedModelId,
       parent_id: null,
       parentId: null,
-      messages: [{
-        id: null,
-        fid: fid,
-        parentId: null,
-        parent_id: null,
-        childrenIds: [generateUUID()],
+      messages: [buildFeChatMessage({
         role: 'user',                   // 取最后一条消息的角色
         content: '',                    // 由下方 parserMessages 填充
-        user_action: 'chat',
-        files: [],
-        timestamp: now,
-        models: [await parserModel(model)],
-        model: '',
-        chat_type: isChatType(model),
-        feature_config: {
-          output_schema: 'phase', // 必需：缺失时上游不再返回 delta.phase，chat.js 会丢弃全部增量（completion=0）
-          thinking_enabled: thinkingConfig.thinking_enabled,
-          research_mode: 'normal',
-          auto_thinking: true,
-          thinking_mode: 'Auto',
-          thinking_format: 'summary', // 与官方 FE + Max 模型 meta 一致
-          auto_search: true
-        },
-        extra: { meta: { subChatType: isChatType(model) } },
-        sub_chat_type: isChatType(model)
-      }],
+        chatType: isChatType(model),
+        thinkingEnabled: thinkingConfig.thinking_enabled,
+        modelId: resolvedModelId
+      })],
       timestamp: now
     }
 

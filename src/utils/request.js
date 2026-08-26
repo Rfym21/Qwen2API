@@ -392,7 +392,9 @@ const sendChatRequest = async (body, options = {}) => {
     }
 
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
-    const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
+    // chat_mode 已由入口（middleware / anthropic builder）通过 resolveChatMode 解析，这里只读取
+    const chatMode = body.chat_mode === 'local' ? 'local' : 'normal'
+    const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType, chatMode)
     if (!chat_id) {
         return {
             status: false,
@@ -400,8 +402,8 @@ const sendChatRequest = async (body, options = {}) => {
             message: '无法创建或续接 Qwen 会话'
         }
     }
-    // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
-    requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
+    // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）；临时聊天为 /c/local
+    requestConfig.headers.referer = `${chatBaseUrl}/c/${chatMode === 'local' ? 'local' : chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
     // 对齐网页双写 chatId/parentId（FE 0.2.81）
     const parentId = options.parentId ?? body.parentId ?? body.parent_id ?? null
@@ -517,9 +519,11 @@ const sendChatRequest = async (body, options = {}) => {
  * @param {string} currentToken
  * @param {string} model
  * @param {Object} [account] - 当前账户对象（用于解析账号级代理）
+ * @param {string} [chatType] - 聊天类型（t2t 等）
+ * @param {string} [chatMode] - 聊天模式：'local'（临时聊天）或 'normal'
  * @returns {Promise<string|null>} 返回生成的chat_id，如果失败则返回null
  */
-const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
+const generateChatID = async (currentToken, model, account, chatType = 't2t', chatMode = 'normal') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const proxyAgent = getProxyAgent(account)
@@ -527,7 +531,7 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
         const requestConfig = {
             headers: {
                 'sec-ch-ua-platform': '"Windows"',
-                'referer': `${chatBaseUrl}/c/new-chat`,
+                'referer': `${chatBaseUrl}/c/${chatMode === 'local' ? 'local' : 'new-chat'}`,
                 'accept-language': 'zh-CN,zh;q=0.9',
                 'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
                 'sec-ch-ua-mobile': '?0',
@@ -557,14 +561,14 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             requestConfig.proxy = false
         }
 
-        // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
+        // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + chat_mode
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
             chatId: '',
             models: [model],
             project_id: '',
             timestamp: Date.now(),
             chat_type: chatType || 't2t',
-            chat_mode: 'normal'
+            chat_mode: chatMode === 'local' ? 'local' : 'normal'
         }, requestConfig)
 
         return response_data.data?.data?.id || null

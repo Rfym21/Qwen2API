@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/start.js",
     "dev": "nodemon src/server.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test --test-force-exit tests/*.test.js"
   },
   "keywords": [],
   "author": "",
