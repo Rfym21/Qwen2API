@@ -553,6 +553,115 @@ const createToolCallLedger = () => {
 };
 
 /**
+ * 文本通道失控信号的告警形态：合成开端被拒（synthetic_rejected），或正文之后的触发器
+ * 没过语义门（after prose: …）。其余 triggered_unrecovered（谈论标签、代码围栏、
+ * Markdown 链接）不是调用，不算失控。
+ */
+const isRejectedTextCallWarning = (warning) =>
+  warning?.type === 'synthetic_rejected' ||
+  (warning?.type === 'triggered_unrecovered' && /^after prose: /.test(String(warning.reason || '')));
+
+/** 一轮里文本通道 tool_use 的上限（config 已钳位 4..256；与 maxAttempts 同样再兜一次底）。 */
+const resolveTextToolCallCap = () => {
+  const config = require('../config/index.js');
+  return Math.min(256, Math.max(4, Number(config.agentTurnMaxToolCalls) || 24));
+};
+
+/**
+ * 文本通道失控守卫（一轮 attempt 一个；流式 / 非流式共用）。
+ *
+ * 生产 2026-09-03..06：模型写完一个叙述的 [TOOL_CALL] 之后继续生成 —— 同一调用重复
+ * 上百次，或幻想整段 agent 会话（单条回复 245/437/531 个背靠背调用，客户端在 bypass
+ * 下全部执行；流长 6-60 分钟）。原生 function_call 批次早有早停（nativeBatchComplete），
+ * 文本通道的调用却从不置 stopRequested。这里是它的镜像：本轮**更早的一次 push**（push =
+ * 一个上游 delta）已经放行 ≥1 个文本通道调用之后，第一个失控信号就截断回合 ——
+ *   (a) duplicate：文本通道同名同参数的第二个调用。只看文本通道自己的登记簿：原生调用
+ *       + 它的文本抄本是跨通道去重，由共享登记簿静默丢弃，不是失控信号；
+ *   (b) rejected：解析器新增硬错误 / 非空 recoveredText / 合成开端被拒 / 正文之后的
+ *       触发器没过语义门；
+ *   (c) prose / think：剥掉 agent 标签后仍有非空白正文，或 think phase 的非空白内容；
+ *   (d) cap：第 N 个已放行的调用（agentTurnMaxToolCalls）—— 该调用照常交付，之后截断。
+ * 武装条件（armed）：本轮**更早的一次 push** 已经放行过 ≥1 个文本通道调用。(a)/(b)/(c)
+ * 只在武装后判定 —— 与完成调用同一 push 里的文本是调用之前的散文，照常交付；背靠背
+ * 调用之间纯空白的 textDelta 永不触发。(d) 不设武装门：第 N 个已放行的调用就是第 N 个，
+ * 与 push 边界无关（一个 delta 里挤着 30 个完整调用同样只交付 N 个）。截断之后守卫不再
+ * 产生规则 —— 同一 push 里剩下的已登记调用仍由调用方发射（cap 除外：调用方在第 N 个
+ * 之后立刻停手）。
+ */
+const createTextChannelRunawayGuard = ({ parser, maxToolCalls, label }) => {
+  const admitTextCall = createToolCallLedger();
+  let admittedInPriorPush = false;
+  let admittedCount = 0;
+  let errorsSeen = 0;
+  let warningsSeen = 0;
+  let cutRule = null;
+
+  /** 正文 push 之后立刻调用（同时推进错误/告警游标）：规则 (b)/(c)，返回规则名或 null。 */
+  const inspectPush = (parsed, strippedText) => {
+    const errors = parser.getErrors().length;
+    const warnings = parser.getWarnings();
+    const rejected = errors > errorsSeen || !!parsed.recoveredText ||
+      warnings.slice(warningsSeen).some(isRejectedTextCallWarning);
+    errorsSeen = errors;
+    warningsSeen = warnings.length;
+    if (cutRule || !admittedInPriorPush) return null;
+    if (rejected) return 'rejected';
+    if (/\S/.test(strippedText)) return 'prose';
+    return null;
+  };
+
+  /**
+   * 每个完成的文本通道调用：先过文本登记簿；首次见到的交给 emit（返回 false = 共享
+   * 登记簿判为跨通道副本，没上线也不计数）。返回规则 (a)/(d) 或 null。
+   */
+  const inspectCall = (call, emit) => {
+    if (!admitTextCall(call)) {
+      logger.warn(
+        `${label} 本轮文本通道重复的工具调用（${call.function.name}，同名同参数），丢弃后到的副本`,
+        'ANTHROPIC'
+      );
+      return cutRule || !admittedInPriorPush ? null : 'duplicate';
+    }
+    const emitted = emit(call);
+    if (emitted) admittedCount += 1;
+    if (cutRule) return null;
+    // cap 不设武装门：第 N 个就是第 N 个，与 push 边界无关。
+    return emitted && admittedCount >= maxToolCalls ? 'cap' : null;
+  };
+
+  /** think phase 的一帧：规则 (c) 的思考形态。 */
+  const inspectThink = (content) =>
+    (!cutRule && admittedInPriorPush && /\S/.test(content || '')) ? 'think' : null;
+
+  /** 一个 push 收尾：此后已放行的调用算"更早的 push"。 */
+  const endPush = () => {
+    if (admittedCount > 0) admittedInPriorPush = true;
+  };
+
+  /** 记录截断规则；每次截断恰好一行告警，点名规则。 */
+  const cut = (rule) => {
+    cutRule = rule;
+    // 分母只对 cap 有意义；其余规则只报数（"31/24" 读起来像 bug）。
+    const tally = rule === 'cap' ? `${admittedCount}/${maxToolCalls}` : `${admittedCount}`;
+    logger.warn(
+      `${label} 文本通道 tool_use 之后出现失控信号 (${rule})，提前终止上游（本轮已放行 ${tally} 个文本通道调用，用量按本地估算）`,
+      'ANTHROPIC'
+    );
+  };
+
+  return {
+    inspectPush,
+    inspectCall,
+    inspectThink,
+    endPush,
+    cut,
+    cutRule: () => cutRule,
+    /** 已武装 = 更早的 push 放行过文本通道调用。 */
+    armed: () => admittedInPriorPush
+  };
+};
+
+/**
  * 原生 function_call 帧的喂入与关闭判定（流式 / 非流式共用）。完成证据读的是**原始**
  * delta：归一化器对 role:function 返回 null（Defect A，tests/agent-protocol.test.js:85-106
  * 钉住），不能从它那里拿。
@@ -764,11 +873,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // malformed_protocol 与 think 晋升守卫的输入），不写任何字节到线上；tool_use
   // 照常放行。由构造只可能在最后一轮为真：名额一次性，任何再拒绝都直接 break。
   let suppressAttemptOutput = false;
-  // 原生晋升（D2）：本轮一旦有**原生**调用晋升，其后的文本/思考增量只做记账、不上线 ——
-  // 结果帧不到、早停（D3）点不起来时的那条保险带。只对原生晋升置位（与非流式的
-  // `promotedNativeCalls.length > 0` 守卫同源）：文本通道调用之后的正文是模型自己的话，
-  // main 一直照常交付，不能一并吞掉。按轮复位（startAttempt），与 suppressAttemptOutput
-  // 互不干扰：那个由抑制重试跨轮持有到最后一轮。
+  // tool_use 之后的输出抑制：其后的文本/思考增量只做记账、不上线。两处置位 ——
+  // 原生晋升（D2，drainPromotedNativeCalls：结果帧不到、早停 D3 点不起来时的保险带），
+  // 以及文本通道的失控截断（cutTextChannelTurn：spec agent-turn-cutoff-text-channel 推翻了
+  // "文本通道调用之后的正文照常交付"的老决定 —— 生产里那段正文就是失控的开头）。
+  // 按轮复位（startAttempt），与 suppressAttemptOutput 互不干扰：那个由抑制重试跨轮持有
+  // 到最后一轮。
   let suppressPostToolUseOutput = false;
   // 本轮跨通道去重登记簿；"已发射 tool_use"由 emitToolUse 自己置位，回合收尾不再重算。
   let admitToolCall = null;
@@ -779,6 +889,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let stopRequested = false;
   const nativePhases = new Map();
   const isClientToolName = createClientToolNamePredicate(allowedToolNames);
+  // 文本通道失控守卫（规则与产生背景见 createTextChannelRunawayGuard）。按轮复位。
+  let textRunaway = null;
+  const maxToolCalls = resolveTextToolCallCap();
   // 抑制重试开跑前，attempt 侧的抢救缓冲先按登记位置剥掉残渣、存进银行：抑制
   // 只对**重试轮**的文本生效，attempt 侧原本要交付的 recovered 文本仍要交付
   // （无闭标记 span 的尾巴可能是真实回答，不能整桶倒掉 —— review loop 1，条目 10）。
@@ -817,6 +930,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     nativeThinkEvidence = false;
     stopRequested = false;
     nativePhases.clear();
+    textRunaway = parser
+      ? createTextChannelRunawayGuard({ parser, maxToolCalls, label: 'Anthropic Agent' })
+      : null;
     // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）——
     // 平台内部工具的丢弃帧不再触发假 intercepted 重试、不再烧协议恢复名额。
     normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
@@ -906,10 +1022,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   /**
-   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃；
-   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：只有原生晋升
-   * 才置位（drainPromotedNativeCalls）。
+   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃 ——
+   * 这不是失控信号（失控的判定在文本通道循环里，见 createTextChannelRunawayGuard）；
+   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：原生晋升
+   * （drainPromotedNativeCalls）与文本通道截断（cutTextChannelTurn）各自置位。
    * @param {Object} call - 工具调用
+   * @returns {boolean} 登记簿裁决：true = 已上线，false = 副本被丢弃
    */
   const emitToolUse = (call) => {
     if (!admitToolCall(call)) {
@@ -917,7 +1035,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         `Anthropic Agent 本轮重复的工具调用（${call.function.name}，跨通道同名同参数），丢弃后到的副本`,
         'ANTHROPIC'
       );
-      return;
+      return false;
     }
     hasEmittedToolCalls = true;
     closeThinkingBlockIfOpen();
@@ -937,6 +1055,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       });
     }
     writeAnthropicEvent(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    return true;
   };
 
   let completionContent = '';
@@ -961,6 +1080,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       suppressPostToolUseOutput = true;
       emitToolUse(call);
     }
+  };
+
+  /**
+   * 文本通道的失控截断（原生早停的镜像）：终止上游、其后一切文本/思考只记账不上线，
+   * 已放行的调用照常以 stop_reason=tool_use 收尾。告警由守卫留下（每次截断恰好一行）。
+   * @param {string} rule - duplicate / rejected / prose / think / cap
+   */
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    suppressPostToolUseOutput = true;
+    textRunaway.cut(rule);
   };
 
   /**
@@ -1015,6 +1145,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     completionContent += content;
 
     if (delta.phase === 'think') {
+      // 文本通道调用之后的思考是失控的开头（规则 c）：截断，这一帧一个字节都不上线。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 武装之后纯空白的思考也不上线（inspectThink 对空白不触发）：放行会在 tool_use
+      // 块之后另开一个空的 thinking 块。
+      if (textRunaway?.armed()) return;
       if (!thinkingStarted) {
         thinkingStarted = true;
         if (webSearchInfo) {
@@ -1032,9 +1171,24 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     } else if (delta.phase === 'answer') {
       if (parser) {
         const parsed = parser.push(content);
-        if (parsed.textDelta) emitTextDelta(agentTagStripper.push(parsed.textDelta));
-        recoveredBuffer += parsed.recoveredText;
-        for (const call of parsed.completedCalls) emitToolUse(call);
+        const text = agentTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：被拒绝的调用 / 非空白正文。触发时这一 push 的正文与抢救文本都不
+        // 上线；同一 push 里已登记完成的调用仍照常发射（下面的循环）。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) {
+          cutTextChannelTurn(pushRule);
+        } else {
+          if (text) emitTextDelta(text);
+          recoveredBuffer += parsed.recoveredText;
+        }
+        // 规则 (a)/(d)：文本通道的重复调用 / 第 N 个调用。到 cap 的那个照常交付，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, emitToolUse);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
       } else {
         emitTextDelta(agentTagStripper.push(content));
       }
@@ -1136,12 +1290,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       throw e;
     }
 
-    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。
+    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。文本通道截断之后例外：
+    // 根本不 flush —— 解析器里压着的只是失控那一 push 的残余（半个触发器 / 半截负载），
+    // flush 会把它定罪成 truncated_tool_call，那是截断自己造成的假错误，不该进日志与
+    // finalToolErrors；抢救文本与迟到的调用同样不交付。
     if (parser) {
-      const tail = parser.flush();
-      if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
-      recoveredBuffer += tail.recoveredText;
-      for (const call of tail.completedCalls) emitToolUse(call);
+      if (!textRunaway.cutRule()) {
+        const tail = parser.flush();
+        if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
+        recoveredBuffer += tail.recoveredText;
+        for (const call of tail.completedCalls) emitToolUse(call);
+      }
       // 收取本轮被定罪的原文（flush 之后登记簿已完整），跨轮累计给交付层剥残渣。
       residueSpans.push(...parser.getResidueSpans());
     }
@@ -1477,6 +1636,55 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       promotedNativeCalls.push(call);
     }
   };
+  // 文本通道失控守卫 —— 流式分支的孪生（规则见 createTextChannelRunawayGuard）。非流式
+  // 没有线可写，回合定案前用一个边收边解析的解析器只做**检测**；截断的轮子以它已放行
+  // 的正文与调用为本轮结果（answerContent 在截断点结束：触发的那一 push 不累计），不再对
+  // 截断的原文整段重解析 —— 跨 push 的半截调用会被判成 truncated_tool_call、触发器按
+  // 正文泄漏、到 cap 的那个调用丢失，与流式分支交付的内容对不上。按轮复位。
+  // 沿袭的不对称（刻意不动）：原生晋升之后 `promotedNativeCalls.length > 0` 在守卫之前
+  // 就 return，此后的 delta 守卫看不见；流式分支则继续喂解析器。
+  const maxToolCalls = resolveTextToolCallCap();
+  let textParser = null;
+  let textTagStripper = null;
+  let textRunaway = null;
+  // 已放行的**原始** textDelta（未剥 agent 标签）：解析器 text 通道的登记落点就是它的
+  // 累计长度，交付层按位置剥残渣要同一坐标系；标签在交付点才剥（与未截断轮同序）。
+  let streamedRawText = '';
+  let streamedCalls = [];
+  // 搜索表前缀（回合定案时才知道）：拼在原文之前，登记落点整体后移。
+  let streamedPrefix = '';
+  const startTextRound = () => {
+    textParser = hasTools ? createToolCallStreamParser({ allowedToolNames, toolSchemas }) : null;
+    textTagStripper = createAgentTagStripper();
+    textRunaway = textParser
+      ? createTextChannelRunawayGuard({ parser: textParser, maxToolCalls, label: 'Anthropic 非流式 Agent' })
+      : null;
+    streamedRawText = '';
+    streamedCalls = [];
+    streamedPrefix = '';
+  };
+  startTextRound();
+  const collectTextCall = (call) => {
+    streamedCalls.push(call);
+    return true;
+  };
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    textRunaway.cut(rule);
+  };
+  /**
+   * 截断轮的结算：流式解析器已放行的原文与调用（形状同 parseToolCallsFromText）。只有
+   * text 通道的登记落在 streamedRawText 的坐标系里（recovered 通道非流式从不交付），
+   * 交付层照旧按位置剥残渣、再剥 agent 标签 —— 截断轮与未截断轮走同一条交付路径。
+   */
+  const settledStreamedRound = () => ({
+    cleanedText: streamedPrefix + streamedRawText,
+    toolCalls: streamedCalls,
+    errors: textParser.getErrors(),
+    residueSpans: textParser.getResidueSpans()
+      .filter(span => span.channel === 'text')
+      .map(span => ({ ...span, at: span.at + streamedPrefix.length }))
+  });
 
   /**
    * 处理一个上游 delta JSON
@@ -1526,9 +1734,35 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     delta.phase = normalized.phase;
     const content = normalized.content;
     if (delta.phase === 'think') {
+      // 与流式分支同一条：文本通道调用之后的思考是失控的开头，截断，这一帧不累计。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 与流式分支同一条：武装之后纯空白的思考不累计。
+      if (textRunaway?.armed()) return;
       thinkingContent += content;
       attemptThinkingContent += content;
     } else if (delta.phase === 'answer') {
+      if (textParser) {
+        const parsed = textParser.push(content);
+        const text = textTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：触发时这一 push 的正文不进结果；同一 push 里已登记完成的调用仍收下。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) cutTextChannelTurn(pushRule);
+        else streamedRawText += parsed.textDelta;
+        // 规则 (a)/(d)：到 cap 的那个照常收下，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, collectTextCall);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
+        // 截断：触发的那一 push 不累计 —— answerContent 在截断点结束。
+        if (textRunaway.cutRule()) return;
+      }
       answerContent += content;
     }
   };
@@ -1553,13 +1787,17 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         thinkingContent = searchTable + '\n\n' + thinkingContent;
       } else {
         answerContent = searchTable + '\n\n' + answerContent;
+        streamedPrefix = searchTable + '\n\n';
       }
     } catch (_) {}
   }
 
-  let parsedTools = hasTools
-    ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
-    : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] };
+  // 文本通道截断的轮子以流式解析器的结果定案；其余照今天整段重解析。
+  let parsedTools = textRunaway?.cutRule()
+    ? settledStreamedRound()
+    : (hasTools
+      ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
+      : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] });
   let cleanedText = stripAgentTags(parsedTools.cleanedText);
   // 回合结束：打开中的原生调用按 round_end 关闭并排出，再 finalize() 单发结算 OpenAI
   // 形状的 tool_calls（原生的已排空，不会出来第二次）。
@@ -1762,6 +2000,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     nativeThinkEvidence = false;
     stopRequested = false;
     nativePhases.clear();
+    // 文本通道守卫、检测解析器与已放行的正文/调用同样按轮全新。
+    startTextRound();
     // normalizeDelta 在本分支是跨 attempt 共享的 —— 这本身是个已知缺陷（流式分支
     // 每轮新建；统一两个循环的计划在 lohari 仓库
     // _bmad-output/implementation-artifacts/spec-qwen2api-unify-agent-loop.md）。
@@ -1779,7 +2019,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       break;
     }
     const retried = answerContent.slice(before.length);
-    const parsedRetry = parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
+    const parsedRetry = textRunaway?.cutRule()
+      ? settledStreamedRound()
+      : parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
     nativeToolCalls = settleNativeCalls();
     toolCalls = mergeToolCalls(nativeToolCalls, parsedRetry.toolCalls);
     cleanedText = stripAgentTags(parsedRetry.cleanedText);

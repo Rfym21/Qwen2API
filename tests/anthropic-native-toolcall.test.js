@@ -504,23 +504,34 @@ describe('native function_call promotion (stream): the capture-foreign incident'
     assert.equal(served.length, firstProseAt + 1, 'parity is only reached after both result frames; the stop waits for them');
   });
 
-  it('F3: the post-tool-use suppression is scoped to NATIVE promotions — prose after a text-channel [TOOL CALL] still reaches the wire', async () => {
-    // main (dc2e8ec) delivered prose + thinking after a text-channel call on the stream path,
-    // and the non-stream twin (`if (promotedNativeCalls.length > 0) return`) gates on native
-    // promotions only. Setting the flag inside emitToolUse for EVERY tool_use silently dropped
-    // both on stream. The flag belongs to drainPromotedNativeCalls.
+  it('F3: prose/thinking after a TEXT-channel [TOOL CALL] is the start of a runaway — cut on the prose frame, nothing after the tool_use reaches the wire', async () => {
+    // main (dc2e8ec) delivered prose + thinking after a text-channel call (only NATIVE
+    // promotions raised the suppression flag). Spec agent-turn-cutoff-text-channel (2026-09-05)
+    // reverses that: prod streams of 6-60 min with 245/437/531 back-to-back narrated calls
+    // started exactly like this. Once a text call was admitted in an EARLIER push, the first
+    // non-whitespace prose (or thinking) cuts the upstream and the turn ends with tool_use.
+    // The native early stop (nativeBatchComplete) is untouched; this is its text-channel mirror.
     const sender = scriptedSender();
-    const res = await runStream(turnOf(
+    const { served, stream } = recordingUpstream([
       answerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"git status"}}[END TOOL CALL]'),
       answerFrame('Here is what I found: all clean.'),
       thinkFrame('more thought'),
-      FINISHED_FRAME
-    ), sender);
+      FINISHED_FRAME,
+      STOP
+    ]);
+    let res;
+    const warns = await captureWarns(async () => {
+      res = await runStream(() => stream, sender);
+    });
 
     assert.equal(sender.calls.length, 0);
     assert.deepEqual(toolUseNames(res.output), ['Bash']);
-    assert.equal(visibleTextOf(res.output), 'Here is what I found: all clean.', 'prose after a TEXT call is not narration echo');
-    assert.equal(thinkingTextOf(res.output), 'more thought', 'thinking after a TEXT call is delivered too');
+    assert.equal(visibleTextOf(res.output), '', 'prose after a TEXT call never reaches the wire');
+    assert.equal(thinkingTextOf(res.output), '', 'nor does thinking after it');
+    assert.equal(served.length, 2, 'the upstream is cut on the prose frame; the think frame is never pulled');
+    const cuts = warns.filter(line => /提前终止上游/.test(line));
+    assert.equal(cuts.length, 1, `exactly one cut line, got:\n${warns.join('\n')}`);
+    assert.match(cuts[0], /prose/, 'the cut line names the rule');
     assert.doesNotMatch(res.output, /"type":"error"/);
     assert.equal(stopReasonOf(res.output), 'tool_use');
   });

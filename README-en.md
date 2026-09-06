@@ -102,6 +102,7 @@ OUTPUT_THINK=true             # Whether to output thinking process (true/false)
 LEGACY_REASONING_IN_CONTENT=false # Reasoning format, false=reasoning_content field, true=legacy <think> inside content (true/false)
 SIMPLE_MODEL_MAP=false        # Simplify model mapping (true/false)
 MODELS_CACHE_TTL=3600         # Model list cache TTL in seconds, 0=never expires
+AGENT_TURN_MAX_TOOL_CALLS=24  # Anthropic path: text-channel tool_use cap per agent turn (4-256), upstream cut after it
 
 # 🌐 Proxy and Reverse Proxy Configuration
 QWEN_CHAT_PROXY_URL=          # Custom Chat API reverse proxy URL (default: https://chat.qwen.ai)
@@ -132,6 +133,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `SIMPLE_MODEL_MAP` | Simplify model mapping, return basic models without variants only | `true` or `false` |
 | `MODEL_MAP` | Incoming model name mapping: `alias=qwen-id,...,*=fallback`. Exact entry wins (trailing `[..]` stripped, case-insensitive), existing Qwen ids pass through, everything else uses `*`; applies to `/v1/chat/completions` and `/v1/messages` only. Also editable at runtime in the dashboard (Settings → Model mapping); a dashboard-saved map overrides this variable, see `.env.example` | `*=qwen3.8-max-thinking` |
 | `MODELS_CACHE_TTL` | Model list cache TTL in seconds; after expiry the next request refreshes it from upstream; `0` = never expires | `3600` |
+| `AGENT_TURN_MAX_TOOL_CALLS` | Anthropic path: cap on text-channel `tool_use` blocks per agent turn (4–256). When the model runs away after a narrated `[TOOL CALL]` (repeats the same call hundreds of times, hallucinates a whole session), the upstream is cut right after the N-th admitted call and the admitted calls are delivered with `stop_reason=tool_use`; once a call was admitted in an earlier delta, a duplicate, a rejected call or prose/thinking also cuts the turn | `24` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Externalize complete Agent tool definitions and history as a Qwen text document when the request body exceeds this size, avoiding the roughly 128 KiB WAF limit | `92160` (90 KiB) |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | Maximum size of the tool protocol and current turn kept in the live request after context externalization | `49152` (48 KiB) |
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
