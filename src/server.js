@@ -5,6 +5,7 @@ const cors = require('cors')
 const Tokens = require('csrf')
 const { logger } = require('./utils/logger')
 const DataPersistence = require('./utils/data-persistence')
+const persistedSettings = require('./utils/persisted-settings')
 const app = express()
 const path = require('path')
 const fs = require('fs')
@@ -111,18 +112,7 @@ const serverInfo = {
 const applyPersistedSettings = async () => {
   try {
     const persisted = await new DataPersistence().loadSettings()
-    if (persisted.chatRetryCount !== undefined && persisted.chatRetryCount !== '') {
-      const v = parseInt(persisted.chatRetryCount, 10)
-      if (!isNaN(v) && v >= 0) config.chatRetryCount = v
-    }
-    if (persisted.chatRetryBackoffMs !== undefined && persisted.chatRetryBackoffMs !== '') {
-      const v = parseInt(persisted.chatRetryBackoffMs, 10)
-      if (!isNaN(v) && v >= 0) config.chatRetryBackoffMs = v
-    }
-    if (persisted.apiKeys?.length > 1) {
-      config.apiKeys = persisted.apiKeys;
-      config.adminKey = persisted.apiKeys[0];
-    }
+    persistedSettings.applyPersistedSettings(config, persisted)
   } catch (err) {
     logger.warn('加载持久化设置失败, 使用 env/默认值', 'CONFIG', '', err.message)
   }

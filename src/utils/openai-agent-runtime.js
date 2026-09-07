@@ -3,15 +3,22 @@ const {
   parseToolCallsFromText,
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
-  containsOrphanProtocolResidue
+  containsOrphanProtocolResidue,
+  ANSWER_PHASES
 } = require('./tool-prompt.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
-const { createUpstreamDeltaNormalizer } = require('./chat-helpers.js')
+const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
 const { assertNoUpstreamFailure } = require('./upstream-error.js')
 const {
   parseAgentControlText,
   createAgentControlStreamParser,
-  buildAgentRetryHint
+  createAgentTagStripper,
+  buildAgentRetryHint,
+  // Guarda de fuga del canal de texto: una sola implementacion, compartida con
+  // anthropic.js (spec agent-turn-cutoff-openai-parity). El `tag` de log es parametro.
+  createToolCallLedger,
+  resolveTextToolCallCap,
+  createTextChannelRunawayGuard
 } = require('./agent-turn.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger.js')
@@ -43,6 +50,60 @@ const imageMarkdownFromDelta = (delta) => {
 }
 
 /**
+ * 原生 function_call 帧的喂入与关闭判定（OpenAI Agent 运行时 / chat.js 旧路径共用；
+ * anthropic.js 有同形的私有副本）。完成证据读的是**原始** delta：归一化器对
+ * role:function 返回 null（Defect A），不能从它那里拿。
+ *
+ * - 有 function_call → pushNativeSnapshot（分类在累积器里：无 function_id 且 answer phase
+ *   才是客户端候选；think phase / 平台调用关闭时记 unknown_tool，走今天的 invalid_tool_call 重试）。
+ * - role:function 且名字是客户端工具（与归一化器同一条谓词）→ closeByName：该调用的
+ *   结果帧。无名帧与平台结果帧惰性。
+ * - answer 帧 status finished / 非空 finish_reason → 回合结束，打开中的按 round_end 关闭。
+ * 每次可能关闭之后都调一次 drain（幂等），关闭即发射。
+ * @param {Object} accumulator - createNativeToolCallAccumulator 实例
+ * @param {Object} delta - 原始上游 delta
+ * @param {*} reportedFinishReason - choice 上报的 finish_reason
+ * @param {{ isClientToolName: (name: unknown) => boolean, drain: () => void }} hooks
+ */
+const feedNativeFrame = (accumulator, delta, reportedFinishReason, { isClientToolName, drain }) => {
+  const rawPhase = delta.phase
+  if (Array.isArray(delta.tool_calls)) {
+    accumulator.push(delta.tool_calls)
+  } else if (delta.function_call) {
+    accumulator.pushNativeSnapshot({
+      name: delta.function_call.name,
+      arguments: delta.function_call.arguments,
+      phase: rawPhase,
+      functionId: delta.function_id
+    })
+    drain()
+  } else if (delta.role === 'function' && isClientToolName(delta.name)) {
+    if (accumulator.closeByName(delta.name)) drain()
+  }
+  const answerFinished = delta.role !== 'function' && ANSWER_PHASES.has(rawPhase) && delta.status === 'finished'
+  if ((reportedFinishReason !== undefined && reportedFinishReason !== null) || answerFinished) {
+    if (accumulator.closeOpen('round_end')) drain()
+  }
+}
+
+/**
+ * 正文恢复帧：归一化后是 answer、内容非空、原始 role ≠ function、原始 phase ∈ ANSWER_PHASES。
+ * 它关闭打开中的调用，也是早停的触发帧（批次已齐时）。
+ */
+const isProseResume = (delta, normalized, rawPhase) =>
+  !!normalized && normalized.phase === 'answer' && !!normalized.content &&
+  delta.role !== 'function' && ANSWER_PHASES.has(rawPhase)
+
+/**
+ * 早停条件：本轮打开过的客户端调用全部被各自的具名结果帧关闭，且至少一个过闸。
+ * 平台调用两侧都不计。达不到就永不早停 —— 保护迟到的第三个并行调用。
+ */
+const nativeBatchComplete = (accumulator) => {
+  const state = accumulator.batchState()
+  return state.opened > 0 && state.opened === state.closedByResult && state.gated >= 1
+}
+
+/**
  * 完整消费一次 Qwen 上游 attempt。裸正文与工具调用始终留在门禁内；调用方可
  * 实时接收安全思考，以及已经进入 final/blocked 包装体的正式正文增量。
  * 每次调用都新建 parser/filter/accumulator，失败 attempt 不会污染下一次。
@@ -53,9 +114,35 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）。
   const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames })
   const acceptUpstreamFrame = createUpstreamResponseFilter()
+  // Schemas de las herramientas declaradas (nombre -> JSON Schema), via
+  // chat-middleware.js#processRequestBody. Sin ellos las puertas de schema del parser
+  // (reparacion de comillas internas, aceptacion de un payload tras prosa) y la del
+  // acumulador nativo fallan cerradas — el estado de este camino antes de esta spec.
+  const toolSchemas = options.tool_schemas || null
+  // La puerta de argumentos de las llamadas NATIVAS tambien vive de los schemas
+  // (anthropic.js se los pasa en sus tres sitios): sin ellos un function_call al que le
+  // falta una clave required se promovia al cliente sin un solo error.
   const nativeTools = hasTools
-    ? createNativeToolCallAccumulator({ allowedToolNames })
+    ? createNativeToolCallAccumulator({ allowedToolNames, toolSchemas })
     : null
+  const isClientToolName = createClientToolNamePredicate(allowedToolNames)
+  // 本轮关闭即晋升的原生调用（takeCompleted 排出）。有了第一个之后，后续正文/思考是平台
+  // "工具不存在"注入的回声，只丢不记；批次齐了就提前终止上游。
+  const promotedNativeCalls = []
+  let stopRequested = false
+  const drainPromotedNativeCalls = () => {
+    for (const call of nativeTools.takeCompleted()) {
+      logger.warn(
+        `OpenAI Agent 原生工具调用晋升为 tool_call：${call.function.name}（answer phase，无 function_id）`,
+        'AGENT'
+      )
+      promotedNativeCalls.push(call)
+    }
+  }
+  // El canal de PENSAMIENTO no recibe schemas — paridad exacta con anthropic.js (:1201 y
+  // :1721 pasan solo allowedToolNames). Con ellos, un [TOOL CALL] reparable por comillas o
+  // aceptable tras prosa que solo aparece en think phase se rescataria y se promoveria a
+  // llamada ejecutable aqui pero no en Anthropic. El salvage se queda en answer phase.
   const reasoningStreamParser = typeof options.on_reasoning_delta === 'function'
     ? createToolCallStreamParser({ allowedToolNames })
     : null
@@ -63,8 +150,62 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     ? createAgentControlStreamParser()
     : null
   const controlToolStreamParser = controlStreamParser
-    ? createToolCallStreamParser({ allowedToolNames })
+    ? createToolCallStreamParser({ allowedToolNames, toolSchemas })
     : null
+  // Guarda de fuga del canal de texto — gemela de la rama NO-stream de anthropic.js.
+  // Este runtime bufferiza el turno entero hasta EOF, asi que no hay nada "ya emitido" que
+  // recoger: se parsea en vivo SOLO para detectar, y la ronda cortada se liquida con lo que
+  // el parser de deteccion habia admitido antes del corte. Se crean sin depender de los
+  // callbacks (a diferencia de los parsers de arriba), asi que no-stream y
+  // LEGACY_REASONING_IN_CONTENT=true quedan cubiertos igual.
+  const detectionParser = hasTools
+    ? createToolCallStreamParser({ allowedToolNames, toolSchemas })
+    : null
+  const detectionTagStripper = createAgentTagStripper()
+  const maxTextToolCalls = resolveTextToolCallCap()
+  const textRunaway = detectionParser
+    ? createTextChannelRunawayGuard({
+      parser: detectionParser,
+      maxToolCalls: maxTextToolCalls,
+      label: 'OpenAI Agent',
+      tag: 'AGENT'
+    })
+    : null
+  // textDelta crudo admitido (SIN quitar tags de agente): es el cleanedText de la ronda
+  // cortada y parseAgentControlText necesita los tags intactos para clasificarla. El
+  // stripper de arriba solo alimenta el test de prosa de la regla (c).
+  let streamedRawText = ''
+  const streamedCalls = []
+  const collectTextCall = (call) => {
+    streamedCalls.push(call)
+    return true
+  }
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true
+    textRunaway.cut(rule)
+  }
+  /**
+   * Liquidacion de la ronda cortada, con la forma que devuelve parseToolCallsFromText.
+   * No se re-parsea `answer` entero: una llamada partida entre pushes saldria como
+   * truncated_tool_call, el trigger se filtraria como prosa y la llamada que toco el cap
+   * se perderia — nada de eso coincide con lo que la ronda realmente admitio.
+   * Hueco asumido: el markdown de imagenes entra en `answer` sin pasar por este parser, asi
+   * que una ronda cortada no lo incluye (imagenes y herramientas no coexisten en t2t).
+   */
+  const settledTextRound = () => ({
+    cleanedText: streamedRawText,
+    toolCalls: streamedCalls,
+    // Una ronda cortada NO superficializa errores del parser — ni los del push disparador ni
+    // los de pushes anteriores. evaluateOpenAIAgentAttempt mira `toolErrors.length > 0` ANTES
+    // que `toolCalls.length > 0`: cualquier error superviviente reintentaria la ronda y
+    // volveria a lanzar la fuga que el corte acaba de detener, hasta agotar intentos y morir
+    // en 502. Es la paridad con anthropic.js, donde decideRetryReason corta en seco con
+    // `if (emittedCalls) return null` (:1080) / `if (toolCalls.length > 0) return null`
+    // (:1749) antes de mirar los errores: una ronda cortada con llamadas admitidas SIEMPRE
+    // se entrega.
+    errors: [],
+    residueSpans: detectionParser.getResidueSpans().filter(span => span.channel === 'text')
+  })
   let streamedVisibleText = ''
   // Texto rescatado de un <tool_call> que no parseó. No se emite aquí: el turn gate
   // todavía puede rechazar esta ronda, y emitirlo ahora lo duplicaría en cada intento
@@ -169,14 +310,12 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     }
 
     const delta = choice.delta || {}
-    if (nativeTools && Array.isArray(delta.tool_calls)) {
-      nativeTools.push(delta.tool_calls)
-    } else if (nativeTools && delta.function_call) {
-      nativeTools.push([{
-        index: 0,
-        type: 'function',
-        function: delta.function_call
-      }])
+    const rawPhase = delta.phase
+    if (nativeTools) {
+      feedNativeFrame(nativeTools, delta, reportedFinishReason, {
+        isClientToolName,
+        drain: drainPromotedNativeCalls
+      })
     }
 
     if (delta.name === 'web_search') {
@@ -198,7 +337,33 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     }
 
     if (!normalized) return
+    if (nativeTools && isProseResume(delta, normalized, rawPhase)) {
+      // 正文恢复关闭打开中的调用（过闸的随即晋升）。
+      if (nativeTools.closeOpen('boundary')) drainPromotedNativeCalls()
+    }
+    // 批次已齐 —— 每个客户端调用都被自己的结果帧关闭且至少一个过闸 —— 之后模型产出的
+    // 第一帧内容（思考**或**正文）就是"工具不存在"叙述的开头：提前终止上游，内容丢弃。
+    // 与 anthropic.js 同一条：不能只等正文 —— 生产里（2026-09-01 18:05）模型被拦截后先又
+    // 思考了 54s 才开口。批次不齐则永不早停，照旧消费到底（迟到的并行调用以 function_call
+    // 帧到达，没有内容，不会触发这里）。
+    if (nativeTools && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeTools)) {
+      stopRequested = true
+      logger.warn('OpenAI Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'AGENT')
+      return
+    }
+    // 晋升之后的叙述（"工具不可用"）不进 answer/reasoning —— 调用前的正文已经在 answer 里了。
+    if (promotedNativeCalls.length > 0) return
     if (normalized.phase === 'think') {
+      // Regla (c) en forma "think": pensar despues de una llamada del canal de texto es el
+      // arranque de la fuga. Se corta y este frame no entra ni en reasoning ni al cliente.
+      const thinkRule = textRunaway?.inspectThink(normalized.content)
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule)
+        return
+      }
+      // Ya armado: el think en blanco tampoco entra (inspectThink no dispara con blancos).
+      if (textRunaway?.armed()) return
       reasoning += normalized.content
       if (reasoningStreamParser) {
         const streamed = reasoningStreamParser.push(normalized.content)
@@ -214,25 +379,69 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       pendingImages.forEach(item => emittedImages.add(item))
       pendingImages.length = 0
     }
+    if (textRunaway) {
+      const parsed = detectionParser.push(normalized.content)
+      const stripped = detectionTagStripper.push(parsed.textDelta)
+      // Reglas (b)/(c): al disparar, el texto de ESTE push no se admite; las llamadas ya
+      // completadas en el mismo push si se recogen (bucle de abajo).
+      const pushRule = textRunaway.inspectPush(parsed, stripped)
+      if (pushRule) cutTextChannelTurn(pushRule)
+      else streamedRawText += parsed.textDelta
+      // Reglas (a)/(d): la llamada que toca el cap se entrega igual, y ahi se para.
+      for (const call of parsed.completedCalls) {
+        // El tope durante el drenaje del push que disparo el corte lo aplica la guarda
+        // compartida (agent-turn.js#inspectCall), una sola vez para los tres llamadores.
+        const callRule = textRunaway.inspectCall(call, collectTextCall)
+        if (!callRule) continue
+        cutTextChannelTurn(callRule)
+        if (callRule === 'cap') break
+      }
+      textRunaway.endPush()
+      // Cortado: el push disparador no llega a `answer`, ni al controlStreamParser, ni al
+      // cliente. `stopRequested` destruye el upstream en el siguiente frame (sse.js).
+      if (textRunaway.cutRule()) return
+    }
     await appendAnswer(normalized.content)
-  })
+  }, { shouldStop: () => stopRequested })
 
-  if (reasoningStreamParser) {
+  const textChannelCut = !!textRunaway?.cutRule()
+  // Tras un corte no se hace flush de ningun parser de texto: lo que queda en el buffer es
+  // el resto del push descontrolado (medio trigger / medio payload) y el flush lo condenaria
+  // como truncated_tool_call -> toolErrors>0 -> reintento (evaluate :461), anulando el corte.
+  if (reasoningStreamParser && !textChannelCut) {
     const streamed = reasoningStreamParser.flush()
     await emitReasoningDelta(streamed.textDelta)
     recoveredReasoning += streamed.recoveredText
   }
-  if (controlStreamParser) {
+  // El mismo guarda para la cadena control -> controlTool -> cliente. Hoy es defensa en
+  // profundidad, no un camino vivo: el controlStreamParser solo emite dentro de un cuerpo
+  // <agent_final>, y una ronda cortada que arrastre ese envoltorio la rechaza la puerta
+  // (invalid_control) antes de entregar nada. Se queda porque la regla es "tras un corte no
+  // se hace flush de NINGUN parser de texto" y el dia que la puerta se relaje esto ya esta bien.
+  if (controlStreamParser && !textChannelCut) {
     await consumeControlStreamResult(controlStreamParser.flush())
   }
 
-  const textTools = hasTools
-    ? parseToolCallsFromText(answer, { allowedToolNames })
-    : { cleanedText: answer, toolCalls: [], errors: [] }
+  // La ronda cortada se liquida con el parser de deteccion; las demas siguen re-parseando
+  // `answer` entero como hasta ahora.
+  const textTools = textChannelCut
+    ? settledTextRound()
+    : (hasTools
+      ? parseToolCallsFromText(answer, { allowedToolNames, toolSchemas })
+      : { cleanedText: answer, toolCalls: [], errors: [] })
+  // Sin schemas, igual que el parser de streaming del canal de pensamiento (paridad con
+  // anthropic.js:1721): el rescate por schema no promueve llamadas desde el think phase.
   const reasoningTools = hasTools && textTools.toolCalls.length === 0 && !textTools.cleanedText.trim()
     ? parseToolCallsFromText(reasoning, { allowedToolNames })
     : { cleanedText: reasoning, toolCalls: [], errors: [] }
-  const nativeToolCalls = nativeTools?.hasAny() ? nativeTools.finalize() : []
+  // 回合结束：打开中的原生调用按 round_end 关闭并排出，再 finalize() 单发结算 OpenAI
+  // 形状的 tool_calls（原生的已排空，不会出来第二次）。
+  let nativeToolCalls = []
+  if (nativeTools) {
+    nativeTools.closeOpen('round_end')
+    drainPromotedNativeCalls()
+    nativeToolCalls = [...promotedNativeCalls, ...nativeTools.finalize()]
+  }
   // 部分 thinking 模型会把“整个可执行工具块”放进 think phase 后直接 EOF。
   // 仅当 thinking 除独立工具块外没有任何文字时才接纳，避免把推理中的示例或
   // 尚未决定执行的调用当成真实动作。
@@ -241,14 +450,38 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     reasoningTools.errors.length === 0
     ? reasoningTools.toolCalls
     : []
-  const toolCalls = nativeToolCalls.length > 0
-    ? nativeToolCalls
-    : (textTools.toolCalls.length > 0 ? textTools.toolCalls : standaloneReasoningCalls)
-  const toolErrors = [
+  // 原生优先（本运行时改动前的语义：`nativeToolCalls.length > 0 ? nativeToolCalls : 文本`）：
+  // 有一个过闸的原生调用，本轮文本通道的调用整体丢弃 —— 两个通道合并会让一条写坏/顺手写的
+  // 文本 [TOOL CALL] 与结构化的原生调用一起执行。这里整轮都在缓冲，丢得掉（anthropic.js
+  // 的文本调用是内联发射的，收不回来）。登记簿仍管其余的同名同参数副本，再统一编号。
+  const textChannelCalls = textTools.toolCalls.length > 0 ? textTools.toolCalls : standaloneReasoningCalls
+  if (nativeToolCalls.length > 0 && textChannelCalls.length > 0) {
+    logger.warn(
+      `OpenAI Agent 本轮原生工具调用优先，丢弃文本通道的 ${textChannelCalls.length} 个调用（${textChannelCalls.map(call => call.function.name).join(', ')}）`,
+      'AGENT'
+    )
+  }
+  const admitToolCall = createToolCallLedger()
+  const toolCalls = [
+    ...nativeToolCalls,
+    ...(nativeToolCalls.length > 0 ? [] : textChannelCalls)
+  ]
+    .filter(call => {
+      if (admitToolCall(call)) return true
+      logger.warn(`OpenAI Agent 本轮重复的工具调用（${call.function.name}，跨通道同名同参数），丢弃后到的副本`, 'AGENT')
+      return false
+    })
+    .map((call, index) => ({ ...call, index }))
+  // 文本来源与原生来源分开记：原生接纳时，文本来源的错误意味着 visibleText 里混着写坏的
+  // [TOOL CALL]（evaluate 据此把正文置空）；原生来源的（平台调用的 unknown_tool 之类）不算。
+  const textToolErrors = [
     ...(textTools.errors || []),
     ...(textTools.toolCalls.length === 0 && !textTools.cleanedText.trim()
       ? (reasoningTools.errors || [])
-      : []),
+      : [])
+  ]
+  const toolErrors = [
+    ...textToolErrors,
     ...(nativeTools?.getErrors?.() || [])
   ]
   const control = parseAgentControlText(textTools.cleanedText)
@@ -270,6 +503,10 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     streamedControlState: controlStreamParser?.getState?.() || null,
     toolCalls,
     toolErrors,
+    textToolErrors,
+    // 本轮过闸晋升的 Qwen 原生 function_call（已并入 toolCalls）。门禁凭它在 toolErrors
+    // 否决与"正文不得与工具并存"之前接纳本轮。
+    nativeToolCalls: promotedNativeCalls,
     // 平台拦截的现场证据：Defect A 丢弃的 role:function 帧的名字（去重、有上限）。
     // 门禁靠它识别"原生调用被平台吃掉、只剩叙述"的死亡回合。
     interceptedToolNames: normalizeDelta.interceptedToolNames,
@@ -279,6 +516,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     upstreamCompleted: streamResult.completed,
     upstreamEventCount: streamResult.eventCount,
     sawDone: streamResult.sawDone,
+    // La guarda de fuga destruyó el upstream a medias. La puerta lo usa para entregar la
+    // ronda sin pasar por las reglas de reintento, y el reintento (si alguna vez lo hubiera)
+    // para no volver a un chat_id cuya generación abortada sigue viva en Qwen.
+    textChannelCut,
+    upstreamStopped: streamResult.stopped === true,
     metadata: {
       ...metadata,
       responseId: metadata?.responseId || acceptedResponseId || null
@@ -297,13 +539,37 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
     const normalized = finishReason === 'max_tokens' ? 'length' : finishReason
     return { accepted: true, finishReason: normalized, retryReason: null }
   }
+  // 过闸的原生调用是结构化帧，比文本启发式更强的证据：有一个就接纳本轮 —— 排在
+  // toolErrors 否决与"正文不得与工具并存"之前，不翻 agentTurnAllowProseWithTools。
+  // 调用前的干净正文随 visibleText 交付；调用后的叙述在采集时就已丢弃。但被跳过的两道
+  // 否决恰恰说明 visibleText 里可能混着写坏的文本 [TOOL CALL]（文本来源的解析错误 /
+  // 孤儿协议残渣）：这种正文不交付 —— suppressVisibleText 让交付层把 content 置空，
+  // tool_calls 照常。
+  if ((attempt.nativeToolCalls?.length || 0) > 0) {
+    const suppressVisibleText = (attempt.textToolErrors?.length || 0) > 0 ||
+      containsOrphanProtocolResidue(attempt.visibleText)
+    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
+  }
+  // Ronda cortada por la guarda de fuga con llamadas admitidas: SIEMPRE se entrega (paridad
+  // con anthropic.js decideRetryReason :1080/:1749 y la promesa de settledTextRound). Va ANTES
+  // del veto por toolErrors y de "prosa no coexiste con tools": rechazarla reintenta la fuga
+  // recién detenida y, peor, el reintento cae en el mismo chat_id cuya generación abortada
+  // sigue viva en Qwen → CHAT_IN_PROGRESS → 502 (incidente qwen-next 2026-09-06 20:29, gate
+  // estricto: narración previa a la llamada + corte por duplicado). La prosa previa al corte
+  // viaja sólo si la config la permite; con gate estricto se suprime en vez de rechazar.
+  if (attempt.textChannelCut === true && attempt.toolCalls.length > 0) {
+    const suppressVisibleText = (attempt.toolErrors?.length || 0) > 0 ||
+      containsOrphanProtocolResidue(attempt.visibleText) ||
+      (!config.agentTurnAllowProseWithTools && !!attempt.visibleText.trim())
+    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
+  }
   if (attempt.toolErrors.length > 0) {
-    return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
+    return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'tool_errors' }
   }
   if (attempt.toolCalls.length > 0) {
     if (!config.agentTurnAllowProseWithTools &&
         (attempt.controlKind !== 'empty' || attempt.visibleText.trim())) {
-      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
+      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'prose_with_tools' }
     }
     return { accepted: true, finishReason: 'tool_calls', retryReason: null }
   }
@@ -457,11 +723,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
           kind: attempt.streamedControlKind
         })
       }
+      if (evaluation.suppressVisibleText) {
+        logger.warn('OpenAI Agent 原生接纳的回合正文带文本工具错误/协议残渣，content 置空只交付 tool_calls', 'AGENT')
+      }
       return {
         ok: true,
         attempt,
         finishReason: evaluation.finishReason,
-        attempts: attemptNumber
+        attempts: attemptNumber,
+        // 原生接纳但正文被文本 [TOOL CALL] 残渣污染：交付层不转发 visibleText。
+        suppressVisibleText: evaluation.suppressVisibleText === true
       }
     }
 
@@ -470,8 +741,11 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     const dropSuffix = (attempt.interceptedToolNames?.length || 0) > 0
       ? `; dropped: ${attempt.interceptedToolNames.join(', ')}`
       : ''
+    // `detail` distingue en producción los dos invalid_tool_call (toolErrors vs prosa+tools):
+    // sin él, el incidente 2026-09-06 fue indistinguible por logs.
+    const detailSuffix = evaluation.detail ? `:${evaluation.detail}` : ''
     logger.warn(
-      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${dropSuffix})`,
+      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${detailSuffix}${dropSuffix})`,
       'AGENT'
     )
     if (attempt.streamedVisibleText) {
@@ -500,9 +774,14 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       retryHint = `${retryHint}\n${buildAgentRetryHint('intercepted')}`
     }
     const retryBody = appendRetryHint(retryBaseBody, retryHint)
+    // Tras un corte el upstream de esta ronda se destruyó a medias: en Qwen esa generación
+    // sigue "in progress" unos segundos y un POST al mismo chat_id responde CHAT_IN_PROGRESS
+    // (visto 2026-09-06 20:29 en qwen-next). Defensa en profundidad — hoy toda ronda cortada
+    // con llamadas se acepta arriba y no llega aquí —: el reintento abre chat nuevo.
+    const chatBusy = attempt.textChannelCut === true || attempt.upstreamStopped === true
     const retryResponse = await requestSender(retryBody, {
-      chatId: upstreamContext.chatId || null,
-      parentId: upstreamContext.responseId || null,
+      chatId: chatBusy ? null : (upstreamContext.chatId || null),
+      parentId: chatBusy ? null : (upstreamContext.responseId || null),
       currentAccount: options.currentAccount || null,
       agentRetry: true
     })
@@ -539,5 +818,7 @@ module.exports = {
   collectOpenAIAgentAttempt,
   evaluateOpenAIAgentAttempt,
   appendRetryHint,
-  runOpenAIAgentTurn
+  runOpenAIAgentTurn,
+  // chat.js 旧路径共用的原生帧喂入
+  feedNativeFrame
 }

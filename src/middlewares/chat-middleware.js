@@ -3,6 +3,7 @@ const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
+const { mapIncomingModel } = require('../utils/model-map.js')
 
 const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
   Array.isArray(tools) &&
@@ -54,6 +55,9 @@ const processRequestBody = async (req, res, next) => {
       tools,                // 工具列表（OpenAI function calling）
       tool_choice           // 工具调用控制
     } = req.body
+
+    // 先做 MODEL_MAP 映射，再判定 thinking / chat_type：目标 id 的 -thinking 后缀要照常生效
+    model = await mapIncomingModel(model)
 
     const now = Math.floor(Date.now() / 1000)
     const fid = generateUUID()
@@ -123,9 +127,42 @@ const processRequestBody = async (req, res, next) => {
       req.allowed_tool_names = tools
         .map(tool => tool?.function?.name)
         .filter(name => typeof name === 'string' && name.length > 0)
+      // Fuente de las puertas de schema del parser (reparacion de comillas internas y
+      // aceptacion tras prosa): nombre de herramienta -> JSON Schema. Gemelo de
+      // anthropic.js#buildInternalRequest — sin esto ambas puertas fallan cerradas en
+      // /v1/chat/completions y una llamada narrada valida se pierde.
+      // Object.create(null): los nombres vienen del cliente, `__proto__` jamas toca la
+      // cadena de prototipos. Nombre duplicado = fail closed (se borra la entrada, el
+      // nombre sigue en la whitelist): dos declaraciones no tienen un schema unico y
+      // last-wins invalidaria silenciosamente la primera.
+      const toolSchemas = Object.create(null)
+      const seenToolNames = new Set()
+      for (const tool of tools) {
+        const name = tool?.function?.name
+        if (typeof name !== 'string' || name.length === 0) continue
+        // Nombre repetido = fail closed: dos declaraciones no tienen un schema unico y
+        // last-wins invalidaria en silencio a la primera. Se comprueba sobre los nombres
+        // VISTOS, no sobre las entradas: si la primera declaracion se salto por schema
+        // inservible, la segunda tampoco puede reclamar el nombre.
+        if (seenToolNames.has(name)) {
+          delete toolSchemas[name]
+          continue
+        }
+        seenToolNames.add(name)
+        const parameters = tool.function.parameters
+        // Un schema ausente o que no es un objeto no vale como schema. Sin entrada, la puerta
+        // semantica (hasOwnProperty en tool-prompt.js#gateAfterProsePayload) falla cerrada —
+        // el comportamiento previo a esta spec. Con entrada basura pasaria a leer `required`
+        // de undefined, es decir "ninguno", y admitiria un payload pelado tras prosa con
+        // argumentos arbitrarios sin validar.
+        if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) continue
+        toolSchemas[name] = parameters
+      }
+      req.tool_schemas = toolSchemas
     } else {
       req.has_tools = false
       req.allowed_tool_names = []
+      req.tool_schemas = null
     }
 
     // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）

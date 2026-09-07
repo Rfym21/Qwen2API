@@ -1,23 +1,11 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
-const { normalizeAllowedToolNames } = require('./tool-prompt.js')
+const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
 const { uploadFileToQwenOss } = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
-
-const MODEL_SUFFIXES = [
-    '-thinking-search',
-    '-image-edit',
-    '-deep-research',
-    '-thinking',
-    '-search',
-    '-video',
-    '-image'
-]
-
-// ponytail: no hardcoded claude→qwen mapping. Users set model in Claude Code config directly.
-// Non-claude names pass through to upstream via existing parserModel lookup.
+const { MODEL_SUFFIXES } = require('./model-suffixes.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -506,7 +494,7 @@ const processOriginalLogic = async (messages, thinking_config, chat_type, imgCac
  * @returns {boolean}
  */
 const isThinkPhase = (phase) => phase === 'think' || phase === 'thinking' || phase === 'thinking_summary'
-const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
+// ANSWER_PHASES 从 tool-prompt.js 引入：原生工具调用累积器用同一集合判定客户端候选。
 
 /**
  * 创建上游 delta 归一化器：将 thinking_summary 的 extra.summary_thought 增量转为 phase=think 的 content
@@ -521,6 +509,21 @@ const ANSWER_PHASES = new Set(['answer', 'final', 'final_answer', 'response'])
  * @returns {(delta: object) => ({ phase: string, content: string }|null)}
  */
 const INTERCEPTED_NAMES_CAP = 20
+
+/**
+ * 客户端工具名谓词。归一化器的拦截证据与原生累积器的结果帧认领（anthropic.js
+ * closeByName）共用这一条，两处永远不会对"这是不是客户端的工具"得出不同答案。
+ * 未传集合 → 一律为真（签名向后兼容）；传了集合 → 带真实名字且名字在集合里。
+ * @param {Iterable<string>|Set<string>|null|undefined} clientToolNames
+ * @returns {(name: unknown) => boolean}
+ */
+const createClientToolNamePredicate = (clientToolNames) => {
+    const names = normalizeAllowedToolNames(clientToolNames)
+    return (name) => names
+        ? typeof name === 'string' && name.length > 0 && names.has(name)
+        : true
+}
+
 const createUpstreamDeltaNormalizer = (options = {}) => {
     // clientToolNames：客户端本次请求声明的工具名集合。传入后，只有**带真实名字**
     // 且名字在集合里的 role:function 丢弃帧才计入 interceptedToolNames —— 平台自己
@@ -530,7 +533,7 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
     // "unknown" 的工具，占位符不能替无名帧冒充它。不传则照旧全记：签名向后兼容。
     // 日志不过滤 —— 每一次丢弃都要留痕。
     // normalizeAllowedToolNames（tool-prompt.js）做同一件事；两处保持同一语义。
-    const clientToolNames = normalizeAllowedToolNames(options.clientToolNames)
+    const isClientToolName = createClientToolNamePredicate(options.clientToolNames)
     let summaryThoughtCount = 0
     const normalize = (delta) => {
         if (!delta) return null
@@ -544,9 +547,7 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
             const droppedName = typeof delta.name === 'string' && delta.name.length > 0
                 ? delta.name
                 : null
-            const countsAsEvidence = clientToolNames
-                ? droppedName !== null && clientToolNames.has(droppedName)
-                : true
+            const countsAsEvidence = isClientToolName(droppedName)
             const interceptedName = droppedName || 'unknown'
             if (countsAsEvidence &&
                 normalize.interceptedToolNames.length < INTERCEPTED_NAMES_CAP &&
@@ -603,5 +604,6 @@ module.exports = {
     parserMessages,
     formatHistoryMessages,
     isThinkPhase,
+    createClientToolNamePredicate,
     createUpstreamDeltaNormalizer
 }

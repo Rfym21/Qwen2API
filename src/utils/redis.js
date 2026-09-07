@@ -479,15 +479,27 @@ const deleteAccount = async (key) => {
 
 const SETTINGS_KEY = 'qwen2api:settings'
 
+// 整份设置存在 hash 的 json 字段里；缺失或损坏时按空对象处理（读失败会抛给调用方）
+const readSettingsJson = async (client) => {
+  const json = await client.hget(SETTINGS_KEY, 'json')
+  if (typeof json !== 'string' || !json) return {}
+  try {
+    const parsed = JSON.parse(json)
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {}
+  } catch {
+    logger.warn('运行时设置 JSON 损坏，按空对象处理', 'REDIS')
+    return {}
+  }
+}
+
 /**
- * 获取运行时设置
- * @returns {Promise<Object>} 设置对象 (字段类型为 string，调用方需自行 parseInt)
+ * 获取运行时设置（整份 JSON 反序列化后的原样值）
+ * @returns {Promise<Object>} 设置对象；未存过、损坏或读取失败时为 {}
  */
 const getSettings = async () => {
   try {
     const client = await ensureConnection()
-    const data = await client.hgetall(SETTINGS_KEY)
-    return JSON.parse(data.json)
+    return await readSettingsJson(client)
   } catch (err) {
     logger.error('获取运行时设置失败', 'REDIS', '', err)
     return {}
@@ -495,15 +507,18 @@ const getSettings = async () => {
 }
 
 /**
- * 保存运行时设置（通过 hset 部分合并）
+ * 保存运行时设置：先读出当前整份设置，把 partial 合并进去再整体写回。
+ * 之前是直接用 partial 覆盖整个 json，会把其他键（chatRetryCount 等）丢掉。
+ * 读取失败时直接返回 false，不会用 partial 覆盖已有设置。
  * @param {Object} partial - 字段
  * @returns {Promise<boolean>} 设置是否成功
  */
 const setSettings = async (partial) => {
   try {
     const client = await ensureConnection()
+    const current = await readSettingsJson(client)
     const stringified = {
-      json: JSON.stringify(partial)
+      json: JSON.stringify({ ...current, ...partial })
     }
     await client.hset(SETTINGS_KEY, stringified)
     return true

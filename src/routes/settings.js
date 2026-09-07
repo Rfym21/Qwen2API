@@ -4,13 +4,31 @@ const config = require('../config')
 const DataPersistence = require('../utils/data-persistence')
 const { adminKeyVerify } = require('../middlewares/authorization')
 const { logger } = require('../utils/logger')
+const { NAME_MAX_LENGTH, buildModelMap, parseModelMap, getUnmappedModels, forgetUnmapped } = require('../utils/model-map')
+const { getLatestModels } = require('../models/models-map')
 
 const dataPersistence = new DataPersistence()
 
+// 可作为映射目标的聊天模型 id：每个 t2t 模型的 id，支持 thinking 的再加一个 -thinking 变体。
+// 不受 simpleModelMap 影响：dashboard 的下拉框要能选到 -thinking。
+const listChatTargets = (models) => {
+  const targets = []
+  for (const model of (Array.isArray(models) ? models : [])) {
+    const id = String(model?.id || '')
+    if (!id || !model?.info?.meta?.chat_type?.includes('t2t')) continue
+    targets.push(id)
+    if (model?.info?.meta?.abilities?.thinking) targets.push(`${id}-thinking`)
+  }
+  return targets
+}
+
+const isUnknownTargetError = (item) =>
+  (item.field === 'target' || item.field === 'fallback') && String(item.message).includes('is not an upstream model')
 
 router.get('/settings', adminKeyVerify, async (req, res) => {
   // 分离管理员密钥和普通密钥
   const regularKeys = config.apiKeys.filter(key => key !== config.adminKey)
+  const upstreamModels = await getLatestModels().catch(() => [])
 
   res.json({
     apiKey: config.apiKey, // 保持向后兼容
@@ -26,7 +44,13 @@ router.get('/settings', adminKeyVerify, async (req, res) => {
     searchInfoMode: config.searchInfoMode,
     simpleModelMap: config.simpleModelMap,
     chatRetryCount: config.chatRetryCount,
-    chatRetryBackoffMs: config.chatRetryBackoffMs
+    chatRetryBackoffMs: config.chatRetryBackoffMs,
+    // 模型映射：当前生效原文、env 种子（用于标记每行来源）、可选目标、落到回退目标的入站名（本进程）
+    modelMap: config.modelMap,
+    modelMapEnv: process.env.MODEL_MAP || '',
+    modelMapTargets: listChatTargets(upstreamModels),
+    unmappedModels: getUnmappedModels(),
+    dataSaveMode: config.dataSaveMode
   })
 })
 
@@ -225,6 +249,76 @@ router.post('/setRetryConfig', adminKeyVerify, async (req, res) => {
     })
   } catch (error) {
     logger.error('更新聊天 retry 配置失败', 'CONFIG', '', error)
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// 更新模型映射：{ entries: [{ alias, target }], fallback } 或 { reset: true }
+// 每个 target 都对照上游模型列表校验；任一错误 → 400，什么都不改。
+// mapIncomingModel 每次重新解析 config.modelMap，所以改字符串即刻生效，无需重启。
+router.post('/setModelMap', adminKeyVerify, async (req, res) => {
+  try {
+    const { entries, fallback, reset } = req.body || {}
+
+    // 恢复 env：清掉 dashboard 保存的映射（存 null → applyPersistedSettings 视为未设置）
+    if (reset === true) {
+      config.modelMap = process.env.MODEL_MAP || ''
+      const persisted = await dataPersistence.saveSettings({ modelMap: null })
+      logger.info(`模型映射已恢复为 env (持久化: ${persisted ? '是' : '否'})`, 'CONFIG', '⚙️')
+      return res.json({
+        status: true,
+        reset: true,
+        message: '模型映射已恢复为 env',
+        persisted,
+        modelMap: config.modelMap,
+        dataSaveMode: config.dataSaveMode
+      })
+    }
+
+    // 没有 entries 数组的请求体（{}、[]、非 JSON）不能被当成"清空映射"
+    if (!Array.isArray(entries)) {
+      return res.status(400).json({
+        error: '无效的模型映射',
+        errors: [{ index: null, field: 'entries', value: '', message: 'entries must be an array' }]
+      })
+    }
+
+    let upstreamModels = await getLatestModels()
+    let result = buildModelMap(entries, fallback, upstreamModels)
+    // 目标不在列表里：模型列表缓存可能已过期（最长一小时），强制刷新一次再判
+    if (result.errors.some(isUnknownTargetError)) {
+      upstreamModels = await getLatestModels(true)
+      result = buildModelMap(entries, fallback, upstreamModels)
+    }
+    const { raw, errors } = result
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: '无效的模型映射', errors })
+    }
+
+    config.modelMap = raw
+
+    // 'none' 模式下 saveSettings 返回 false：只在内存里生效，env 仍是重启后的基线
+    const persisted = await dataPersistence.saveSettings({ modelMap: raw })
+
+    // 已经分配了映射的名字不再是"待分配"
+    forgetUnmapped(Object.keys(parseModelMap(raw)).filter(alias => alias !== '*'))
+
+    logger.info(
+      `模型映射更新: "${raw.slice(0, NAME_MAX_LENGTH)}" (持久化: ${persisted ? '是' : '否'})`,
+      'CONFIG',
+      '⚙️'
+    )
+
+    res.json({
+      status: true,
+      message: '模型映射更新成功',
+      persisted,
+      modelMap: raw,
+      dataSaveMode: config.dataSaveMode
+    })
+  } catch (error) {
+    logger.error('更新模型映射失败', 'CONFIG', '', error)
     res.status(500).json({ error: error.message })
   }
 })

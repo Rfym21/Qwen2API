@@ -41,6 +41,9 @@ services:
       # 简化模型映射 (true: 只返回基础模型, false: 返回完整模型列表)
       # Simplified model mapping (true: base models only, false: full list)
       - SIMPLE_MODEL_MAP=false
+      # 入站模型名映射 (alias=qwen-id,...,*=fallback)，详见 .env.example
+      # Incoming model name mapping (alias=qwen-id,...,*=fallback), see .env.example
+      # - MODEL_MAP=*=qwen3.8-max-thinking
       # redis 连接地址(必填)
       # Redis URL (required; use rediss:// for TLS)
       - REDIS_URL=redis://redis:6379

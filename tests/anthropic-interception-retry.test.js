@@ -123,6 +123,13 @@ const LEAK_MCP_CONTEXT7 = [
   '[END TOOL CALL]'
 ].join('\n');
 
+// Leak SIN closer: payload pelado al inicio de la respuesta. Es RESIDUO (forma de leak,
+// isLeakedToolPayloadShape) pero no protocolo demostrable → sigue disparando
+// malformed_protocol. Desde el spec narrated-toolcall (2026-09-02) los leaks CON closer y
+// nombre no declarado son errores DUROS (unknown_tool → retry tool_error), asi que los
+// tests que pinean la defensa malformed_protocol usan esta forma.
+const LEAK_PAYLOAD_NO_CLOSER = '{"name": "Bash", "arguments": {"command": "find . -type f 2>/dev/null"}}';
+
 const scriptedSender = (...turns) => {
   const queue = [...turns];
   const fn = async (body) => {
@@ -382,9 +389,9 @@ describe('documented limitation: the after-prose allowance is shared (finding 8)
 });
 
 describe('malformed bracket protocol (finding 10)', () => {
-  it('payload + closer with no opener: retry carries the malformed hint and recovers', async () => {
+  it('payload with no opener and no closer: retry carries the malformed hint and recovers', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+    const res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_NO_CLOSER)), sender);
 
     assert.equal(sender.calls.length, 1);
     const hint = JSON.stringify(sender.calls[0]);
@@ -395,13 +402,30 @@ describe('malformed bracket protocol (finding 10)', () => {
     assert.doesNotMatch(res.output, /"type":"error"/);
   });
 
-  it('a complete valid JSON payload with doubled closers also fires (leak sample #2)', async () => {
+  it('payload + closer with no opener and an UNDECLARED name is provable protocol (spec narrated-toolcall): tool_error retry names the allowed tools and recovers', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
+    const res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+
+    assert.equal(sender.calls.length, 1);
+    const hint = JSON.stringify(sender.calls[0]);
+    assert.match(hint, /invalid, truncated, or unknown tool call/, 'the reason is tool_error, not malformed_protocol');
+    assert.match(hint, /Bash do not exist/, 'the hint names the bad tool');
+    assert.match(hint, /Use ONLY these exact tool names: read_file/);
+    assert.ok(hint.includes('[TOOL CALL]'), 'must teach the canonical opener');
+    assert.doesNotMatch(hint, /<tool_call/i);
+    assert.deepEqual(toolUseNames(res.output), ['read_file']);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.doesNotMatch(res.output, /find \. -type f/, 'the condemned payload never reaches the wire');
+  });
+
+  it('a complete valid JSON payload with doubled closers and an undeclared name is a tool_error too (leak sample #2)', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
     const res = await runStream(turnOf(answerFrame(LEAK_VALID_JSON_DOUBLE_CLOSER)), sender);
 
     assert.equal(sender.calls.length, 1);
-    assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
+    assert.match(JSON.stringify(sender.calls[0]), /AskUserQuestion do not exist/);
     assert.deepEqual(toolUseNames(res.output), ['read_file']);
+    assert.doesNotMatch(res.output, /"type":"error"/);
   });
 
   it('an orphan closer alone in prose fires the defense', async () => {
@@ -426,7 +450,7 @@ describe('malformed bracket protocol (finding 10)', () => {
     // prosa nunca se activa). attempt 2: leak malformado. Solo el tope COMPARTIDO
     // puede parar aqui; con topes separados habria un segundo retry.
     const sender = scriptedSender(
-      turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)),
+      turnOf(answerFrame(LEAK_PAYLOAD_NO_CLOSER)),
       turnOf(answerFrame(BRACKET_CALL))
     );
     const res = await runStream(turnOf(interceptionFrame('read_file')), sender);
@@ -435,9 +459,9 @@ describe('malformed bracket protocol (finding 10)', () => {
     assert.match(res.output, /"type":"message_stop"/);
   });
 
-  it('non-stream: the leak shape retries once and recovers tool_use', async () => {
+  it('non-stream: the leak shape (no closer) retries once and recovers tool_use', async () => {
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
-    const res = await runNonStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+    const res = await runNonStream(turnOf(answerFrame(LEAK_PAYLOAD_NO_CLOSER)), sender);
 
     assert.equal(sender.calls.length, 1);
     assert.match(JSON.stringify(sender.calls[0]), /was NOT executed/);
@@ -554,7 +578,7 @@ describe('platform-internal drops are not interception evidence (clientToolNames
     const sender = scriptedSender(turnOf(answerFrame('Listo: no hay nada que ejecutar.')));
     let res;
     const warns = await captureWarns(async () => {
-      res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_CLOSER)), sender);
+      res = await runStream(turnOf(answerFrame(LEAK_PAYLOAD_NO_CLOSER)), sender);
     });
 
     assert.equal(sender.calls.length, 1, 'attempt 1 debe reintentar por malformed_protocol');
@@ -572,7 +596,7 @@ describe('platform-internal drops are not interception evidence (clientToolNames
     // El slot queda libre: un leak malformado en el retry posterior AUN puede usarlo.
     const sender = scriptedSender(turnOf(answerFrame(BRACKET_CALL)));
     const res = await runNonStream(
-      turnOf(interceptionFrame('web_search'), answerFrame(LEAK_PAYLOAD_CLOSER)),
+      turnOf(interceptionFrame('web_search'), answerFrame(LEAK_PAYLOAD_NO_CLOSER)),
       sender
     );
 

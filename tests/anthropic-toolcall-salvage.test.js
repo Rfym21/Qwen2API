@@ -99,7 +99,7 @@ describe('incident-3 salvage: first-content span, name outside the JSON, broken 
   });
 });
 
-describe('position gate: salvage honors emittedProse exactly like canonical calls (decision A)', () => {
+describe('position gate on SALVAGE (decision A) survives the semantic gate: truncated spans after prose stay condemned', () => {
   const AFTER_PROSE = `Voy a listar los archivos del directorio.\n${INCIDENT3_SPAN}\n`;
 
   it('whole-text: a malformed span after prose is NOT salvaged; the span strips from delivery, prose survives', () => {
@@ -124,13 +124,20 @@ describe('position gate: salvage honors emittedProse exactly like canonical call
     assert.equal(spans[0]?.channel, 'recovered');
   });
 
-  it('canonical call after prose behaves exactly as today: suppressed, prose delivered (regression pin)', () => {
+  it('canonical call after prose passes the SEMANTIC gate (spec narrated-toolcall, inverted pin): call emitted, prose delivered', () => {
+    // Antes (decision A, position gate) se suprimia. Ahora la posicion no es la puerta:
+    // whitelist + required lo son. El span MALFORMADO tras prosa (dos casos arriba) sigue
+    // condenado — el salvage truncado conserva la puerta de posicion.
     const text = `Some prose first.\n${GOOD_CALL}`;
     const result = parseToolCallsFromText(text, { allowedToolNames: ALLOWED, toolSchemas: SCHEMAS });
-    assert.equal(result.toolCalls.length, 0, 'not-first-content suppression is untouched');
+    assert.equal(result.toolCalls.length, 1, 'schema validity is the arbiter, not position');
+    assert.equal(result.toolCalls[0].function.name, 'read_file');
     assert.equal(result.errors.length, 0);
     assert.equal(result.cleanedText, 'Some prose first.');
-    assert.ok(result.warnings.some(w => w.reason === 'not the first content of the answer'));
+    assert.ok(!result.warnings.some(w => w.reason === 'not the first content of the answer'));
+    const { calls, visible } = streamAll(text, { allowedToolNames: ALLOWED, toolSchemas: SCHEMAS });
+    assert.equal(calls.length, 1, 'streaming diverges');
+    assert.equal(visible.trim(), 'Some prose first.');
   });
 });
 
@@ -653,10 +660,23 @@ describe('loop B: emptiness judged on debris-stripped text (502 discipline)', ()
     assert.match(res.output, /invalid_tool_call_error/, 'a residue-only turn is not an answer');
   });
 
-  it('a REJECTED synthetic payload is never 502-voided — it may BE the answer', async () => {
-    // Payload balanceado con nombre no declarado (releaseRejectedSpan): por doctrina
-    // puede ser la respuesta; no entra al registro y no puede vaciar el turno a 502.
-    const REJECTED_TURN = '{"name":"nope","arguments":{}}\n[END TOOL CALL]';
+  it('a first-content payload + closer with an unknown name is provable protocol: recovered channel, tool_error retries, never visible', async () => {
+    // Spec narrated-toolcall (defecto 2): antes era un rechazo blando visible (y su
+    // emittedProse envenenaba el resto del lote). Ahora sigue la disciplina de GARBAGE_CALL.
+    const HARD_TURN = '{"name":"nope","arguments":{}}\n[END TOOL CALL]';
+    const sender = scriptedSender(turnOf(answerFrame(HARD_TURN)), turnOf(answerFrame(HARD_TURN)));
+    const res = await runStream(turnOf(answerFrame(HARD_TURN)), sender);
+
+    assert.equal(sender.calls.length, 2, 'tool_error retries run to the cap');
+    assert.match(JSON.stringify(sender.calls[0]), /nope do not exist/, 'the tool_error hint names the bad tool');
+    assert.match(res.output, /invalid_tool_call_error/);
+    assert.equal(visibleTextOf(res.output), '', 'the condemned span never reaches the wire as text');
+  });
+
+  it('a soft-REJECTED synthetic payload (no closer) is never 502-voided — it may BE the answer', async () => {
+    // Payload balanceado SIN closer (releaseRejectedSpan): por doctrina puede ser la
+    // respuesta; no entra al registro y no puede vaciar el turno a 502.
+    const REJECTED_TURN = '{"name":"nope","arguments":{}}';
     const sender = scriptedSender(turnOf(answerFrame(REJECTED_TURN)));
     let res;
     const warns = await captureWarns(async () => {
@@ -667,6 +687,21 @@ describe('loop B: emptiness judged on debris-stripped text (502 discipline)', ()
     assert.match(res.output, /"stop_reason":"end_turn"/);
     assert.match(visibleTextOf(res.output), /"name":"nope"/, 'the payload is delivered as the answer');
     assert.ok(warns.some(l => /required 未兑现/.test(l)));
+  });
+
+  it('P9 (loop 2): multi-line, closer-less, anchor-less first-content payload cut by finish_reason=length → residue-only 502, body lines never delivered as prose', async () => {
+    // Sin ancla (ni closer, ni trigger, ni candidato) nada de lo que sigue puede ser una
+    // llamada: el residuo cubre HASTA EL FINAL, no solo la primera linea. Antes del loop 2
+    // las lineas del cuerpo salian como bloque de texto con 200.
+    const LENGTH_STOP = 'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n';
+    const cutByLength = (...frames) => () => Readable.from([...frames, LENGTH_STOP]);
+    const MULTI = '{"name":"Bash","arguments":{"command":"echo hi\nline two\nline three';
+    const sender = scriptedSender(cutByLength(answerFrame(MULTI)), cutByLength(answerFrame(MULTI)));
+    const res = await runNonStream(cutByLength(answerFrame(MULTI)), sender);
+
+    assert.equal(res.statusCode, 502, 'a residue-only turn has no deliverable content');
+    assert.equal(res.body?.error?.type, 'invalid_tool_call_error');
+    assert.doesNotMatch(JSON.stringify(res.body), /line two/, 'the body lines are residue, not an answer');
   });
 
   it('residue-only turn (recovered channel), retries exhausted → 502 as today, nothing visible', async () => {

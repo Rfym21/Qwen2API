@@ -13,9 +13,9 @@ const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
-const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
+const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('../utils/chat-helpers.js')
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js')
-const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
+const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
 
 const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
     if (hasToolCalls) return 'tool_calls'
@@ -242,9 +242,13 @@ const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     return usage
 }
 
-const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch) => {
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false } = {}) => {
     let reasoning = String(attempt?.reasoning || '')
-    let content = attempt?.toolCalls?.length > 0 ? '' : String(attempt?.visibleText || '')
+    // 工具调用旁的正文照常交付（OpenAI 允许 content 与 tool_calls 并存）：严格门禁下文本
+    // 通道的调用到这里 visibleText 必为空白；原生晋升的回合带着调用前的正文过来 —— 除非
+    // 门禁判定那段正文混着写坏的文本 [TOOL CALL]（suppressVisibleText），那就一个字节不发。
+    const visibleText = suppressVisibleText ? '' : String(attempt?.visibleText || '')
+    let content = attempt?.toolCalls?.length > 0 && !visibleText.trim() ? '' : visibleText
 
     if (attempt?.webSearchInfo) {
         const table = await accountManager.generateMarkdownTable(attempt.webSearchInfo, config.searchInfoMode)
@@ -341,8 +345,8 @@ const handleOpenAIAgentStream = async (
         return
     }
 
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
     let bufferedReasoning = output.reasoning
     const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
     const rawAcceptedReasoning = String(attempt.reasoning || '')
@@ -448,8 +452,8 @@ const handleOpenAIAgentNonStream = async (
     }
 
     setResponseHeaders(res, false)
-    const { attempt, finishReason } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch)
+    const { attempt, finishReason, suppressVisibleText } = runtime
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
     const assistantMessage = {
         role: 'assistant',
         content: output.content || (attempt.toolCalls.length > 0 ? null : '')
@@ -500,10 +504,14 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
         const allowedToolNames = options.allowed_tool_names || []
-        const toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
+        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
+        let toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
         let nativeToolAccumulator = hasTools
             ? createNativeToolCallAccumulator({ allowedToolNames })
             : null
+        // 调用方持有唯一的单调 index：文本解析器与原生累积器各自从 0 计数，直接透传会让
+        // 两路都写 tool_calls[0]。
+        let nextToolCallIndex = 0
         let upstreamFinishReason = null
         let upstreamCompleted = false
         let upstreamEventCount = 0
@@ -597,6 +605,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             const ARG_CHUNK_SIZE = 32
 
             for (const call of calls) {
+                const index = nextToolCallIndex++
                 const headerDelta = {
                     "id": `chatcmpl-${message_id}`,
                     "object": "chat.completion.chunk",
@@ -607,7 +616,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                             "delta": {
                                 "tool_calls": [
                                     {
-                                        "index": call.index,
+                                        "index": index,
                                         "id": call.id,
                                         "type": "function",
                                         "function": {
@@ -636,7 +645,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                                 "delta": {
                                     "tool_calls": [
                                         {
-                                            "index": call.index,
+                                            "index": index,
                                             "function": { "arguments": piece }
                                         }
                                     ]
@@ -678,14 +687,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             }
 
             const delta = choice.delta || {}
-            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-                nativeToolAccumulator.push(delta.tool_calls)
-            } else if (nativeToolAccumulator && delta.function_call) {
-                nativeToolAccumulator.push([{
-                    index: 0,
-                    type: 'function',
-                    function: delta.function_call
-                }])
+            if (nativeToolAccumulator) {
+                // 关闭即判定；发射仍在回合尾部 finalize()（旧路径没有中途排放，drain 为空操作）。
+                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
             }
 
             if (delta && delta.name === 'web_search') {
@@ -839,6 +843,12 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             try {
                 const retryResp = await requestSender(retryBody)
                 if (retryResp.status && retryResp.response) {
+                    // 与非流式分支同一条：重试是新的回合，解析器与累积器都重建，第一轮的残片
+                    // 不能漂进第二轮（其余消费者本来就按 attempt 重建）。
+                    if (hasTools) {
+                        toolParser = createToolCallStreamParser({ allowedToolNames })
+                        nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
+                    }
                     upstreamFinishReason = null
                     await pipeUpstream(retryResp.response)
                 }
@@ -1003,6 +1013,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         const requestSender = options.sendChatRequest || sendChatRequest
         const toolChoice = options.tool_choice
         const allowedToolNames = options.allowed_tool_names || []
+        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
         let nativeToolAccumulator = hasTools
             ? createNativeToolCallAccumulator({ allowedToolNames })
             : null
@@ -1057,10 +1068,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 upstreamFinishReason = reportedFinishReason
             }
             const delta = choice.delta || {}
-            if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-                nativeToolAccumulator.push(delta.tool_calls)
-            } else if (nativeToolAccumulator && delta.function_call) {
-                nativeToolAccumulator.push([{ index: 0, type: 'function', function: delta.function_call }])
+            if (nativeToolAccumulator) {
+                // 关闭即判定；结算在回合尾部 finalize()（drain 为空操作）。
+                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
             }
 
             if (delta.name === 'web_search') {
@@ -1341,6 +1351,9 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
@@ -1354,6 +1367,9 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {

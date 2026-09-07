@@ -2,7 +2,10 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js');
+const {
+  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase,
+  createUpstreamDeltaNormalizer, createClientToolNamePredicate
+} = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
   foldToolMessages,
@@ -12,11 +15,23 @@ const {
   looksLikeUnexecutedToolAction,
   containsOrphanProtocolResidue,
   stripToolCallResidue,
+  ANSWER_PHASES,
   TOOL_CALL_OPEN,
   TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js');
-const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint, buildAgentTurnDirective } = require('../utils/agent-turn.js');
+const {
+  createAgentTagStripper,
+  stripAgentTags,
+  buildAgentRetryHint,
+  buildAgentTurnDirective,
+  // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
+  // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
+  createToolCallLedger,
+  resolveTextToolCallCap,
+  createTextChannelRunawayGuard
+} = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
+const { mapIncomingModel } = require('../utils/model-map.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
 const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
@@ -219,7 +234,9 @@ const flattenAnthropicMessages = (messages) => {
  * @returns {Promise<{body: Object, hasTools: boolean, toolChoice: any, allowedToolNames: string[], enable_thinking: boolean, model: string}>} 转换结果
  */
 const buildInternalRequest = async (anthropicReq) => {
-  const { model, messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
+  const { messages, system, tools, tool_choice, stream, thinking } = anthropicReq;
+  // 先做 MODEL_MAP 映射，再判定 thinking / chat_type：目标 id 的 -thinking 后缀要照常生效
+  const model = await mapIncomingModel(anthropicReq.model);
 
   const normalizedTools = normalizeAnthropicTools(tools);
   const internalToolChoice = normalizeAnthropicToolChoice(tool_choice);
@@ -456,8 +473,12 @@ const describeToolErrors = (errors) => {
   const parts = [];
   if (unknown.length) parts.push(`unknown_tool: ${unknown.join(', ')}`);
   // salvage_rejected 单列：抢救闸门的拒绝正是 salvage-3 瞄准的类，诊断时
-  // 不能和真正的坏 JSON 混在一堆（review loop 1，条目 11）。
-  for (const type of ['invalid_json', 'truncated_tool_call', 'salvage_rejected']) {
+  // 不能和真正的坏 JSON 混在一堆（review loop 1，条目 11）。后四种来自原生累积器
+  // （createNativeToolCallAccumulator）——以前它们没被计入，日志只打 unspecified。
+  for (const type of [
+    'invalid_json', 'truncated_tool_call', 'salvage_rejected',
+    'invalid_arguments', 'missing_tool_name', 'truncated_native_call', 'schema_mismatch'
+  ]) {
     const count = errors.filter(e => e?.type === type).length;
     if (count) parts.push(`${type} ×${count}`);
   }
@@ -466,7 +487,8 @@ const describeToolErrors = (errors) => {
 
 /**
  * 工具错误的重试提示。基础文本复用 agent-turn.js 的通用提示；当错误是编造的工具名时，
- * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。
+ * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。原生调用的参数不合法
+ * （invalid_arguments / schema_mismatch）时，点名该工具：模型要重发的是参数，不是名字。
  * @param {Array<Object>} errors - 本轮的工具错误
  * @param {Array<string>} allowedToolNames - 本次请求真正提供的工具名
  * @returns {string} 提示文本
@@ -476,28 +498,100 @@ const buildToolErrorRetryHint = (errors, allowedToolNames) => {
   const unknown = [...new Set(
     errors.filter(e => e?.type === 'unknown_tool').map(e => e.name).filter(Boolean)
   )];
-  if (!unknown.length || !allowedToolNames?.length) return base;
-  return [
-    base,
-    `The tool name(s) ${unknown.join(', ')} do not exist.`,
-    `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
-  ].join('\n');
+  const badArguments = [...new Set(
+    errors.filter(e => e?.type === 'invalid_arguments' || e?.type === 'schema_mismatch').map(e => e.name).filter(Boolean)
+  )];
+  const lines = [base];
+  if (unknown.length && allowedToolNames?.length) {
+    lines.push(
+      `The tool name(s) ${unknown.join(', ')} do not exist.`,
+      `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
+    );
+  }
+  if (badArguments.length) {
+    lines.push(`Your arguments for tool ${badArguments.join(', ')} were not a valid JSON object or missed required keys. Re-emit the call with a complete JSON object that matches the tool's input schema.`);
+  }
+  return lines.join('\n');
 };
 
 /**
  * 异步迭代上游 axios 流，按 SSE 段切分回调内部 delta JSON
  * @param {object} upstream - axios stream 响应
  * @param {(json: Object) => Promise<void>|void} onDelta - 单个 delta 回调
+ * @param {{ shouldStop?: () => boolean }} [options] - 透传给 consumeSSEStream（提前终止谓词）
  * @returns {Promise<void>} 完成 Promise
  */
-const consumeUpstream = async (upstream, onDelta) => consumeSSEStream(upstream, async (frame) => {
+const consumeUpstream = async (upstream, onDelta, options) => consumeSSEStream(upstream, async (frame) => {
   const payload = frame.data;
   if (!payload || payload.trim() === '[DONE]') return;
   if (!isJson(payload)) return;
   const parsed = JSON.parse(payload);
   assertNoUpstreamFailure(parsed);
   await onDelta(parsed);
-});
+}, options);
+
+/**
+ * 原生 function_call 帧的喂入与关闭判定（流式 / 非流式共用）。完成证据读的是**原始**
+ * delta：归一化器对 role:function 返回 null（Defect A，tests/agent-protocol.test.js:85-106
+ * 钉住），不能从它那里拿。
+ *
+ * - 有 function_call：think phase 且无 function_id → 只记排放证据（onThinkEvidence），
+ *   不喂累积器 —— 交给 thought_tool_call 重试，绝不晋升；其余 pushNativeSnapshot
+ *   （分类在累积器里：无 function_id 且 answer phase 才是客户端候选）。
+ * - role:function 且名字是客户端工具（与归一化器同一条谓词）→ closeByName：该调用的
+ *   结果帧。无名帧与平台结果帧（code_interpreter 之类）惰性。
+ * - answer 帧 status finished / 非空 finish_reason → 回合结束，打开中的按 round_end 关闭。
+ * 每次可能关闭之后都排空一次 takeCompleted()（幂等），关闭即发射。
+ * @param {Object} accumulator - createNativeToolCallAccumulator 实例
+ * @param {Object} delta - 原始上游 delta
+ * @param {*} reportedFinishReason - choice 上报的 finish_reason
+ * @param {{ isClientToolName: (name: unknown) => boolean, onThinkEvidence: () => void, drain: () => void, phases: Map<string, string> }} hooks
+ */
+const feedNativeFrame = (accumulator, delta, reportedFinishReason, { isClientToolName, onThinkEvidence, drain, phases }) => {
+  const rawPhase = delta.phase;
+  if (Array.isArray(delta.tool_calls)) {
+    accumulator.push(delta.tool_calls);
+  } else if (delta.function_call) {
+    if (!delta.function_id && isThinkPhase(rawPhase)) {
+      onThinkEvidence();
+    } else {
+      if (typeof delta.function_call.name === 'string' && delta.function_call.name) {
+        phases.set(delta.function_call.name, rawPhase);
+      }
+      accumulator.pushNativeSnapshot({
+        name: delta.function_call.name,
+        arguments: delta.function_call.arguments,
+        phase: rawPhase,
+        functionId: delta.function_id
+      });
+      drain();
+    }
+  } else if (delta.role === 'function' && isClientToolName(delta.name)) {
+    if (accumulator.closeByName(delta.name)) drain();
+  }
+  const answerFinished = delta.role !== 'function' && ANSWER_PHASES.has(rawPhase) && delta.status === 'finished';
+  if ((reportedFinishReason !== undefined && reportedFinishReason !== null) || answerFinished) {
+    if (accumulator.closeOpen('round_end')) drain();
+  }
+};
+
+/**
+ * 正文恢复帧：归一化后是 answer、内容非空、原始 role ≠ function、原始 phase ∈ ANSWER_PHASES。
+ * 它关闭打开中的调用，也是早停的触发帧（批次已齐时）。
+ */
+const isProseResume = (delta, normalized, rawPhase) =>
+  !!normalized && normalized.phase === 'answer' && !!normalized.content &&
+  delta.role !== 'function' && ANSWER_PHASES.has(rawPhase);
+
+/**
+ * 早停条件（D3）：本轮打开过的客户端调用全部被各自的具名结果帧关闭，且至少一个过闸。
+ * 平台调用两侧都不计（batchState 只数客户端调用）。达不到就永不早停 —— 严格无回归，
+ * 保护迟到的第三个并行调用。
+ */
+const nativeBatchComplete = (accumulator) => {
+  const state = accumulator.batchState();
+  return state.opened > 0 && state.opened === state.closedByResult && state.gated >= 1;
+};
 
 /**
  * 把工具调用的 arguments JSON 字符串切成 input_json_delta 切片
@@ -648,6 +742,25 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // malformed_protocol 与 think 晋升守卫的输入），不写任何字节到线上；tool_use
   // 照常放行。由构造只可能在最后一轮为真：名额一次性，任何再拒绝都直接 break。
   let suppressAttemptOutput = false;
+  // tool_use 之后的输出抑制：其后的文本/思考增量只做记账、不上线。两处置位 ——
+  // 原生晋升（D2，drainPromotedNativeCalls：结果帧不到、早停 D3 点不起来时的保险带），
+  // 以及文本通道的失控截断（cutTextChannelTurn：spec agent-turn-cutoff-text-channel 推翻了
+  // "文本通道调用之后的正文照常交付"的老决定 —— 生产里那段正文就是失控的开头）。
+  // 按轮复位（startAttempt），与 suppressAttemptOutput 互不干扰：那个由抑制重试跨轮持有
+  // 到最后一轮。
+  let suppressPostToolUseOutput = false;
+  // 本轮跨通道去重登记簿；"已发射 tool_use"由 emitToolUse 自己置位，回合收尾不再重算。
+  let admitToolCall = null;
+  let hasEmittedToolCalls = false;
+  // think phase 里的原生帧只是排放证据（thought_tool_call），永不晋升；早停谓词的状态；
+  // 原生帧的 phase 按名字留档给晋升日志。三者按轮复位。
+  let nativeThinkEvidence = false;
+  let stopRequested = false;
+  const nativePhases = new Map();
+  const isClientToolName = createClientToolNamePredicate(allowedToolNames);
+  // 文本通道失控守卫（规则与产生背景见 createTextChannelRunawayGuard）。按轮复位。
+  let textRunaway = null;
+  const maxToolCalls = resolveTextToolCallCap();
   // 抑制重试开跑前，attempt 侧的抢救缓冲先按登记位置剥掉残渣、存进银行：抑制
   // 只对**重试轮**的文本生效，attempt 侧原本要交付的 recovered 文本仍要交付
   // （无闭标记 span 的尾巴可能是真实回答，不能整桶倒掉 —— review loop 1，条目 10）。
@@ -671,7 +784,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   const startAttempt = () => {
     parser = hasTools ? createToolCallStreamParser({ allowedToolNames, toolSchemas }) : null;
     nativeToolAccumulator = hasTools
-      ? createNativeToolCallAccumulator({ allowedToolNames })
+      ? createNativeToolCallAccumulator({ allowedToolNames, toolSchemas })
       : null;
     // buildToolSystemPrompt 让模型把最终答复包进 <agent_final>...</agent_final>，
     // 但本控制器没有 Agent 回合门禁去解包，标签会原样发给客户端。剥掉它们。
@@ -680,6 +793,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     attemptVisibleText = '';
     attemptThinkText = '';
     attemptThinkEvidence = false;
+    suppressPostToolUseOutput = false;
+    admitToolCall = createToolCallLedger();
+    hasEmittedToolCalls = false;
+    nativeThinkEvidence = false;
+    stopRequested = false;
+    nativePhases.clear();
+    textRunaway = parser
+      ? createTextChannelRunawayGuard({ parser, maxToolCalls, label: 'Anthropic Agent', tag: 'ANTHROPIC' })
+      : null;
     // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）——
     // 平台内部工具的丢弃帧不再触发假 intercepted 重试、不再烧协议恢复名额。
     normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
@@ -720,8 +842,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   const emitThinkingDelta = (thinking) => {
     if (!thinking) return;
     // 文本抑制重试：思考增量一个字节都不上线（attemptThinkText 在 onUpstreamDelta
-    // 已经记账，think 晋升与 thought_tool_call 证据不受影响）。
-    if (suppressAttemptOutput) return;
+    // 已经记账，think 晋升与 thought_tool_call 证据不受影响）。tool_use 上线之后同理。
+    if (suppressAttemptOutput || suppressPostToolUseOutput) return;
     if (!thinkingBlockOpen) {
       closeTextBlockIfOpen();
       blockIndex += 1;
@@ -749,7 +871,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // attemptVisibleText 是**检测输入**（malformed_protocol / missing_tool / think
     // 晋升守卫），被抑制的重试轮也要如实累计；visibleText 只映照真正写上线的字节。
     if (countsAsVisible) attemptVisibleText += text;
-    if (suppressAttemptOutput) return;
+    if (suppressAttemptOutput || suppressPostToolUseOutput) return;
     if (countsAsVisible) visibleText += text;
     if (!textBlockOpen) {
       closeThinkingBlockIfOpen();
@@ -769,10 +891,22 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   /**
-   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）
+   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃 ——
+   * 这不是失控信号（失控的判定在文本通道循环里，见 createTextChannelRunawayGuard）；
+   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：原生晋升
+   * （drainPromotedNativeCalls）与文本通道截断（cutTextChannelTurn）各自置位。
    * @param {Object} call - 工具调用
+   * @returns {boolean} 登记簿裁决：true = 已上线，false = 副本被丢弃
    */
   const emitToolUse = (call) => {
+    if (!admitToolCall(call)) {
+      logger.warn(
+        `Anthropic Agent 本轮重复的工具调用（${call.function.name}，跨通道同名同参数），丢弃后到的副本`,
+        'ANTHROPIC'
+      );
+      return false;
+    }
+    hasEmittedToolCalls = true;
     closeThinkingBlockIfOpen();
     closeTextBlockIfOpen();
     blockIndex += 1;
@@ -790,11 +924,43 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       });
     }
     writeAnthropicEvent(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    return true;
   };
 
   let completionContent = '';
   let webSearchInfo = null;
   let thinkingStarted = false;
+
+  /**
+   * 关闭即发射：排出累积器里已关闭、过闸、尚未发射的原生调用。幂等，每次可能关闭之后
+   * 都调一次。每个晋升留一行来源日志（名字、phase、无 function_id —— 绝不打参数）。
+   * 原生晋升之后本轮的文本/思考只记账不上线（平台"工具不存在"注入的回声）—— 在这里
+   * 置位而不是 emitToolUse：文本通道的调用之后的正文照常交付。副本被登记簿丢弃时也
+   * 置位：那份调用已经在线上（与非流式 promotedNativeCalls 的守卫一致）。
+   */
+  const drainPromotedNativeCalls = () => {
+    for (const call of nativeToolAccumulator.takeCompleted()) {
+      logger.warn(
+        `Anthropic Agent 原生工具调用晋升为 tool_use：${call.function.name}（phase ${nativePhases.get(call.function.name) || 'answer'}，无 function_id）`,
+        'ANTHROPIC'
+      );
+      // 早停的回合收不到上游尾部的 usage 帧，本地估算要吃到参数 JSON 才不至于 ~0。
+      completionContent += call.function.arguments;
+      suppressPostToolUseOutput = true;
+      emitToolUse(call);
+    }
+  };
+
+  /**
+   * 文本通道的失控截断（原生早停的镜像）：终止上游、其后一切文本/思考只记账不上线，
+   * 已放行的调用照常以 stop_reason=tool_use 收尾。告警由守卫留下（每次截断恰好一行）。
+   * @param {string} rule - duplicate / rejected / prose / think / cap
+   */
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    suppressPostToolUseOutput = true;
+    textRunaway.cut(rule);
+  };
 
   /**
    * 处理一个上游 delta JSON
@@ -814,21 +980,49 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       upstreamFinishReason = reportedFinishReason;
     }
     const delta = choice.delta || {};
-    if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-      nativeToolAccumulator.push(delta.tool_calls);
-    } else if (nativeToolAccumulator && delta.function_call) {
-      nativeToolAccumulator.push([{ index: 0, type: 'function', function: delta.function_call }]);
+    const rawPhase = delta.phase;
+    if (nativeToolAccumulator) {
+      feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, {
+        isClientToolName,
+        onThinkEvidence: () => { nativeThinkEvidence = true; },
+        drain: drainPromotedNativeCalls,
+        phases: nativePhases
+      });
     }
     if (delta && delta.name === 'web_search') {
       webSearchInfo = delta.extra?.web_search_info;
     }
     const normalized = normalizeDelta(delta);
     if (!normalized) return;
+    if (nativeToolAccumulator && isProseResume(delta, normalized, rawPhase)) {
+      // 正文恢复关闭打开中的调用（过闸的随即发射）。
+      if (nativeToolAccumulator.closeOpen('boundary')) drainPromotedNativeCalls();
+    }
+    // 批次已齐 —— 每个客户端调用都被自己的结果帧关闭且至少一个过闸 —— 之后模型产出的
+    // 第一帧内容（思考**或**正文）就是"工具不存在"叙述的开头：提前终止上游，内容丢弃。
+    // 不能只等正文：生产里（2026-09-01 18:05）模型被拦截后先又思考了 54s 才开口，
+    // tool_use 早已在线上，等正文等于让客户端白等这 54s。批次不齐则永不早停，照旧
+    // 消费到底（保护迟到的并行调用 —— 它以 function_call 帧到达，没有内容，不会触发这里）。
+    if (nativeToolAccumulator && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeToolAccumulator)) {
+      stopRequested = true;
+      logger.warn('Anthropic Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
+      return;
+    }
     delta.phase = normalized.phase;
     let content = normalized.content;
     completionContent += content;
 
     if (delta.phase === 'think') {
+      // 文本通道调用之后的思考是失控的开头（规则 c）：截断，这一帧一个字节都不上线。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 武装之后纯空白的思考也不上线（inspectThink 对空白不触发）：放行会在 tool_use
+      // 块之后另开一个空的 thinking 块。
+      if (textRunaway?.armed()) return;
       if (!thinkingStarted) {
         thinkingStarted = true;
         if (webSearchInfo) {
@@ -846,9 +1040,24 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     } else if (delta.phase === 'answer') {
       if (parser) {
         const parsed = parser.push(content);
-        if (parsed.textDelta) emitTextDelta(agentTagStripper.push(parsed.textDelta));
-        recoveredBuffer += parsed.recoveredText;
-        for (const call of parsed.completedCalls) emitToolUse(call);
+        const text = agentTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：被拒绝的调用 / 非空白正文。触发时这一 push 的正文与抢救文本都不
+        // 上线；同一 push 里已登记完成的调用仍照常发射（下面的循环）。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) {
+          cutTextChannelTurn(pushRule);
+        } else {
+          if (text) emitTextDelta(text);
+          recoveredBuffer += parsed.recoveredText;
+        }
+        // 规则 (a)/(d)：文本通道的重复调用 / 第 N 个调用。到 cap 的那个照常交付，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, emitToolUse);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
       } else {
         emitTextDelta(agentTagStripper.push(content));
       }
@@ -871,8 +1080,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     if (emittedCalls) return null;
     if (parser && requiresToolCall(toolChoice)) return 'required';
     // 以前任何一个工具错误都会让全部补偿失效并直接 502。可是被编造的工具名恰恰是
-    // 最容易纠正的错误：把允许的名字摆在模型面前即可。
-    if (currentToolErrors().length > 0) return 'tool_error';
+    // 最容易纠正的错误：把允许的名字摆在模型面前即可。终止性 finish 下**原生来源**
+    // 的错误不点火：被 length 截断的快照是 truncated_native_call，不发射也不重试
+    // （文本来源保持今天的行为）。
+    const retryableToolErrors = terminalFinish() ? (parser?.getErrors() || []) : currentToolErrors();
+    if (retryableToolErrors.length > 0) return 'tool_error';
     // 平台把模型的原生工具调用吃掉时，我们收到的只剩 role:function 丢弃帧和一段
     // 叙述失败的散文。丢弃帧就是拦截的现场证据：有丢弃、零工具调用、且本请求
     // 确实带工具 → 值得用规范标记提示模型重发一次。终止性 finish（length/
@@ -930,8 +1142,6 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let attemptsMade = 0;
   let retriedAfterVisibleText = false;
   let protocolRecoveryRetried = false;
-  let nativeToolCalls;
-  let hasEmittedToolCalls;
 
   for (;;) {
     attemptsMade += 1;
@@ -940,7 +1150,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     try {
       const result = await runWithAnthropicPing(
         res,
-        () => consumeUpstream(currentUpstream, onUpstreamDelta)
+        () => consumeUpstream(currentUpstream, onUpstreamDelta, { shouldStop: () => stopRequested })
       );
       upstreamCompleted = result.completed;
       upstreamEventCount = result.eventCount;
@@ -949,23 +1159,31 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       throw e;
     }
 
-    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。
+    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。文本通道截断之后例外：
+    // 根本不 flush —— 解析器里压着的只是失控那一 push 的残余（半个触发器 / 半截负载），
+    // flush 会把它定罪成 truncated_tool_call，那是截断自己造成的假错误，不该进日志与
+    // finalToolErrors；抢救文本与迟到的调用同样不交付。
     if (parser) {
-      const tail = parser.flush();
-      if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
-      recoveredBuffer += tail.recoveredText;
-      for (const call of tail.completedCalls) emitToolUse(call);
+      if (!textRunaway.cutRule()) {
+        const tail = parser.flush();
+        if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
+        recoveredBuffer += tail.recoveredText;
+        for (const call of tail.completedCalls) emitToolUse(call);
+      }
       // 收取本轮被定罪的原文（flush 之后登记簿已完整），跨轮累计给交付层剥残渣。
       residueSpans.push(...parser.getResidueSpans());
     }
     // 缓冲区里可能压着一个最终没能凑成标签的前缀，它是正文，必须放出来。
     emitTextDelta(agentTagStripper.flush());
 
-    nativeToolCalls = nativeToolAccumulator?.hasAny()
-      ? nativeToolAccumulator.finalize()
-      : [];
-    for (const call of nativeToolCalls) emitToolUse(call);
-    hasEmittedToolCalls = !!(nativeToolCalls.length > 0 || parser?.hasEmittedAnyCall());
+    if (nativeToolAccumulator) {
+      // 回合结束（EOF / [DONE] / 早停）：打开中的原生调用按 round_end 关闭并排出（截断的
+      // 记 truncated_native_call，不发射）；然后 finalize() 单发结算 OpenAI 形状的
+      // tool_calls —— 原生的已经排空，不会再出来第二次。
+      nativeToolAccumulator.closeOpen('round_end');
+      drainPromotedNativeCalls();
+      for (const call of nativeToolAccumulator.finalize()) emitToolUse(call);
+    }
 
     // think phase 的回合定案：正文侧一无所获时，把本轮思考文本过一遍共享解析器。
     // 晋升守卫 = A 的守卫（openai-agent-runtime.js:232-243：正文零调用且正文文本为空
@@ -992,9 +1210,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         !terminalFinish();
       if (promotable) {
         for (const call of thinkParsed.toolCalls) emitToolUse(call);
-        hasEmittedToolCalls = true;
       } else {
-        attemptThinkEvidence = thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
+        // think phase 里的原生 function_call 帧（无 function_id）同样是排放证据。
+        attemptThinkEvidence = nativeThinkEvidence || thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
       }
     }
 
@@ -1103,6 +1321,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // 文本）不受它约束。
   const suppressedFinalAttempt = suppressAttemptOutput;
   suppressAttemptOutput = false;
+  suppressPostToolUseOutput = false;
 
   // 空判据（hasToolProtocolError）用：visibleText 减去 **debris 类**残渣。debris
   // 走 textDelta 通道且跨轮累计，位置在 agent-tag 剥离与跨轮拼接后不再可用 ——
@@ -1265,11 +1484,76 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   let upstreamCompleted;
   let upstreamEventCount;
   let nativeToolAccumulator = hasTools
-    ? createNativeToolCallAccumulator({ allowedToolNames })
+    ? createNativeToolCallAccumulator({ allowedToolNames, toolSchemas })
     : null;
   // clientToolNames：与流式分支同一条规则 —— 平台内部工具的丢弃帧不算拦截证据。
   const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
   const acceptUpstreamFrame = createUpstreamResponseFilter();
+  const isClientToolName = createClientToolNamePredicate(allowedToolNames);
+  // 本轮关闭即晋升的原生调用：非流式没有线可写，先攒着，回合定案时与文本解析器的调用
+  // 过同一本登记簿去重。think phase 的原生帧只留排放证据；早停谓词；phase 留档。按轮复位。
+  let promotedNativeCalls = [];
+  let nativeThinkEvidence = false;
+  let stopRequested = false;
+  const nativePhases = new Map();
+  const drainPromotedNativeCalls = () => {
+    for (const call of nativeToolAccumulator.takeCompleted()) {
+      logger.warn(
+        `Anthropic 非流式 Agent 原生工具调用晋升为 tool_use：${call.function.name}（phase ${nativePhases.get(call.function.name) || 'answer'}，无 function_id）`,
+        'ANTHROPIC'
+      );
+      promotedNativeCalls.push(call);
+    }
+  };
+  // 文本通道失控守卫 —— 流式分支的孪生（规则见 createTextChannelRunawayGuard）。非流式
+  // 没有线可写，回合定案前用一个边收边解析的解析器只做**检测**；截断的轮子以它已放行
+  // 的正文与调用为本轮结果（answerContent 在截断点结束：触发的那一 push 不累计），不再对
+  // 截断的原文整段重解析 —— 跨 push 的半截调用会被判成 truncated_tool_call、触发器按
+  // 正文泄漏、到 cap 的那个调用丢失，与流式分支交付的内容对不上。按轮复位。
+  // 沿袭的不对称（刻意不动）：原生晋升之后 `promotedNativeCalls.length > 0` 在守卫之前
+  // 就 return，此后的 delta 守卫看不见；流式分支则继续喂解析器。
+  const maxToolCalls = resolveTextToolCallCap();
+  let textParser = null;
+  let textTagStripper = null;
+  let textRunaway = null;
+  // 已放行的**原始** textDelta（未剥 agent 标签）：解析器 text 通道的登记落点就是它的
+  // 累计长度，交付层按位置剥残渣要同一坐标系；标签在交付点才剥（与未截断轮同序）。
+  let streamedRawText = '';
+  let streamedCalls = [];
+  // 搜索表前缀（回合定案时才知道）：拼在原文之前，登记落点整体后移。
+  let streamedPrefix = '';
+  const startTextRound = () => {
+    textParser = hasTools ? createToolCallStreamParser({ allowedToolNames, toolSchemas }) : null;
+    textTagStripper = createAgentTagStripper();
+    textRunaway = textParser
+      ? createTextChannelRunawayGuard({ parser: textParser, maxToolCalls, label: 'Anthropic 非流式 Agent', tag: 'ANTHROPIC' })
+      : null;
+    streamedRawText = '';
+    streamedCalls = [];
+    streamedPrefix = '';
+  };
+  startTextRound();
+  const collectTextCall = (call) => {
+    streamedCalls.push(call);
+    return true;
+  };
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    textRunaway.cut(rule);
+  };
+  /**
+   * 截断轮的结算：流式解析器已放行的原文与调用（形状同 parseToolCallsFromText）。只有
+   * text 通道的登记落在 streamedRawText 的坐标系里（recovered 通道非流式从不交付），
+   * 交付层照旧按位置剥残渣、再剥 agent 标签 —— 截断轮与未截断轮走同一条交付路径。
+   */
+  const settledStreamedRound = () => ({
+    cleanedText: streamedPrefix + streamedRawText,
+    toolCalls: streamedCalls,
+    errors: textParser.getErrors(),
+    residueSpans: textParser.getResidueSpans()
+      .filter(span => span.channel === 'text')
+      .map(span => ({ ...span, at: span.at + streamedPrefix.length }))
+  });
 
   /**
    * 处理一个上游 delta JSON
@@ -1289,27 +1573,70 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       upstreamFinishReason = reportedFinishReason;
     }
     const delta = choice.delta || {};
-    if (nativeToolAccumulator && Array.isArray(delta.tool_calls)) {
-      nativeToolAccumulator.push(delta.tool_calls);
-    } else if (nativeToolAccumulator && delta.function_call) {
-      nativeToolAccumulator.push([{ index: 0, type: 'function', function: delta.function_call }]);
+    const rawPhase = delta.phase;
+    if (nativeToolAccumulator) {
+      feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, {
+        isClientToolName,
+        onThinkEvidence: () => { nativeThinkEvidence = true; },
+        drain: drainPromotedNativeCalls,
+        phases: nativePhases
+      });
     }
     if (delta && delta.name === 'web_search') {
       webSearchInfo = delta.extra?.web_search_info;
     }
     const normalized = normalizeDelta(delta);
     if (!normalized) return;
+    if (nativeToolAccumulator && isProseResume(delta, normalized, rawPhase)) {
+      // 与流式分支同一条：正文恢复关闭打开中的调用。
+      if (nativeToolAccumulator.closeOpen('boundary')) drainPromotedNativeCalls();
+    }
+    // 与流式分支同一条：批次已齐后第一帧内容（思考或正文）即叙述开头，提前终止上游。
+    if (nativeToolAccumulator && delta.role !== 'function' && normalized.content &&
+        nativeBatchComplete(nativeToolAccumulator)) {
+      stopRequested = true;
+      logger.warn('Anthropic 非流式 Agent 原生工具批次已晋升，提前终止上游（用量按本地估算）', 'ANTHROPIC');
+      return;
+    }
+    // 晋升之后的叙述（"工具不可用"）不进交付文本 —— 流式分支 tool_use 后抑制的孪生。
+    if (promotedNativeCalls.length > 0) return;
     delta.phase = normalized.phase;
     const content = normalized.content;
     if (delta.phase === 'think') {
+      // 与流式分支同一条：文本通道调用之后的思考是失控的开头，截断，这一帧不累计。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 与流式分支同一条：武装之后纯空白的思考不累计。
+      if (textRunaway?.armed()) return;
       thinkingContent += content;
       attemptThinkingContent += content;
     } else if (delta.phase === 'answer') {
+      if (textParser) {
+        const parsed = textParser.push(content);
+        const text = textTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：触发时这一 push 的正文不进结果；同一 push 里已登记完成的调用仍收下。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) cutTextChannelTurn(pushRule);
+        else streamedRawText += parsed.textDelta;
+        // 规则 (a)/(d)：到 cap 的那个照常收下，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, collectTextCall);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
+        // 截断：触发的那一 push 不累计 —— answerContent 在截断点结束。
+        if (textRunaway.cutRule()) return;
+      }
       answerContent += content;
     }
   };
 
-  const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta);
+  const initialStreamResult = await consumeUpstream(upstream, onUpstreamDelta, { shouldStop: () => stopRequested });
   upstreamCompleted = initialStreamResult.completed;
   upstreamEventCount = initialStreamResult.eventCount;
 
@@ -1329,21 +1656,46 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         thinkingContent = searchTable + '\n\n' + thinkingContent;
       } else {
         answerContent = searchTable + '\n\n' + answerContent;
+        streamedPrefix = searchTable + '\n\n';
       }
     } catch (_) {}
   }
 
-  let parsedTools = hasTools
-    ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
-    : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] };
+  // 文本通道截断的轮子以流式解析器的结果定案；其余照今天整段重解析。
+  let parsedTools = textRunaway?.cutRule()
+    ? settledStreamedRound()
+    : (hasTools
+      ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
+      : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] });
   let cleanedText = stripAgentTags(parsedTools.cleanedText);
-  let nativeToolCalls = nativeToolAccumulator?.hasAny()
-    ? nativeToolAccumulator.finalize()
-    : [];
-  let toolCalls = [...nativeToolCalls, ...parsedTools.toolCalls]
-    .map((call, index) => ({ ...call, index }));
+  // 回合结束：打开中的原生调用按 round_end 关闭并排出，再 finalize() 单发结算 OpenAI
+  // 形状的 tool_calls（原生的已排空，不会出来第二次）。
+  const settleNativeCalls = () => {
+    if (!nativeToolAccumulator) return [];
+    nativeToolAccumulator.closeOpen('round_end');
+    drainPromotedNativeCalls();
+    return [...promotedNativeCalls, ...nativeToolAccumulator.finalize()];
+  };
+  // 跨通道去重登记簿替代原来的 concat：同名同参数只留先到的（原生在前 —— 它先关闭）。
+  const mergeToolCalls = (native, parsed) => {
+    const admit = createToolCallLedger();
+    return [...native, ...parsed]
+      .filter(call => {
+        if (admit(call)) return true;
+        logger.warn(
+          `Anthropic 非流式 Agent 本轮重复的工具调用（${call.function.name}，跨通道同名同参数），丢弃后到的副本`,
+          'ANTHROPIC'
+        );
+        return false;
+      })
+      .map((call, index) => ({ ...call, index }));
+  };
+  let nativeToolCalls = settleNativeCalls();
+  let toolCalls = mergeToolCalls(nativeToolCalls, parsedTools.toolCalls);
+  // 文本来源与原生来源分开记：终止性 finish 下只有文本来源的错误还点火 tool_error。
+  let textToolErrors = parsedTools.errors;
   let toolErrors = [
-    ...parsedTools.errors,
+    ...textToolErrors,
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
   // 本轮 parser 的**原始** cleanedText 与登记 span（位置坐标系 = 原始文本）。
@@ -1388,7 +1740,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       toolCalls = thinkParsed.toolCalls.map((call, index) => ({ ...call, index }));
       return;
     }
-    attemptThinkEvidence = thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
+    // think phase 里的原生 function_call 帧（无 function_id）同样是排放证据。
+    attemptThinkEvidence = nativeThinkEvidence || thinkParsed.toolCalls.length > 0 || thinkParsed.errors.length > 0;
   };
   settleThinkPhase();
 
@@ -1396,8 +1749,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     if (toolCalls.length > 0) return null;
     if (hasTools && requiresToolCall(toolChoice)) return 'required';
     // 以前任何一个工具错误都会让全部补偿失效并直接 502。被编造的工具名恰恰是最容易
-    // 纠正的错误：把允许的名字摆在模型面前即可。
-    if (toolErrors.length > 0) return 'tool_error';
+    // 纠正的错误：把允许的名字摆在模型面前即可。终止性 finish 下原生来源的错误不点火
+    // （截断的快照 = truncated_native_call，不发射也不重试；文本来源保持今天的行为）。
+    if ((terminalFinish() ? textToolErrors : toolErrors).length > 0) return 'tool_error';
     // 与流式分支同一条防御：role:function 丢弃帧 + 零工具调用 + 本请求带工具，
     // 说明平台吃掉了模型的原生调用，用规范标记提示重发一次。终止性 finish 不重试
     // —— 与 missing_tool/empty 同一纪律。
@@ -1509,8 +1863,14 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
     attemptsMade += 1;
     const before = answerContent;
-    // 每轮全新的累加器，否则上一轮的错误会一直跟着走。
-    nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames });
+    // 每轮全新的累加器，否则上一轮的错误会一直跟着走。原生晋升的按轮状态一并复位。
+    nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames, toolSchemas });
+    promotedNativeCalls = [];
+    nativeThinkEvidence = false;
+    stopRequested = false;
+    nativePhases.clear();
+    // 文本通道守卫、检测解析器与已放行的正文/调用同样按轮全新。
+    startTextRound();
     // normalizeDelta 在本分支是跨 attempt 共享的 —— 这本身是个已知缺陷（流式分支
     // 每轮新建；统一两个循环的计划在 lohari 仓库
     // _bmad-output/implementation-artifacts/spec-qwen2api-unify-agent-loop.md）。
@@ -1521,21 +1881,21 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 判定输入按轮清零（thinkingContent 本身继续累计 —— 响应交付语义不动）。
     attemptThinkingContent = '';
     upstreamFinishReason = null;
-    const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta);
+    const retryResult = await consumeUpstream(retryResp.response, onUpstreamDelta, { shouldStop: () => stopRequested });
     upstreamCompleted = retryResult.completed;
     if (!upstreamCompleted && !upstreamFinishReason) {
       streamBrokeOnRetry = true;
       break;
     }
     const retried = answerContent.slice(before.length);
-    const parsedRetry = parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
-    nativeToolCalls = nativeToolAccumulator.hasAny()
-      ? nativeToolAccumulator.finalize()
-      : [];
-    toolCalls = [...nativeToolCalls, ...parsedRetry.toolCalls]
-      .map((call, index) => ({ ...call, index }));
+    const parsedRetry = textRunaway?.cutRule()
+      ? settledStreamedRound()
+      : parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
+    nativeToolCalls = settleNativeCalls();
+    toolCalls = mergeToolCalls(nativeToolCalls, parsedRetry.toolCalls);
     cleanedText = stripAgentTags(parsedRetry.cleanedText);
-    toolErrors = [...parsedRetry.errors, ...nativeToolAccumulator.getErrors()];
+    textToolErrors = parsedRetry.errors;
+    toolErrors = [...textToolErrors, ...nativeToolAccumulator.getErrors()];
     // 交付轮换人：原始文本与登记 span 一起换（丢了这行，上一轮的 span 配不上
     // 本轮文本，残渣原样上线 —— 有测试钉住）。
     roundRawCleanedText = parsedRetry.cleanedText;
@@ -1646,7 +2006,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   }
 
   if (promptTokens === 0 && completionTokens === 0) {
-    const usage = createUsageObject(requestBody?.messages || '', thinkingContent + answerContent, null);
+    // 早停的回合收不到上游尾部的 usage 帧：原生调用的参数 JSON 也进本地估算，免得 ~0。
+    const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
+    const usage = createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText, null);
     promptTokens = usage.prompt_tokens || 0;
     completionTokens = usage.completion_tokens || 0;
   }
@@ -1770,5 +2132,7 @@ module.exports = {
   consumeUpstream,
   runWithAnthropicPing,
   handleAnthropicStream,
-  handleAnthropicNonStream
+  handleAnthropicNonStream,
+  describeToolErrors,
+  buildToolErrorRetryHint
 };

@@ -63,6 +63,56 @@ test('consumeSSEStream serializes async handlers before resolving', async () => 
   assert.equal(result.completed, true)
 })
 
+test('consumeSSEStream without shouldStop consumes to EOF and reports stopped=false', async () => {
+  const stream = new PassThrough()
+  const seen = []
+  const consuming = consumeSSEStream(stream, frame => {
+    seen.push(frame.data)
+  })
+
+  stream.end('data: one\n\ndata: two\n\ndata: [DONE]\n\n')
+  const result = await consuming
+
+  assert.deepEqual(seen, ['one', 'two', '[DONE]'])
+  assert.equal(result.stopped, false, 'la ruta normal nunca reporta stopped')
+  assert.equal(result.completed, true)
+})
+
+test('consumeSSEStream stops early on shouldStop, destroys the source and still settles', async () => {
+  // El upstream nunca manda [DONE] ni cierra: si el consumidor no corta, la promesa cuelga.
+  const stream = new PassThrough()
+  const seen = []
+  const consuming = consumeSSEStream(stream, frame => {
+    seen.push(frame.data)
+  }, { shouldStop: () => seen.length >= 2 })
+
+  stream.write('data: one\n\ndata: two\n\ndata: three\n\n')
+  const result = await consuming
+
+  assert.deepEqual(seen, ['one', 'two'], 'el frame que dispara el stop es el ultimo entregado')
+  assert.equal(result.stopped, true)
+  assert.equal(result.completed, true, 'completed = sin fallo de transporte; un corte propio no lo es')
+  assert.equal(result.sawDone, false)
+  assert.equal(result.eventCount, 2)
+  assert.equal(stream.destroyed, true, 'el break del for-await debe destruir la fuente')
+})
+
+test('consumeSSEStream with a never-true shouldStop consumes everything and reports stopped=false', async () => {
+  const stream = new PassThrough()
+  const seen = []
+  const consuming = consumeSSEStream(stream, frame => {
+    seen.push(frame.data)
+  }, { shouldStop: () => false })
+
+  stream.end('data: one\n\ndata: two\n\ndata: [DONE]\n\n')
+  const result = await consuming
+
+  assert.deepEqual(seen, ['one', 'two', '[DONE]'])
+  assert.equal(result.stopped, false)
+  assert.equal(result.completed, true)
+  assert.equal(result.sawDone, true)
+})
+
 test('formatSSEFrame produces a frame that survives byte-by-byte decoding', async () => {
   const encoded = formatSSEFrame({ event: 'message', data: '第一行\n第二行', id: '42' })
   const frames = []

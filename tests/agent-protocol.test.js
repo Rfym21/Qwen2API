@@ -1199,7 +1199,10 @@ test('默认严格模式：工具调用附带可见正文仍判为 invalid_tool_
     assert.deepEqual(evaluateAgentTurn(attempt), {
       accepted: false,
       finishReason: null,
-      retryReason: 'invalid_tool_call'
+      retryReason: 'invalid_tool_call',
+      // Ronda NO cortada (sin textChannelCut): el rechazo estricto se mantiene; `detail`
+      // sólo etiqueta cuál de los dos invalid_tool_call fue, para los logs de producción.
+      detail: 'prose_with_tools'
     })
   })
 })
@@ -1316,6 +1319,10 @@ const AGENT_LEAK = [
   '[END TOOL CALL]',
   '[END TOOL CALL]'
 ].join('\n')
+// El mismo payload SIN closer: residuo (forma de leak) pero no protocolo demostrable →
+// sigue disparando malformed_protocol. Desde el spec narrated-toolcall (2026-09-02) la
+// forma CON closer y nombre no declarado es un error duro (unknown_tool → invalid_tool_call).
+const AGENT_LEAK_NO_CLOSER = AGENT_LEAK.split('\n')[0]
 
 const runAgentTurn = (initialFrames, sendChatRequest, overrides = {}) => runOpenAIAgentTurn(
   agentTurnStream(...initialFrames),
@@ -1410,7 +1417,23 @@ test('OpenAI loop: la segunda interceptacion entrega el final envuelto tal cual 
   assert.match(result.attempt.visibleText, /unavailable/)
 })
 
-test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_calls', async () => {
+test('OpenAI loop: el leak malformado (sin closer) reintenta con su hint y recupera tool_calls', async () => {
+  const sent = []
+  const result = await runAgentTurn(
+    [agentAnswerFrame(AGENT_LEAK_NO_CLOSER)],
+    async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
+    }
+  )
+
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(sent.length, 1)
+  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+})
+
+test('OpenAI loop: el leak CON closer y nombre no declarado es error duro (spec narrated-toolcall) → invalid_tool_call, reintenta y recupera', async () => {
   const sent = []
   const result = await runAgentTurn(
     [agentAnswerFrame(AGENT_LEAK)],
@@ -1423,7 +1446,9 @@ test('OpenAI loop: el leak malformado reintenta con su hint y recupera tool_call
   assert.equal(result.ok, true)
   assert.equal(result.finishReason, 'tool_calls')
   assert.equal(sent.length, 1)
-  assert.match(JSON.stringify(sent[0]), /was NOT executed/)
+  const hint = JSON.stringify(sent[0])
+  assert.match(hint, /invalid, truncated, or unknown tool call/, 'la razon es invalid_tool_call (unknown_tool), no malformed_protocol')
+  assert.doesNotMatch(hint, /was NOT executed/)
 })
 
 test('OpenAI loop: required_tool tapa la interceptacion pero el hint lleva el dato clave', async () => {
@@ -1518,7 +1543,7 @@ test('P10: drops de tools internos en la ruta OpenAI no disparan intercepted', a
 test('P10: los drops internos no queman el slot que malformed_protocol necesita', async () => {
   const sent = []
   const result = await runAgentTurn(
-    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK)],
+    [agentInterceptionFrame('web_search'), agentAnswerFrame(AGENT_LEAK_NO_CLOSER)],
     async (body) => {
       sent.push(body)
       return { status: true, response: agentTurnStream(agentAnswerFrame(AGENT_BRACKET_CALL)) }
@@ -1531,4 +1556,579 @@ test('P10: los drops internos no queman el slot que malformed_protocol necesita'
   assert.match(hint, /was NOT executed/, 'la razon debe ser malformed_protocol')
   assert.doesNotMatch(hint, /did not reach the client/,
     'web_search conto como interceptacion y robo la razon del retry')
+})
+
+// ── D5: promocion de function_call NATIVOS en la ruta OpenAI y en chat.js legacy ──
+// El modelo llama a las herramientas del cliente por la via nativa de Qwen: upstream
+// streamea `delta.function_call` con `arguments` como SNAPSHOT acumulativo (el final
+// llega dos veces, sin function_id, phase "answer"), la plataforma inyecta
+// `role:function "Tool X does not exists."` y el modelo narra que no tiene herramientas.
+// Antes cada frame se hacia push() en index 0 con `+=` → JSON invalido → invalid_tool_call
+// → retry quemado. Fixtures byte-fieles a scratchpad/capture-foreign.txt (2026-09-01).
+
+const { createNativeToolCallAccumulator: createNativeAccumulatorForIndexPin } = require('../src/utils/tool-prompt.js')
+
+const agentNativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
+  choices: [{
+    delta: {
+      role: 'assistant',
+      content: '',
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name, arguments: snapshot },
+      extra: { display_position: 'answer' }
+    },
+    finish_reason: null
+  }]
+})}\n\n`
+
+// Lookup del registry de la plataforma: role function, punto final incluido, name.
+const agentNotExistsFrame = (name) => `data: ${JSON.stringify({
+  choices: [{
+    delta: { role: 'function', content: `Tool ${name} does not exists.`, phase: 'answer', status: 'typing', name },
+    finish_reason: null
+  }]
+})}\n\n`
+
+// Herramienta de PLATAFORMA (code_interpreter): phase propia + function_id round_N_call_<hex>.
+const agentPlatformCallFrame = (name, snapshot, id) => `data: ${JSON.stringify({
+  choices: [{
+    delta: {
+      role: 'assistant',
+      content: '',
+      phase: name,
+      status: 'typing',
+      function_call: { name, arguments: snapshot },
+      function_id: id,
+      extra: { display_position: 'answer' }
+    },
+    finish_reason: null
+  }]
+})}\n\n`
+
+const agentPlatformResultFrame = (name, id, toolResult) => `data: ${JSON.stringify({
+  choices: [{
+    delta: {
+      role: 'function',
+      content: '',
+      phase: name,
+      status: 'finished',
+      name,
+      extra: { function_id: id.replace(/^round_\d+_/, ''), tool_result: toolResult, code_interpreter_info: toolResult, display_position: 'answer' },
+      function_id: id
+    },
+    finish_reason: null
+  }]
+})}\n\n`
+
+// Frame #45 de la captura: fin de la respuesta (status finished, sin finish_reason).
+const AGENT_FINISHED_FRAME = `data: ${JSON.stringify({
+  choices: [{ delta: { content: '', role: 'assistant', status: 'finished', phase: 'answer' }, finish_reason: null }]
+})}\n\n`
+
+const NATIVE_SEND_MESSAGE_ARGS = '{"to": "riky", "message": "build is green"}'
+const NATIVE_SEND_MESSAGE_SNAPSHOTS = [
+  '', '{"to": ', '{"to": "riky', '{"to": "riky"', '{"to": "riky", "message": ',
+  '{"to": "riky", "message": "build is green', '{"to": "riky", "message": "build is green"',
+  NATIVE_SEND_MESSAGE_ARGS, NATIVE_SEND_MESSAGE_ARGS
+]
+const NATIVE_BASH_ARGS = '{"command": "git status", "description": "Check git status on user\'s machine"}'
+const NATIVE_BASH_SNAPSHOTS = [
+  '', '{"command": ', '{"command": "git status', '{"command": "git status"',
+  '{"command": "git status", "description": "Check',
+  '{"command": "git status", "description": "Check git status on user',
+  '{"command": "git status", "description": "Check git status on user\'s machine',
+  '{"command": "git status", "description": "Check git status on user\'s machine"',
+  NATIVE_BASH_ARGS, NATIVE_BASH_ARGS
+]
+const nativeAgentTurn = (name, snapshots) => snapshots.map(snapshot => agentNativeCallFrame(name, snapshot))
+
+// Narracion de la captura (#23-#42).
+const NATIVE_NARRATION_FRAMES = [
+  'The', ' required', ' tools `SendMessage`', ' and `Bash', '` are not available',
+  ' in my current environment', '. I', ' only have access to', ' `code_interpreter',
+  '`, `web_search', '`, `web_extractor', '`, and `web', '_search_image`. Therefore',
+  ', I cannot send', ' a', ' message to teammate "', 'riky" or', ' run `git status',
+  '` on your machine', '.'
+].map(agentAnswerFrame)
+const NATIVE_NARRATION_MARKER = 'not available in my current environment'
+
+const NATIVE_FOREIGN_FRAMES = [
+  ...nativeAgentTurn('SendMessage', NATIVE_SEND_MESSAGE_SNAPSHOTS),
+  ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+  agentNotExistsFrame('SendMessage'),
+  agentNotExistsFrame('Bash'),
+  ...NATIVE_NARRATION_FRAMES,
+  AGENT_FINISHED_FRAME
+]
+
+// Plataforma: forma y function_id de OTRA captura (variante 'natural', frames #2-#12 — ver el
+// header de tests/anthropic-native-toolcall.test.js); la lista de snapshots esta abreviada.
+const CODE_INTERPRETER_ID = 'round_0_call_45542fe59a8346bf888dd458'
+const CODE_INTERPRETER_SNAPSHOTS = ['', '{"code": "ls', '{"code": "ls -1 /tmp"}', '{"code": "ls -1 /tmp"}']
+
+/**
+ * Upstream que registra cada frame que el consumidor le PIDE. Generador crudo a proposito:
+ * Readable.from pre-cargaria hasta highWaterMark objetos y served[] mentiria.
+ */
+const recordingAgentUpstream = (frames) => {
+  const served = []
+  async function * gen () {
+    for (const frame of frames) {
+      served.push(frame)
+      yield frame
+    }
+  }
+  return { served, stream: gen() }
+}
+
+const NATIVE_TOOLS = ['SendMessage', 'Bash']
+const neverSend = () => { const fn = async () => { fn.calls += 1; return { status: false } }; fn.calls = 0; return fn }
+
+test('OpenAI loop: los function_call nativos se promueven a tool_calls, cero retries, la narracion no llega', async () => {
+  const sender = neverSend()
+  const upstream = recordingAgentUpstream([...NATIVE_FOREIGN_FRAMES, 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'])
+  const result = await runOpenAIAgentTurn(upstream.stream, {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: NATIVE_TOOLS,
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest: sender
+  })
+
+  assert.equal(sender.calls, 0, 'una promocion nativa no puede quemar retries')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['SendMessage', 'Bash'])
+  assert.equal(result.attempt.toolCalls[0].function.arguments, NATIVE_SEND_MESSAGE_ARGS, 'arguments = snapshot final exacto')
+  assert.equal(result.attempt.toolCalls[1].function.arguments, NATIVE_BASH_ARGS, 'arguments = snapshot final exacto')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.index), [0, 1])
+  assert.equal(result.attempt.nativeToolCalls.length, 2)
+  assert.doesNotMatch(result.attempt.rawAnswer, new RegExp(NATIVE_NARRATION_MARKER), 'la narracion post-promocion es el eco del "does not exists"')
+  assert.equal(result.attempt.visibleText.trim(), '')
+  assert.equal(result.attempt.upstreamCompleted, true, 'el corte temprano no es una falla de transporte')
+  // Corte temprano: el lote esta completo (2 calls, 2 result frames) y la primera prosa lo dispara.
+  const narrationServed = upstream.served.filter(frame => NATIVE_NARRATION_FRAMES.includes(frame))
+  assert.equal(narrationServed.length, 1, 'solo la primera prosa de la narracion debe pedirse al upstream')
+  assert.ok(!upstream.served.includes(AGENT_FINISHED_FRAME), 'el upstream siguio consumiendose hasta el final')
+})
+
+// F5: espejo de anthropic.js (commit 58f56fd) — tras la paridad del lote, el PRIMER frame con
+// contenido del modelo (think O answer) es el arranque de la narracion. En prod (18:05Z) el
+// modelo penso 54s mas antes de abrir la boca; esperar la prosa hacia esperar al cliente.
+const agentThinkFrame = (content) => `data: ${JSON.stringify({
+  choices: [{ delta: { phase: 'think', content }, finish_reason: null }]
+})}\n\n`
+
+test('OpenAI loop (F5): paridad → cinco frames think → prosa: el upstream se corta en el PRIMER think', async () => {
+  const sender = neverSend()
+  const thinkTail = ['The tools', ' seem to be', ' missing,', ' let me', ' reconsider...'].map(agentThinkFrame)
+  const frames = [
+    ...nativeAgentTurn('SendMessage', NATIVE_SEND_MESSAGE_SNAPSHOTS),
+    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+    agentNotExistsFrame('SendMessage'),
+    agentNotExistsFrame('Bash'),
+    ...thinkTail,
+    ...NATIVE_NARRATION_FRAMES,
+    AGENT_FINISHED_FRAME,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  ]
+  const upstream = recordingAgentUpstream(frames)
+  const result = await runOpenAIAgentTurn(upstream.stream, {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: NATIVE_TOOLS,
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest: sender
+  })
+
+  assert.equal(sender.calls, 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['SendMessage', 'Bash'])
+  const parityAt = frames.indexOf(agentNotExistsFrame('Bash'))
+  assert.equal(upstream.served.length, parityAt + 2, `must stop on the first think frame after parity, served ${upstream.served.length}`)
+  assert.equal(upstream.served[upstream.served.length - 1], thinkTail[0], 'the stop frame is the first think frame')
+  assert.doesNotMatch(result.attempt.reasoning, /reconsider/, 'post-parity thinking is discarded')
+})
+
+test('OpenAI loop: prosa ANTES de los frames nativos se conserva como visibleText junto a los tool_calls', async () => {
+  const sender = neverSend()
+  const result = await runAgentTurn(
+    [agentAnswerFrame('Let me check.'), ...NATIVE_FOREIGN_FRAMES],
+    sender,
+    { allowed_tool_names: NATIVE_TOOLS }
+  )
+  assert.equal(sender.calls, 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls', 'la prosa previa no puede tumbar una llamada nativa (no se toca AGENT_TURN_ALLOW_PROSE_WITH_TOOLS)')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['SendMessage', 'Bash'])
+  assert.equal(result.attempt.visibleText, 'Let me check.')
+  assert.doesNotMatch(result.attempt.rawAnswer, new RegExp(NATIVE_NARRATION_MARKER))
+})
+
+// El [TOOL CALL] textual va ANTES de los frames nativos a proposito: despues del lote
+// completo la primera prosa dispara el corte temprano y el texto ni se lee. Con el texto
+// primero ambos canales producen el mismo Bash: el nativo supersede (F1) y queda uno.
+test('OpenAI loop: [TOOL CALL] textual + nativo del mismo Bash con los mismos args → una sola llamada', async () => {
+  const sender = neverSend()
+  const shuffled = JSON.parse(NATIVE_BASH_ARGS)
+  const textCall = `[TOOL CALL]{"name":"Bash","arguments":{"description":${JSON.stringify(shuffled.description)},"command":${JSON.stringify(shuffled.command)}}}[END TOOL CALL]`
+  const result = await runAgentTurn(
+    [agentAnswerFrame(textCall), ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS), agentNotExistsFrame('Bash')],
+    sender,
+    { allowed_tool_names: NATIVE_TOOLS }
+  )
+  assert.equal(sender.calls, 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.equal(result.attempt.toolCalls.length, 1, 'el duplicado cruzado se descarta')
+  assert.equal(result.attempt.toolCalls[0].function.name, 'Bash')
+  assert.equal(result.attempt.toolCalls[0].function.arguments, NATIVE_BASH_ARGS, 'gana el nativo (cierra primero); el textual es la copia')
+})
+
+// F1: el canal nativo SUPERSEDE al textual — semantica pre-diff de este runtime
+// (`nativeToolCalls.length > 0 ? nativeToolCalls : textTools.toolCalls`). Fusionar ambos
+// canales dejaba ejecutar un [TOOL CALL] textual destructivo junto al Bash nativo distinto.
+// Este runtime bufferiza toda la ronda, asi que PUEDE descartar el textual (anthropic.js
+// emite el textual inline y no puede retirarlo).
+test('OpenAI loop: nativo + [TOOL CALL] textual DISTINTOS en la misma ronda → solo el nativo, un warn', async () => {
+  const sender = neverSend()
+  const savedWarn = logger.warn
+  const warnLines = []
+  logger.warn = (msg) => { warnLines.push(String(msg)) }
+  let result
+  try {
+    result = await runAgentTurn(
+      [
+        agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"rm -rf build"}}[END TOOL CALL]'),
+        ...nativeAgentTurn('Bash', ['', '{"command": ', '{"command": "git status"}', '{"command": "git status"}']),
+        agentNotExistsFrame('Bash')
+      ],
+      sender,
+      { allowed_tool_names: NATIVE_TOOLS }
+    )
+  } finally {
+    logger.warn = savedWarn
+  }
+  assert.equal(sender.calls, 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(
+    result.attempt.toolCalls.map(call => [call.function.name, call.function.arguments]),
+    [['Bash', '{"command": "git status"}']],
+    'el textual "rm -rf build" jamas debe ejecutarse junto al nativo'
+  )
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.index), [0])
+  assert.equal(warnLines.filter(line => /文本通道/.test(line)).length, 1, `expected ONE precedence warn, got:\n${warnLines.join('\n')}`)
+})
+
+// Misma precedencia con nombres distintos: texto Read + nativo Bash → solo Bash. (Antes de
+// F1 este test pinaba "dos llamadas con index unico [0,1]"; el index unico cruzado sigue
+// pinado donde si aplica, en chat.js legacy mas abajo.)
+test('OpenAI loop: texto Read + nativo Bash en la misma ronda → solo el nativo Bash', async () => {
+  const sender = neverSend()
+  const result = await runAgentTurn(
+    [
+      agentAnswerFrame('[TOOL CALL]{"name":"Read","arguments":{"path":"a.txt"}}[END TOOL CALL]'),
+      ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+      agentNotExistsFrame('Bash')
+    ],
+    sender,
+    { allowed_tool_names: ['Read', 'Bash'] }
+  )
+  assert.equal(sender.calls, 0)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['Bash'])
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.index), [0])
+})
+
+// Cinturon bajo el tirante del corte temprano: si los result frames nunca llegan, la
+// primera prosa cierra la llamada abierta (se promueve igual), el lote nunca esta "completo"
+// (no hay corte temprano) y la narracion posterior se descarta en la recoleccion.
+test('OpenAI loop: sin result frames la prosa cierra la llamada nativa; no hay corte temprano y la narracion no entra', async () => {
+  const sender = neverSend()
+  const frames = [...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS), ...NATIVE_NARRATION_FRAMES, AGENT_FINISHED_FRAME]
+  const upstream = recordingAgentUpstream([...frames, 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'])
+  const result = await runOpenAIAgentTurn(upstream.stream, {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: NATIVE_TOOLS,
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest: sender
+  })
+  assert.equal(sender.calls, 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['Bash'])
+  assert.equal(result.attempt.toolCalls[0].function.arguments, NATIVE_BASH_ARGS)
+  assert.equal(upstream.served.length, frames.length + 1, 'sin paridad de result frames no hay corte temprano')
+  assert.doesNotMatch(result.attempt.rawAnswer, new RegExp(NATIVE_NARRATION_MARKER), 'la narracion post-promocion se descarta aunque no haya corte')
+  assert.equal(result.attempt.visibleText.trim(), '')
+})
+
+test('OpenAI loop: la ronda de code_interpreter (plataforma) sigue siendo invalid_tool_call con retry, sin corte temprano', async () => {
+  const sent = []
+  const frames = [
+    ...CODE_INTERPRETER_SNAPSHOTS.map(snapshot => agentPlatformCallFrame('code_interpreter', snapshot, CODE_INTERPRETER_ID)),
+    agentPlatformResultFrame('code_interpreter', CODE_INTERPRETER_ID, '```\nCount: 1\n```'),
+    agentAnswerFrame('There is 1 file in /tmp.'),
+    AGENT_FINISHED_FRAME,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  ]
+  const upstream = recordingAgentUpstream(frames)
+  const result = await runOpenAIAgentTurn(upstream.stream, {
+    has_tools: true,
+    tool_choice: 'auto',
+    allowed_tool_names: ['Bash'],
+    agent_turn_max_attempts: 3,
+    upstream_request_body: { messages: [{ role: 'user', content: 'do the task' }] },
+    sendChatRequest: async (body) => {
+      sent.push(body)
+      return { status: true, response: agentTurnStream(agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]')) }
+    }
+  })
+  assert.equal(sent.length, 1, 'una llamada de plataforma es unknown_tool → un retry, como hoy')
+  assert.match(JSON.stringify(sent[0]), /invalid, truncated, or unknown tool call/)
+  assert.equal(result.ok, true)
+  assert.equal(result.attempt.toolCalls[0].function.name, 'Bash')
+  assert.equal(upstream.served.length, frames.length, 'las llamadas de plataforma no cuentan para el corte temprano')
+})
+
+// P5: la aceptacion por nativo va ANTES del veto de toolErrors. Una llamada de plataforma en la
+// misma ronda deja un unknown_tool (origen nativo, no textual) en toolErrors; si el veto fuera
+// primero, la ronda con el Bash promovido se rechazaria y quemaria un retry.
+test('OpenAI loop (P5): plataforma (unknown_tool) + nativo Bash promovido en la misma ronda → aceptada sin retry, toolErrors no vacio', async () => {
+  const sender = neverSend()
+  const result = await runAgentTurn(
+    [
+      ...CODE_INTERPRETER_SNAPSHOTS.map(snapshot => agentPlatformCallFrame('code_interpreter', snapshot, CODE_INTERPRETER_ID)),
+      agentPlatformResultFrame('code_interpreter', CODE_INTERPRETER_ID, '```\nCount: 1\n```'),
+      ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+      agentNotExistsFrame('Bash'),
+      agentAnswerFrame('There is 1 file in /tmp.')
+    ],
+    sender,
+    { allowed_tool_names: ['Bash'] }
+  )
+  assert.equal(sender.calls, 0, 'un unknown_tool de origen nativo no puede vetar una ronda con promocion')
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'tool_calls')
+  assert.deepEqual(result.attempt.toolCalls.map(call => call.function.name), ['Bash'])
+  assert.deepEqual(result.attempt.toolErrors, [{ type: 'unknown_tool', name: 'code_interpreter' }])
+  assert.deepEqual(result.attempt.textToolErrors, [], 'el error es de origen nativo: el content limpio sigue saliendo (F2 no aplica)')
+  assert.equal(result.suppressVisibleText, false)
+})
+
+test('OpenAI loop: allowlist vacia → fail closed, cero tool_calls, un retry (gemelo R2)', async () => {
+  let sent = 0
+  const result = await runAgentTurn(
+    [...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS), agentNotExistsFrame('Bash'), ...NATIVE_NARRATION_FRAMES, AGENT_FINISHED_FRAME],
+    async () => { sent += 1; return { status: false } },
+    { allowed_tool_names: [] }
+  )
+  assert.equal(sent, 1, 'sin allowlist nada se promueve; la ronda se rechaza y reintenta una vez')
+  assert.equal(result.ok, false)
+  assert.equal(result.attempt.toolCalls.length, 0)
+})
+
+// e2e por handleStreamResponse (turn gate): la prosa previa sale como content y los dos
+// tool_calls siguen; la narracion no aparece en el wire.
+test('OpenAI stream e2e: prosa previa + tool_calls nativos en el wire, sin narracion', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([agentAnswerFrame('Let me check.'), ...NATIVE_FOREIGN_FRAMES]),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'do the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: NATIVE_TOOLS,
+      sendChatRequest: async () => { retries += 1; return { status: false } }
+    }
+  )
+  assert.equal(retries, 0)
+  const chunks = res.output.split('\n\n').filter(line => line.startsWith('data: ') && line !== 'data: [DONE]').map(line => JSON.parse(line.slice(6)))
+  const headers = chunks.flatMap(chunk => (chunk.choices?.[0]?.delta?.tool_calls || []).filter(call => call.id))
+  assert.deepEqual(headers.map(call => call.function.name), ['SendMessage', 'Bash'])
+  assert.deepEqual(headers.map(call => call.index), [0, 1])
+  const content = chunks.map(chunk => chunk.choices?.[0]?.delta?.content || '').join('')
+  assert.equal(content, 'Let me check.')
+  assert.doesNotMatch(res.output, new RegExp(NATIVE_NARRATION_MARKER))
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+})
+
+// F2: la aceptacion por nativo se salta el veto de toolErrors y containsOrphanProtocolResidue
+// a proposito (la llamada estructurada vale mas), pero el visibleText de esa ronda puede
+// traer un [TOOL CALL] textual roto. Ese texto NO se reenvia como content junto a los
+// tool_calls: content vacio, tool_calls intactos. La prosa limpia previa sigue saliendo
+// (test anterior + el gemelo no-stream de abajo).
+const TAINTED_PROSE = 'Sure. [TOOL CALL]{"name":"Bash","arguments":{"command":[END TOOL CALL]'
+const NATIVE_GIT_STATUS_SNAPSHOTS = ['', '{"command": ', '{"command": "git status"}', '{"command": "git status"}']
+
+test('OpenAI stream e2e (F2): [TOOL CALL] textual roto + nativo aceptado → content vacio, tool_calls presentes', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from([
+      agentAnswerFrame(TAINTED_PROSE),
+      ...nativeAgentTurn('Bash', NATIVE_GIT_STATUS_SNAPSHOTS),
+      agentNotExistsFrame('Bash'),
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ]),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'do the task' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: NATIVE_TOOLS,
+      sendChatRequest: async () => { retries += 1; return { status: false } }
+    }
+  )
+  assert.equal(retries, 0, 'la aceptacion por nativo sigue sin quemar retries')
+  const chunks = res.output.split('\n\n').filter(line => line.startsWith('data: ') && line !== 'data: [DONE]').map(line => JSON.parse(line.slice(6)))
+  const headers = chunks.flatMap(chunk => (chunk.choices?.[0]?.delta?.tool_calls || []).filter(call => call.id))
+  assert.deepEqual(headers.map(call => call.function.name), ['Bash'])
+  const content = chunks.map(chunk => chunk.choices?.[0]?.delta?.content || '').join('')
+  assert.equal(content, '', 'el residuo de protocolo jamas llega al cliente junto a los tool_calls')
+  assert.doesNotMatch(res.output, /TOOL CALL/)
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+})
+
+test('OpenAI non-stream e2e (F2): texto contaminado → content null; prosa limpia → content junto a tool_calls', async () => {
+  const runNonStream = async (firstFrame) => {
+    const res = createMockResponse()
+    await handleNonStreamResponse(
+      res,
+      Readable.from([
+        agentAnswerFrame(firstFrame),
+        ...nativeAgentTurn('Bash', NATIVE_GIT_STATUS_SNAPSHOTS),
+        agentNotExistsFrame('Bash'),
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+      ]),
+      false,
+      false,
+      'qwen-test',
+      { messages: [{ role: 'user', content: 'do the task' }] },
+      {
+        has_tools: true,
+        tool_choice: 'auto',
+        allowed_tool_names: NATIVE_TOOLS,
+        sendChatRequest: async () => ({ status: false })
+      }
+    )
+    return JSON.parse(res.output).choices[0]
+  }
+
+  const tainted = await runNonStream(TAINTED_PROSE)
+  assert.equal(tainted.finish_reason, 'tool_calls')
+  assert.deepEqual(tainted.message.tool_calls.map(call => call.function.name), ['Bash'])
+  assert.equal(tainted.message.content, null, 'texto con residuo de protocolo → sin content')
+
+  const clean = await runNonStream('Let me check.')
+  assert.equal(clean.finish_reason, 'tool_calls')
+  assert.deepEqual(clean.message.tool_calls.map(call => call.function.name), ['Bash'])
+  assert.equal(clean.message.content, 'Let me check.', 'la prosa limpia previa a la llamada sigue saliendo')
+})
+
+// ── chat.js legacy (strict_agent_turn: false): feed nativo, index unico, retry limpio ──
+
+const legacyToolCallHeaders = (output) => output
+  .split('\n\n')
+  .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+  .map(line => JSON.parse(line.slice(6)))
+  .flatMap(chunk => (chunk.choices?.[0]?.delta?.tool_calls || []))
+
+const legacyArgsOf = (deltas, index) => deltas
+  .filter(call => call.index === index && !call.id)
+  .map(call => call.function.arguments)
+  .join('')
+
+const runLegacyStream = async (frames, options = {}) => {
+  const res = createMockResponse()
+  await handleStreamResponse(
+    res,
+    Readable.from(frames),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'do the task' }] },
+    { has_tools: true, strict_agent_turn: false, tool_choice: 'auto', allowed_tool_names: NATIVE_TOOLS, ...options }
+  )
+  return res
+}
+
+test('chat.js legacy stream: una llamada nativa produce exactamente un header tool_calls[0] con los arguments exactos', async () => {
+  const res = await runLegacyStream([
+    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+    agentNotExistsFrame('Bash'),
+    AGENT_FINISHED_FRAME,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  ])
+  assert.doesNotMatch(res.output, /invalid_tool_call/)
+  const deltas = legacyToolCallHeaders(res.output)
+  const headers = deltas.filter(call => call.id)
+  assert.equal(headers.length, 1, 'un snapshot repetido no puede abrir una segunda llamada')
+  assert.equal(headers[0].index, 0)
+  assert.equal(headers[0].function.name, 'Bash')
+  assert.equal(legacyArgsOf(deltas, 0), NATIVE_BASH_ARGS)
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
+})
+
+test('chat.js legacy stream: la llamada textual y la nativa no pueden ser ambas tool_calls[0]', async () => {
+  const res = await runLegacyStream([
+    agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
+    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
+    agentNotExistsFrame('Bash'),
+    AGENT_FINISHED_FRAME,
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+  ])
+  const deltas = legacyToolCallHeaders(res.output)
+  const headers = deltas.filter(call => call.id)
+  assert.deepEqual(headers.map(call => call.function.name), ['Bash', 'Bash'])
+  assert.deepEqual(headers.map(call => call.index), [0, 1], 'el caller es dueno del unico index monotono')
+  assert.equal(legacyArgsOf(deltas, 0), '{"command":"ls"}')
+  assert.equal(legacyArgsOf(deltas, 1), NATIVE_BASH_ARGS)
+  // El accumulator por si solo sigue numerando desde 0: la unificacion vive en el caller.
+  const twin = createNativeAccumulatorForIndexPin({ allowedToolNames: NATIVE_TOOLS })
+  twin.pushNativeSnapshot({ name: 'Bash', arguments: NATIVE_BASH_ARGS, phase: 'answer' })
+  assert.equal(twin.finalize()[0].index, 0)
+})
+
+test('chat.js legacy stream: el retry de compensacion recrea parser y accumulator — el fragmento de la ronda 1 no reaparece', async () => {
+  let sent = 0
+  const res = await runLegacyStream(
+    [
+      agentAnswerFrame('[TOOL CALL]{"name":"Bash","arg'),
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    ],
+    {
+      tool_choice: 'required',
+      sendChatRequest: async () => {
+        sent += 1
+        return {
+          status: true,
+          response: Readable.from([
+            agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+          ])
+        }
+      }
+    }
+  )
+  assert.equal(sent, 1, 'tool_choice=required sin llamada dispara la compensacion')
+  assert.doesNotMatch(res.output, /invalid_tool_call/, 'el fragmento de la ronda 1 contamino el parser de la ronda 2')
+  const deltas = legacyToolCallHeaders(res.output)
+  const headers = deltas.filter(call => call.id)
+  assert.equal(headers.length, 1)
+  assert.equal(headers[0].function.name, 'Bash')
+  assert.equal(legacyArgsOf(deltas, headers[0].index), '{"command":"ls"}')
+  assert.match(res.output, /"finish_reason":"tool_calls"/)
 })

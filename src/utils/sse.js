@@ -132,34 +132,52 @@ const formatSSEFrame = (frame = {}) => {
  * 串行消费 Node readable 中的 SSE。for-await 会等待 onFrame，避免 end 事件越过异步 data handler。
  * @param {AsyncIterable<Buffer|string>} stream
  * @param {(frame: ReturnType<typeof parseSSEFrame>) => Promise<void>|void} onFrame
+ * @param {{ shouldStop?: () => boolean }} [options]
  * 正常迭代结束代表 HTTP 响应体被完整消费。真正的连接重置、premature close
  * 或解压失败会由 for-await 抛出，不能把“没有 [DONE]”等同于传输中断：
  * Qwen 网页端的正常流本来就可能以干净 EOF 收尾。
- * @returns {Promise<{sawDone: boolean, eventCount: number, completed: boolean}>}
+ *
+ * options.shouldStop：每帧 onFrame 结束后询问一次；返回 true 则消费者自己 `break`
+ * 出 for-await —— 异步迭代器的 return() 会干净地销毁 axios 流，不需要 AbortController，
+ * 也绝不能在 onFrame 里 destroy()（那会以 ERR_STREAM_PREMATURE_CLOSE 重新抛出）。
+ * break 前先挂一个空的 'error' 监听：解压管道在销毁时可能补发一个 error 事件。
+ * 这样收尾的流 completed 仍为 true —— completed 只表示"没有传输故障"，主动截断不是故障；
+ * 同一 chunk 里排在停止帧之后的帧被丢弃（那正是要丢的叙述），decoder.end() 不再调用。
+ * @returns {Promise<{sawDone: boolean, eventCount: number, completed: boolean, stopped: boolean}>}
  */
-const consumeSSEStream = async (stream, onFrame) => {
+const consumeSSEStream = async (stream, onFrame, options = {}) => {
     if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
         throw new TypeError('上游响应不是可读取的异步流')
     }
 
+    const shouldStop = typeof options.shouldStop === 'function' ? options.shouldStop : null
     const decoder = new SSEDecoder()
     let sawDone = false
     let eventCount = 0
+    let stopped = false
 
     const consumeFrames = async (frames) => {
         for (const frame of frames) {
             eventCount += 1
             if (frame.data.trim() === '[DONE]') sawDone = true
             await onFrame(frame)
+            if (shouldStop && shouldStop()) {
+                stopped = true
+                return
+            }
         }
     }
 
     for await (const chunk of stream) {
         await consumeFrames(decoder.push(chunk))
+        if (stopped) {
+            if (typeof stream.on === 'function') stream.on('error', () => {})
+            break
+        }
     }
-    await consumeFrames(decoder.end())
+    if (!stopped) await consumeFrames(decoder.end())
 
-    return { sawDone, eventCount, completed: true }
+    return { sawDone, eventCount, completed: true, stopped }
 }
 
 /**
