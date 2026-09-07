@@ -445,9 +445,13 @@ describe('OpenAI text-channel runaway cut-off (runOpenAIAgentTurn)', () => {
     assert.equal(result.finishReason, 'tool_calls');
   });
 
-  // P7(b): el corte no toca las reglas del evaluador. La prosa PREVIA a la llamada sigue
-  // en visibleText y la puerta estricta prosa+tools sigue rechazando la ronda.
-  it('pre-call prose survives a cut and is still rejected by the unchanged prose-with-tools gate', async () => {
+  // P7(b) — REVERTIDO 2026-09-06 tras incidente en qwen-next (gate estricto): la version
+  // original exigia que la puerta prosa+tools siguiera rechazando la ronda cortada. En vivo
+  // eso reintenta la fuga recien detenida sobre el mismo chat_id abortado → CHAT_IN_PROGRESS
+  // → 502, y contradice la promesa de settledTextRound y la paridad Anthropic
+  // (decideRetryReason entrega en cuanto hubo llamadas). Ahora: la prosa previa se conserva
+  // en visibleText, la ronda SE ENTREGA, y con gate estricto la prosa se suprime en el wire.
+  it('pre-call prose survives a cut; the strict prose-with-tools gate delivers (prose suppressed) instead of rejecting', async () => {
     const sender = scriptedSender();
     const frames = [
       answerFrame(`Let me check that file.\n${readCall('a')}`),
@@ -457,8 +461,11 @@ describe('OpenAI text-channel runaway cut-off (runOpenAIAgentTurn)', () => {
 
     assert.equal(ruleOf(warns), 'duplicate', 'el corte se dispara');
     assert.match(result.attempt.visibleText, /Let me check that file/, 'la prosa previa se conserva');
-    assert.equal(result.ok, false, 'y la puerta estricta la rechaza igual que antes');
+    assert.equal(result.ok, true, 'la ronda cortada con llamadas admitidas SIEMPRE se entrega');
+    assert.equal(result.finishReason, 'tool_calls');
+    assert.equal(result.suppressVisibleText, true, 'con gate estricto la prosa no viaja al cliente');
     assert.equal(result.attempt.toolCalls.length, 1);
+    assert.equal(sender.calls.length, 0, 'sin reintento sobre el chat abortado');
   });
 
   // P7(c): el tag del warn es un parametro de la guarda compartida desde la extraccion.
@@ -515,6 +522,79 @@ describe('OpenAI text-channel runaway cut-off (runOpenAIAgentTurn)', () => {
 });
 
 // ─────────────────── aislamiento por attempt (AC de la spec) ───────────────────
+
+// ─────────────── gate estricto: la ronda cortada se entrega igual ───────────────
+// Incidente qwen-next 2026-09-06 20:29 (staging SIN AGENT_TURN_ALLOW_PROSE_WITH_TOOLS, a
+// diferencia de prod): el modelo narró antes de la llamada, la guarda cortó por duplicado y
+// la puerta rechazó la ronda por "prosa+tools" → reintento sobre el mismo chat_id cuya
+// generación abortada seguía viva en Qwen → CHAT_IN_PROGRESS → 502. La promesa de
+// settledTextRound ("una ronda cortada con llamadas admitidas SIEMPRE se entrega") tiene que
+// valer con cualquier valor de la flag.
+describe('cut round under strict gate (AGENT_TURN_ALLOW_PROSE_WITH_TOOLS unset)', () => {
+  const withProseFlag = async (value, fn) => {
+    const prev = config.agentTurnAllowProseWithTools;
+    config.agentTurnAllowProseWithTools = value;
+    try { return await fn(); } finally { config.agentTurnAllowProseWithTools = prev; }
+  };
+  const narratedDuplicate = () => [
+    answerFrame(`Voy a leer el archivo primero.\n\n${readCall('a')}`),
+    answerFrame(`\n\n${readCall('a')}`),
+    ...Array.from({ length: 30 }, (_, i) => answerFrame(`\n\nnarration ${i}`))
+  ];
+
+  it('runtime: prose before the call + duplicate cut → tool_calls, prose suppressed, no retry', async () => {
+    await withProseFlag(false, async () => {
+      const sender = scriptedSender();
+      const { result, served, warns } = await runTurnRecorded(narratedDuplicate(), sender);
+      assert.equal(result.ok, true, JSON.stringify(result.error || null));
+      assert.equal(result.finishReason, 'tool_calls');
+      assert.equal(result.attempt.toolCalls.length, 1);
+      assert.equal(result.attempt.textChannelCut, true);
+      assert.equal(result.suppressVisibleText, true, 'con gate estricto la narración no se entrega');
+      assert.equal(served.length, 2, 'se corta en el duplicado');
+      assert.equal(ruleOf(warns), 'duplicate');
+      assert.equal(sender.calls.length, 0, 'sin reintento: ningún segundo POST al chat abortado');
+    });
+  });
+
+  it('non-stream wire: 200 with tool_calls and empty content (was 502 CHAT_IN_PROGRESS)', async () => {
+    await withProseFlag(false, async () => {
+      const sender = scriptedSender();
+      const { res } = await runNonStreamRecorded(narratedDuplicate(), sender);
+      assert.equal(res.statusCode, 200, res.output);
+      const body = bodyOf(res);
+      assert.equal(body.choices[0].finish_reason, 'tool_calls');
+      assert.equal(body.choices[0].message.tool_calls.length, 1);
+      assert.equal(body.choices[0].message.tool_calls[0].function.name, 'Read');
+      assert.ok(!body.choices[0].message.content, 'content vacío/null: la narración se suprime');
+      assert.equal(sender.calls.length, 0);
+    });
+  });
+
+  it('stream wire: tool_calls delivered, no content deltas, no retry', async () => {
+    await withProseFlag(false, async () => {
+      const sender = scriptedSender();
+      const { res } = await runStreamRecorded(narratedDuplicate(), sender);
+      assert.equal(streamFinishReason(res.output), 'tool_calls');
+      assert.deepEqual(streamToolCalls(res.output).map(c => c.name), ['Read']);
+      assert.equal(streamContent(res.output), '', 'sin content: la narración no viaja');
+      assert.equal(sender.calls.length, 0);
+    });
+  });
+
+  it('prod flag (ALLOW_PROSE=true): same round delivers prose AND the call — unchanged', async () => {
+    await withProseFlag(true, async () => {
+      const sender = scriptedSender();
+      const { result } = await runTurnRecorded(narratedDuplicate(), sender);
+      assert.equal(result.ok, true);
+      assert.equal(result.finishReason, 'tool_calls');
+      assert.equal(result.attempt.toolCalls.length, 1);
+      assert.notEqual(result.suppressVisibleText, true);
+      assert.equal(result.attempt.visibleText.trim(), 'Voy a leer el archivo primero.');
+      assert.equal(sender.calls.length, 0);
+    });
+  });
+});
 
 describe('OpenAI runaway guard: per-attempt isolation', () => {
   it('a call admitted in attempt 1 is NOT a duplicate in attempt 2 (ledger/guard/parser are fresh)', async () => {

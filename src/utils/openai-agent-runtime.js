@@ -516,6 +516,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     upstreamCompleted: streamResult.completed,
     upstreamEventCount: streamResult.eventCount,
     sawDone: streamResult.sawDone,
+    // La guarda de fuga destruyó el upstream a medias. La puerta lo usa para entregar la
+    // ronda sin pasar por las reglas de reintento, y el reintento (si alguna vez lo hubiera)
+    // para no volver a un chat_id cuya generación abortada sigue viva en Qwen.
+    textChannelCut,
+    upstreamStopped: streamResult.stopped === true,
     metadata: {
       ...metadata,
       responseId: metadata?.responseId || acceptedResponseId || null
@@ -545,13 +550,26 @@ const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
       containsOrphanProtocolResidue(attempt.visibleText)
     return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
   }
+  // Ronda cortada por la guarda de fuga con llamadas admitidas: SIEMPRE se entrega (paridad
+  // con anthropic.js decideRetryReason :1080/:1749 y la promesa de settledTextRound). Va ANTES
+  // del veto por toolErrors y de "prosa no coexiste con tools": rechazarla reintenta la fuga
+  // recién detenida y, peor, el reintento cae en el mismo chat_id cuya generación abortada
+  // sigue viva en Qwen → CHAT_IN_PROGRESS → 502 (incidente qwen-next 2026-09-06 20:29, gate
+  // estricto: narración previa a la llamada + corte por duplicado). La prosa previa al corte
+  // viaja sólo si la config la permite; con gate estricto se suprime en vez de rechazar.
+  if (attempt.textChannelCut === true && attempt.toolCalls.length > 0) {
+    const suppressVisibleText = (attempt.toolErrors?.length || 0) > 0 ||
+      containsOrphanProtocolResidue(attempt.visibleText) ||
+      (!config.agentTurnAllowProseWithTools && !!attempt.visibleText.trim())
+    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
+  }
   if (attempt.toolErrors.length > 0) {
-    return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
+    return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'tool_errors' }
   }
   if (attempt.toolCalls.length > 0) {
     if (!config.agentTurnAllowProseWithTools &&
         (attempt.controlKind !== 'empty' || attempt.visibleText.trim())) {
-      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call' }
+      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'prose_with_tools' }
     }
     return { accepted: true, finishReason: 'tool_calls', retryReason: null }
   }
@@ -723,8 +741,11 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     const dropSuffix = (attempt.interceptedToolNames?.length || 0) > 0
       ? `; dropped: ${attempt.interceptedToolNames.join(', ')}`
       : ''
+    // `detail` distingue en producción los dos invalid_tool_call (toolErrors vs prosa+tools):
+    // sin él, el incidente 2026-09-06 fue indistinguible por logs.
+    const detailSuffix = evaluation.detail ? `:${evaluation.detail}` : ''
     logger.warn(
-      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${dropSuffix})`,
+      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${detailSuffix}${dropSuffix})`,
       'AGENT'
     )
     if (attempt.streamedVisibleText) {
@@ -753,9 +774,14 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       retryHint = `${retryHint}\n${buildAgentRetryHint('intercepted')}`
     }
     const retryBody = appendRetryHint(retryBaseBody, retryHint)
+    // Tras un corte el upstream de esta ronda se destruyó a medias: en Qwen esa generación
+    // sigue "in progress" unos segundos y un POST al mismo chat_id responde CHAT_IN_PROGRESS
+    // (visto 2026-09-06 20:29 en qwen-next). Defensa en profundidad — hoy toda ronda cortada
+    // con llamadas se acepta arriba y no llega aquí —: el reintento abre chat nuevo.
+    const chatBusy = attempt.textChannelCut === true || attempt.upstreamStopped === true
     const retryResponse = await requestSender(retryBody, {
-      chatId: upstreamContext.chatId || null,
-      parentId: upstreamContext.responseId || null,
+      chatId: chatBusy ? null : (upstreamContext.chatId || null),
+      parentId: chatBusy ? null : (upstreamContext.responseId || null),
       currentAccount: options.currentAccount || null,
       agentRetry: true
     })
