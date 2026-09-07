@@ -389,12 +389,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       else streamedRawText += parsed.textDelta
       // Reglas (a)/(d): la llamada que toca el cap se entrega igual, y ahi se para.
       for (const call of parsed.completedCalls) {
-        // El cap manda tambien mientras se drena el push que disparo el corte. Despues de un
-        // corte por regla NO-cap, inspectCall deja de devolver reglas (incluida 'cap'), asi
-        // que sin este tope un solo delta con 41 llamadas completas las entregaba todas.
-        // streamedCalls.length === admittedCount de la guarda (collectTextCall solo corre
-        // cuando el registro admite la llamada).
-        if (streamedCalls.length >= maxTextToolCalls) break
+        // El tope durante el drenaje del push que disparo el corte lo aplica la guarda
+        // compartida (agent-turn.js#inspectCall), una sola vez para los tres llamadores.
         const callRule = textRunaway.inspectCall(call, collectTextCall)
         if (!callRule) continue
         cutTextChannelTurn(callRule)

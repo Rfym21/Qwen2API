@@ -406,6 +406,18 @@ const createTextChannelRunawayGuard = ({ parser, maxToolCalls, label, tag }) => 
    * 登记簿判为跨通道副本，没上线也不计数）。返回规则 (a)/(d) 或 null。
    */
   const inspectCall = (call, emit) => {
+    // El cap manda TAMBIEN mientras se drena el push que disparo un corte por otra regla.
+    // Tras un corte esta funcion deja de devolver reglas (incluida 'cap') —— ver el `return
+    // null` de mas abajo —— asi que sin este tope las llamadas restantes de ese mismo push
+    // se admitian y emitian todas: un solo delta con 40 llamadas mas entregaba 41 contra un
+    // cap de 24. En la rama de streaming de Anthropic `emitToolUse` escribe el bloque
+    // tool_use en el cable al instante, asi que ese exceso es irrecuperable.
+    //
+    // Va ANTES del registro (no se toca el ledger) y esta condicionado a `cutRule`, asi que
+    // no puede alterar el camino sin corte: ahi `inspectCall` devuelve 'cap' exactamente al
+    // llegar al tope y todos los llamadores hacen `break`, de modo que nunca se vuelve a
+    // entrar con admittedCount >= maxToolCalls. El unico modo de pasarse del cap era este.
+    if (cutRule && admittedCount >= maxToolCalls) return null;
     if (!admitTextCall(call)) {
       logger.warn(
         `${label} 本轮文本通道重复的工具调用（${call.function.name}，同名同参数），丢弃后到的副本`,
