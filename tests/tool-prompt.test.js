@@ -2093,7 +2093,9 @@ test('loop 1: escapeInnerQuotesInStrings — JSON valido es punto fijo (null), e
   // Una comilla dentro de una CLAVE tambien se escapa (solo ':' cierra una clave).
   assert.deepEqual(JSON.parse(escapeInnerQuotesInStrings('{"na"me": "x"}')), { 'na"me': 'x' })
   // Sin contexto de salvage la reparacion no corre (fail closed): el trigger canonico
-  // con comillas internas sigue siendo invalid_json en la ruta OpenAI de hoy.
+  // con comillas internas es invalid_json cuando la llamada no trae toolSchemas.
+  // (Desde spec-agent-turn-cutoff-openai-parity la ruta OpenAI SI los pasa; esto pina
+  // la puerta del parser, no la ruta.)
   const noSalvage = parseToolCallsFromText('[TOOL CALL]{"name":"Bash","arguments":{"command":"echo "hi""}}[END TOOL CALL]', { allowedToolNames: ['Bash'] })
   assert.equal(noSalvage.toolCalls.length, 0)
   assert.equal(noSalvage.errors[0]?.type, 'invalid_json')

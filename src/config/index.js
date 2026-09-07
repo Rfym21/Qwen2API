@@ -61,7 +61,7 @@ const config = {
         6,
         Math.max(2, parseInt(process.env.AGENT_TURN_MAX_ATTEMPTS, 10) || 3)
     ),
-    // Anthropic 路径：一轮 attempt 里文本通道 tool_use 的上限（默认 24，钳在 4..256）。
+    // Anthropic 与 OpenAI 两条路径共用：一轮 attempt 里文本通道工具调用的上限（默认 24，钳在 4..256）。
     // 模型在叙述的 [TOOL CALL] 之后失控（同一调用重复上百次 / 幻想整段 agent 会话）时，
     // 第 N 个已放行的调用之后立刻终止上游；非数字按默认处理，越界钳位而非回退默认。
     agentTurnMaxToolCalls: (() => {

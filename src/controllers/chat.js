@@ -1351,6 +1351,9 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
@@ -1364,6 +1367,9 @@ const handleChatCompletion = async (req, res) => {
                 has_tools: req.has_tools,
                 tool_choice: req.tool_choice,
                 allowed_tool_names: req.allowed_tool_names,
+                // Puertas de schema del parser (reparacion de comillas / aceptacion tras
+                // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
+                tool_schemas: req.tool_schemas,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {

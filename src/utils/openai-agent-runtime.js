@@ -12,7 +12,13 @@ const { assertNoUpstreamFailure } = require('./upstream-error.js')
 const {
   parseAgentControlText,
   createAgentControlStreamParser,
-  buildAgentRetryHint
+  createAgentTagStripper,
+  buildAgentRetryHint,
+  // Guarda de fuga del canal de texto: una sola implementacion, compartida con
+  // anthropic.js (spec agent-turn-cutoff-openai-parity). El `tag` de log es parametro.
+  createToolCallLedger,
+  resolveTextToolCallCap,
+  createTextChannelRunawayGuard
 } = require('./agent-turn.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger.js')
@@ -41,37 +47,6 @@ const imageMarkdownFromDelta = (delta) => {
     if (item?.image) result.push(`![image](${item.image})`)
   }
   return result
-}
-
-/** 键排序后的规范 JSON：跨通道去重要把 `{"a":1,"b":2}` 与 `{"b": 2, "a": 1}` 判成同一份参数。 */
-const canonicalJson = (value) => {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
-  }
-  return JSON.stringify(value)
-}
-
-/**
- * 本轮的工具调用登记簿：同名 + 规范 JSON 相同的第二个调用是跨通道的副本（文本解析器
- * 与原生累积器各自都能产出同一个调用），只保留先到的。
- * @returns {(call: Object) => boolean} true = 首次见到，可以发射
- */
-const createToolCallLedger = () => {
-  const seen = new Set()
-  return (call) => {
-    const args = call?.function?.arguments || '{}'
-    let canonical
-    try {
-      canonical = canonicalJson(JSON.parse(args))
-    } catch (_) {
-      canonical = args
-    }
-    const key = `${call?.function?.name || ''}\u0000${canonical}`
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  }
 }
 
 /**
@@ -139,8 +114,16 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）。
   const normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames })
   const acceptUpstreamFrame = createUpstreamResponseFilter()
+  // Schemas de las herramientas declaradas (nombre -> JSON Schema), via
+  // chat-middleware.js#processRequestBody. Sin ellos las puertas de schema del parser
+  // (reparacion de comillas internas, aceptacion de un payload tras prosa) y la del
+  // acumulador nativo fallan cerradas — el estado de este camino antes de esta spec.
+  const toolSchemas = options.tool_schemas || null
+  // La puerta de argumentos de las llamadas NATIVAS tambien vive de los schemas
+  // (anthropic.js se los pasa en sus tres sitios): sin ellos un function_call al que le
+  // falta una clave required se promovia al cliente sin un solo error.
   const nativeTools = hasTools
-    ? createNativeToolCallAccumulator({ allowedToolNames })
+    ? createNativeToolCallAccumulator({ allowedToolNames, toolSchemas })
     : null
   const isClientToolName = createClientToolNamePredicate(allowedToolNames)
   // 本轮关闭即晋升的原生调用（takeCompleted 排出）。有了第一个之后，后续正文/思考是平台
@@ -156,6 +139,10 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       promotedNativeCalls.push(call)
     }
   }
+  // El canal de PENSAMIENTO no recibe schemas — paridad exacta con anthropic.js (:1201 y
+  // :1721 pasan solo allowedToolNames). Con ellos, un [TOOL CALL] reparable por comillas o
+  // aceptable tras prosa que solo aparece en think phase se rescataria y se promoveria a
+  // llamada ejecutable aqui pero no en Anthropic. El salvage se queda en answer phase.
   const reasoningStreamParser = typeof options.on_reasoning_delta === 'function'
     ? createToolCallStreamParser({ allowedToolNames })
     : null
@@ -163,8 +150,62 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     ? createAgentControlStreamParser()
     : null
   const controlToolStreamParser = controlStreamParser
-    ? createToolCallStreamParser({ allowedToolNames })
+    ? createToolCallStreamParser({ allowedToolNames, toolSchemas })
     : null
+  // Guarda de fuga del canal de texto — gemela de la rama NO-stream de anthropic.js.
+  // Este runtime bufferiza el turno entero hasta EOF, asi que no hay nada "ya emitido" que
+  // recoger: se parsea en vivo SOLO para detectar, y la ronda cortada se liquida con lo que
+  // el parser de deteccion habia admitido antes del corte. Se crean sin depender de los
+  // callbacks (a diferencia de los parsers de arriba), asi que no-stream y
+  // LEGACY_REASONING_IN_CONTENT=true quedan cubiertos igual.
+  const detectionParser = hasTools
+    ? createToolCallStreamParser({ allowedToolNames, toolSchemas })
+    : null
+  const detectionTagStripper = createAgentTagStripper()
+  const maxTextToolCalls = resolveTextToolCallCap()
+  const textRunaway = detectionParser
+    ? createTextChannelRunawayGuard({
+      parser: detectionParser,
+      maxToolCalls: maxTextToolCalls,
+      label: 'OpenAI Agent',
+      tag: 'AGENT'
+    })
+    : null
+  // textDelta crudo admitido (SIN quitar tags de agente): es el cleanedText de la ronda
+  // cortada y parseAgentControlText necesita los tags intactos para clasificarla. El
+  // stripper de arriba solo alimenta el test de prosa de la regla (c).
+  let streamedRawText = ''
+  const streamedCalls = []
+  const collectTextCall = (call) => {
+    streamedCalls.push(call)
+    return true
+  }
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true
+    textRunaway.cut(rule)
+  }
+  /**
+   * Liquidacion de la ronda cortada, con la forma que devuelve parseToolCallsFromText.
+   * No se re-parsea `answer` entero: una llamada partida entre pushes saldria como
+   * truncated_tool_call, el trigger se filtraria como prosa y la llamada que toco el cap
+   * se perderia — nada de eso coincide con lo que la ronda realmente admitio.
+   * Hueco asumido: el markdown de imagenes entra en `answer` sin pasar por este parser, asi
+   * que una ronda cortada no lo incluye (imagenes y herramientas no coexisten en t2t).
+   */
+  const settledTextRound = () => ({
+    cleanedText: streamedRawText,
+    toolCalls: streamedCalls,
+    // Una ronda cortada NO superficializa errores del parser — ni los del push disparador ni
+    // los de pushes anteriores. evaluateOpenAIAgentAttempt mira `toolErrors.length > 0` ANTES
+    // que `toolCalls.length > 0`: cualquier error superviviente reintentaria la ronda y
+    // volveria a lanzar la fuga que el corte acaba de detener, hasta agotar intentos y morir
+    // en 502. Es la paridad con anthropic.js, donde decideRetryReason corta en seco con
+    // `if (emittedCalls) return null` (:1080) / `if (toolCalls.length > 0) return null`
+    // (:1749) antes de mirar los errores: una ronda cortada con llamadas admitidas SIEMPRE
+    // se entrega.
+    errors: [],
+    residueSpans: detectionParser.getResidueSpans().filter(span => span.channel === 'text')
+  })
   let streamedVisibleText = ''
   // Texto rescatado de un <tool_call> que no parseó. No se emite aquí: el turn gate
   // todavía puede rechazar esta ronda, y emitirlo ahora lo duplicaría en cada intento
@@ -314,6 +355,15 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     // 晋升之后的叙述（"工具不可用"）不进 answer/reasoning —— 调用前的正文已经在 answer 里了。
     if (promotedNativeCalls.length > 0) return
     if (normalized.phase === 'think') {
+      // Regla (c) en forma "think": pensar despues de una llamada del canal de texto es el
+      // arranque de la fuga. Se corta y este frame no entra ni en reasoning ni al cliente.
+      const thinkRule = textRunaway?.inspectThink(normalized.content)
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule)
+        return
+      }
+      // Ya armado: el think en blanco tampoco entra (inspectThink no dispara con blancos).
+      if (textRunaway?.armed()) return
       reasoning += normalized.content
       if (reasoningStreamParser) {
         const streamed = reasoningStreamParser.push(normalized.content)
@@ -329,21 +379,62 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       pendingImages.forEach(item => emittedImages.add(item))
       pendingImages.length = 0
     }
+    if (textRunaway) {
+      const parsed = detectionParser.push(normalized.content)
+      const stripped = detectionTagStripper.push(parsed.textDelta)
+      // Reglas (b)/(c): al disparar, el texto de ESTE push no se admite; las llamadas ya
+      // completadas en el mismo push si se recogen (bucle de abajo).
+      const pushRule = textRunaway.inspectPush(parsed, stripped)
+      if (pushRule) cutTextChannelTurn(pushRule)
+      else streamedRawText += parsed.textDelta
+      // Reglas (a)/(d): la llamada que toca el cap se entrega igual, y ahi se para.
+      for (const call of parsed.completedCalls) {
+        // El cap manda tambien mientras se drena el push que disparo el corte. Despues de un
+        // corte por regla NO-cap, inspectCall deja de devolver reglas (incluida 'cap'), asi
+        // que sin este tope un solo delta con 41 llamadas completas las entregaba todas.
+        // streamedCalls.length === admittedCount de la guarda (collectTextCall solo corre
+        // cuando el registro admite la llamada).
+        if (streamedCalls.length >= maxTextToolCalls) break
+        const callRule = textRunaway.inspectCall(call, collectTextCall)
+        if (!callRule) continue
+        cutTextChannelTurn(callRule)
+        if (callRule === 'cap') break
+      }
+      textRunaway.endPush()
+      // Cortado: el push disparador no llega a `answer`, ni al controlStreamParser, ni al
+      // cliente. `stopRequested` destruye el upstream en el siguiente frame (sse.js).
+      if (textRunaway.cutRule()) return
+    }
     await appendAnswer(normalized.content)
   }, { shouldStop: () => stopRequested })
 
-  if (reasoningStreamParser) {
+  const textChannelCut = !!textRunaway?.cutRule()
+  // Tras un corte no se hace flush de ningun parser de texto: lo que queda en el buffer es
+  // el resto del push descontrolado (medio trigger / medio payload) y el flush lo condenaria
+  // como truncated_tool_call -> toolErrors>0 -> reintento (evaluate :461), anulando el corte.
+  if (reasoningStreamParser && !textChannelCut) {
     const streamed = reasoningStreamParser.flush()
     await emitReasoningDelta(streamed.textDelta)
     recoveredReasoning += streamed.recoveredText
   }
-  if (controlStreamParser) {
+  // El mismo guarda para la cadena control -> controlTool -> cliente. Hoy es defensa en
+  // profundidad, no un camino vivo: el controlStreamParser solo emite dentro de un cuerpo
+  // <agent_final>, y una ronda cortada que arrastre ese envoltorio la rechaza la puerta
+  // (invalid_control) antes de entregar nada. Se queda porque la regla es "tras un corte no
+  // se hace flush de NINGUN parser de texto" y el dia que la puerta se relaje esto ya esta bien.
+  if (controlStreamParser && !textChannelCut) {
     await consumeControlStreamResult(controlStreamParser.flush())
   }
 
-  const textTools = hasTools
-    ? parseToolCallsFromText(answer, { allowedToolNames })
-    : { cleanedText: answer, toolCalls: [], errors: [] }
+  // La ronda cortada se liquida con el parser de deteccion; las demas siguen re-parseando
+  // `answer` entero como hasta ahora.
+  const textTools = textChannelCut
+    ? settledTextRound()
+    : (hasTools
+      ? parseToolCallsFromText(answer, { allowedToolNames, toolSchemas })
+      : { cleanedText: answer, toolCalls: [], errors: [] })
+  // Sin schemas, igual que el parser de streaming del canal de pensamiento (paridad con
+  // anthropic.js:1721): el rescate por schema no promueve llamadas desde el think phase.
   const reasoningTools = hasTools && textTools.toolCalls.length === 0 && !textTools.cleanedText.trim()
     ? parseToolCallsFromText(reasoning, { allowedToolNames })
     : { cleanedText: reasoning, toolCalls: [], errors: [] }

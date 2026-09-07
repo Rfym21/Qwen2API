@@ -55,7 +55,9 @@ const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
  * 第一个内容（buildToolSystemPrompt 的措辞不动），但解析器对叙述**宽容**：正文之后的
  * 触发器（或行首的裸负载 + 方括号闭标记）不再按位置一刀切压制，而是过**语义门**
  * （gateAfterProsePayload：白名单 + required 键）—— 且只在调用方带齐抢救上下文
- * （白名单 + toolSchemas，今天只有 anthropic 路径）时放行，否则保持旧的压制。
+ * （白名单 + toolSchemas）时放行，否则保持旧的压制。anthropic 与 OpenAI 的 Agent
+ * 运行时都传 toolSchemas（后者自 spec-agent-turn-cutoff-openai-parity 起），但都**只在
+ * answer phase**：think phase 的解析器两条路径都不带 schema。
  * 第一位置的规则一字不改。这样做的理由与接受的风险写在 spec 的 Intent 里：位置只是
  * 意图的弱代理，它从没保护过位置 0，却丢掉了每一个"Let me check…"后面的真实调用。
  *
@@ -1623,8 +1625,9 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   // 捏出 tool_use。正则触发器保持旧行为。
   const salvage = !!allowedToolNames;
   // 引号修复 / 尾巴名字抢救的上下文：非空白名单**且** toolSchemas 齐备才存在
-  // （fail closed —— schema 闸门是抢救的一半边界）。只有 anthropic 路径传
-  // toolSchemas；chat.js / openai 路径不传，行为不变。
+  // （fail closed —— schema 闸门是抢救的一半边界）。anthropic 路径与 OpenAI Agent 运行时
+  // （openai-agent-runtime.js，自 spec-agent-turn-cutoff-openai-parity）都传 toolSchemas，
+  // 但只在 answer phase；think phase 的解析与 chat.js 的旧非-Agent 分支不传，行为不变。
   const repairSalvage = allowedToolNames && options.toolSchemas
     ? { allowedToolNames, toolSchemas: options.toolSchemas }
     : null;
@@ -1940,7 +1943,8 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     // （"Let me check…"、"## Plan"），于是每一个叙述后的真调用都无声丢失。现在：
     // 调用方带齐抢救上下文（白名单 + toolSchemas）时，先构造负载，过
     // gateAfterProsePayload（白名单 + required 键）就晋升为调用，每次留一行来源日志；
-    // 不过（或没有抢救上下文 —— OpenAI 路径今天不传 toolSchemas，fail closed）则
+    // 不过（或没有抢救上下文 —— 没有 toolSchemas 就 fail closed：think phase 的解析和
+    // chat.js 的旧非-Agent 分支正是这种情况）则
     // 按旧规矩压制：不产生调用、不进 errors、不点火重试，但整段仍然**吞掉**（连带
     // 紧随其后的重复闭标记）：它是工具标记，不是回答。放回正文会让裸协议漏给客户端
     // —— 模型在 thinking 里写 `checking <tool_call>{…}</tool_call>` 正是这一种。
