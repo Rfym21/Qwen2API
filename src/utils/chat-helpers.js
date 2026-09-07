@@ -173,6 +173,61 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
 }
 
 /**
+ * 把 parserMessages 产出的**图片**项从 content[] 移到 Qwen 的 files[] 通道。
+ *
+ * 为什么必须换通道：上游对「content[] 里带图」+「files[] 里带外置上下文文档」这个组合
+ * 返回 500。实测四格（本地复现，qwen3.8-max）：107KiB 无图 files=[txt] → 200；
+ * 61KiB 有图 files=[] → 200；108KiB 有图 files=[txt] → 500（换通道后 → 200）。
+ * 是形状问题，不是体积问题。
+ *
+ * 只搬图片：files[] 里唯一被上游验证过的形状是 {type:'image', url}
+ * （chat.image.video.js 的 image_edit，仓库里仅有的两处 files.push）。视频没有这样的
+ * 先例，所以继续留在 content[] 里，行为与今天完全一致。
+ *
+ * 也只搬 http(s) 图片：被验证过的形状是「已上传的 https URL」。normalizeMediaContentItem
+ * 没能识别的 data: URI 会原样落到这里，把几 MB 的 base64 塞进 files[] 既没有先例，
+ * 也会把请求体撑爆——这种项留在 content[] 里，维持今天的行为。
+ *
+ * @param {string|Array} content - parserMessages 产出的消息内容
+ * @returns {{ content: string|Array, files: Array<{type: 'image', url: string}> }}
+ */
+const extractMediaToFiles = (content) => {
+    if (!Array.isArray(content)) {
+        return { content, files: [] }
+    }
+
+    const files = []
+    const remaining = []
+    for (const item of content) {
+        const descriptor = isMediaContentItem(item) ? getMediaDescriptor(item) : null
+        if (descriptor?.url && descriptor.mediaType === 'image' && HTTP_URL_REGEX.test(descriptor.url)) {
+            files.push({ type: 'image', url: descriptor.url })
+        } else {
+            remaining.push(item)
+        }
+    }
+
+    // 没有图片就原样返回：无图片请求的上游请求体必须逐字节不变（视频也走这一支）。
+    if (files.length === 0) {
+        return { content, files: [] }
+    }
+
+    // 只剩一个纯文本项时收敛回字符串，正是 image_edit 里被上游验证过的形状
+    // （content 是文本，图片全部走 files[]）。
+    if (remaining.length === 1 && remaining[0]?.type === 'text' && typeof remaining[0].text === 'string') {
+        return { content: remaining[0].text, files }
+    }
+
+    // 内容里除了图片什么都没有：绝不能留下 content: []（空提示词）。收敛成空字符串，
+    // 也就是 image_edit 那个被验证过的形状——文本内容 + files[]。
+    if (remaining.length === 0) {
+        return { content: '', files }
+    }
+
+    return { content: remaining, files }
+}
+
+/**
  * 判断聊天类型
  * @param {string} model - 模型名称
  * @param {boolean} search - 是否搜索模式
@@ -598,6 +653,7 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
 }
 
 module.exports = {
+    extractMediaToFiles,
     isChatType,
     isThinkingEnabled,
     parserModel,

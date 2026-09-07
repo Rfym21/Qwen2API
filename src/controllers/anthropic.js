@@ -3,7 +3,7 @@ const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const {
-  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase,
+  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
   createUpstreamDeltaNormalizer, createClientToolNamePredicate
 } = require('../utils/chat-helpers.js');
 const {
@@ -134,6 +134,21 @@ const normalizeAnthropicToolChoice = (toolChoice) => {
 };
 
 /**
+ * 把一个 Anthropic `image` 块转成 parserMessages 认识的 OpenAI `image_url` 项。
+ * base64 source 转 data URI（由 normalizeMediaContentItem 负责上传），url source 直接透传。
+ * 单一实现：普通 image 块和 tool_result 里的 image 块共用它。
+ * @param {Object} block - Anthropic image 块
+ * @returns {{type: 'image_url', image_url: {url: string}}|null} 无法取到 url 时返回 null
+ */
+const anthropicImageBlockToItem = (block) => {
+  const src = block?.source || {};
+  const url = src.type === 'base64' && src.data
+    ? `data:${src.media_type || 'image/png'};base64,${src.data}`
+    : (src.url || '');
+  return url ? { type: 'image_url', image_url: { url } } : null;
+};
+
+/**
  * 把 Anthropic 风格的消息（含 content blocks 与 tool_use/tool_result）展开为
  * OpenAI 风格消息列表。tool_use 转为 assistant.tool_calls；tool_result 转为
  * role=tool 消息（保留 tool_call_id），后续由 foldToolMessages 折叠。
@@ -193,31 +208,36 @@ const flattenAnthropicMessages = (messages) => {
           : Array.isArray(block.content)
             ? block.content.filter(b => b?.type === 'text').map(b => b.text || '').join('\n')
             : JSON.stringify(block.content ?? '');
-        out.push({
+        const toolMessage = {
           role: 'tool',
           tool_call_id: block.tool_use_id || '',
           content: resultContent
-        });
+        };
+        // Claude Code 的 Read 把图片放在 tool_result.content 里。resultContent 依旧只取
+        // text 块（保持逐字节不变），图片改走 media 旁路：role=tool 的 content 必须是
+        // 字符串，foldToolMessages 会把非字符串 JSON.stringify 掉，图片项塞进去就废了。
+        const toolResultMedia = Array.isArray(block.content)
+          ? block.content.filter(b => b?.type === 'image').map(anthropicImageBlockToItem).filter(Boolean)
+          : [];
+        if (toolResultMedia.length > 0) toolMessage.media = toolResultMedia;
+        out.push(toolMessage);
       } else if (block?.type === 'text' && typeof block.text === 'string') {
         collectedTextParts.push(block.text);
       } else if (block?.type === 'image') {
         // 透传 image 块给现有 parserMessages 处理（OpenAI image_url 形态）
-        const src = block.source || {};
-        const url = src.type === 'base64' && src.data
-          ? `data:${src.media_type || 'image/png'};base64,${src.data}`
-          : (src.url || '');
-        if (url) {
+        const imageItem = anthropicImageBlockToItem(block);
+        if (imageItem) {
           if (collectedTextParts.length > 0) {
             out.push({
               role: 'user',
               content: [
                 { type: 'text', text: collectedTextParts.join('') },
-                { type: 'image_url', image_url: { url } }
+                imageItem
               ]
             });
             collectedTextParts.length = 0;
           } else {
-            out.push({ role: 'user', content: [{ type: 'image_url', image_url: { url } }] });
+            out.push({ role: 'user', content: [imageItem] });
           }
         }
       }
@@ -247,6 +267,24 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 1. 展开 Anthropic 消息（tool_use/tool_result 折叠由 foldToolMessages 完成）
   let flat = flattenAnthropicMessages(messages);
+  // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
+  // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
+  // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
+  const currentTurnMedia = [];
+  let scanFrom = flat.length - 1;
+  // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
+  // 跳过它再开始找边界，否则同一回合 tool_result 里的图片永远收不到。
+  if (flat[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  for (let i = scanFrom; i >= 0; i--) {
+    const candidate = flat[i];
+    if (candidate?.role === 'assistant') break;
+    if (Array.isArray(candidate?.media)) currentTurnMedia.unshift(...candidate.media);
+  }
+  // media 是内部旁路，绝不能进上游请求体。历史消息里的 media 携带完整 base64 data URI，
+  // 目前只是碰巧被 foldToolMessages 丢掉，而它只在带工具时才跑——所以在这里全量清掉。
+  for (const message of flat) {
+    if (message && 'media' in message) delete message.media;
+  }
   const systemText = normalizeAnthropicSystem(system);
 
   // 2. system 文本拼到首条用户消息内容前缀（不要作为独立 system 消息，
@@ -257,6 +295,17 @@ const buildInternalRequest = async (anthropicReq) => {
 
   if (hasTools) {
     flat = foldToolMessages(flat);
+  }
+
+  // 折叠之后再挂图片：parserMessages 只处理最后一条消息里的媒体，挂在这里的图片
+  // 才会被上传，而工具结果正文仍然留在 "# Current message" 里（agent 回合语义不变）。
+  if (currentTurnMedia.length > 0 && flat.length > 0) {
+    const lastFlat = flat[flat.length - 1];
+    if (typeof lastFlat.content === 'string') {
+      lastFlat.content = [{ type: 'text', text: lastFlat.content }, ...currentTurnMedia];
+    } else if (Array.isArray(lastFlat.content)) {
+      lastFlat.content = [...lastFlat.content, ...currentTurnMedia];
+    }
   }
 
   // 3. 走现有 parserMessages 复用图片上传与 thinking 配置
@@ -315,6 +364,9 @@ const buildInternalRequest = async (anthropicReq) => {
   const lastParsed = Array.isArray(parsedMessages) && parsedMessages.length > 0
     ? parsedMessages[parsedMessages.length - 1]
     : { role: 'user', content: '' };
+  // 媒体从 content[] 换到 files[]：content[] 带图 + files[] 带外置上下文文档的组合
+  // 会让上游 500（详见 extractMediaToFiles）。无媒体时原样返回，请求体逐字节不变。
+  const { content: envelopeContent, files: envelopeFiles } = extractMediaToFiles(lastParsed.content || '');
 
   const envelopeMessage = {
     id: null,
@@ -323,9 +375,9 @@ const buildInternalRequest = async (anthropicReq) => {
     parent_id: null,
     childrenIds: [generateUUID()],
     role: lastParsed.role || 'user',
-    content: lastParsed.content || '',
+    content: envelopeContent,
     user_action: 'chat',
-    files: [],
+    files: envelopeFiles,
     timestamp: now,
     models: [parsedModel],
     model: '',
@@ -2125,6 +2177,7 @@ module.exports = {
   buildAnthropicCompatibilityHeaders,
   // 暴露内部辅助以便测试
   flattenAnthropicMessages,
+  buildInternalRequest,
   normalizeAnthropicTools,
   normalizeAnthropicToolChoice,
   normalizeAnthropicSystem,

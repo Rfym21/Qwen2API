@@ -1,5 +1,5 @@
 const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
@@ -171,8 +171,22 @@ const processRequestBody = async (req, res, next) => {
     // 将解析后的消息填充到 React UI 格式的消息对象中
     // 取最后一条用户消息作为主消息内容，历史消息通过 content 传递
     const lastMessage = parsedMessages[parsedMessages.length - 1] || { role: 'user', content: '' }
+    // 图片从 content[] 换到 files[]：content[] 带图 + files[] 带外置上下文文档的组合
+    // 会让上游 500（详见 chat-helpers.js#extractMediaToFiles）。
+    //
+    // 只对走文本控制器的 chat_type 生效。routes/chat.js 的分发表把 t2t / search 交给
+    // handleChatCompletion，其余（t2i / t2v / image_edit，以及未知类型的兜底）全部交给
+    // handleImageVideoCompletion —— 后者拿的就是这个 req.body，并且直接读
+    // messages[0].content，期待原始的 content 数组。换成字符串会让 image_edit 走进
+    // `!Array.isArray(userPrompt)` 分支退化成 t2i，把输入图片整个丢掉。
+    const splitsMediaToFiles = chatType === 't2t' || chatType === 'search'
+    const { content: envelopeContent, files: envelopeFiles } = splitsMediaToFiles
+      ? extractMediaToFiles(lastMessage.content || '')
+      : { content: lastMessage.content || '', files: [] }
     body.messages[0].role = lastMessage.role || 'user'
-    body.messages[0].content = lastMessage.content || ''
+    body.messages[0].content = envelopeContent
+    // files 的键位在上面的信封字面量里（对齐 React UI 的键顺序，别挪），这里只填内容。
+    body.messages[0].files.push(...envelopeFiles)
     body.messages[0].chat_type = chatType
     body.messages[0].sub_chat_type = chatType
     body.messages[0].feature_config.thinking_enabled = thinkingConfig.thinking_enabled
