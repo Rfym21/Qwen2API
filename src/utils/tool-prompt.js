@@ -1466,6 +1466,31 @@ const compressToolDefinition = (tool) => {
 };
 
 /**
+ * 折叠出来的历史标记要带序号，结果才有地址可寻。
+ *
+ * 真实语料（192 段 Claude Code 会话，15337 个 tool_use）里 1451 次跨回合重复调用中，
+ * 925 次（63.7%）在原调用和重复之间还夹着**同名不同参**的另一次调用。二十次 Read
+ * 折出来是二十个一模一样的 `[TOOL RESULT: Read]`，按消息顺序排开，没有任何东西把某个
+ * 结果绑回它的调用 —— 模型分不清哪次读到的是哪个路径，于是重读。Read 同时是调用最多
+ * 和重复最多的工具，正是这个 signature。
+ *
+ * 序号只出现在**折叠的历史**里。模型被要求写的实时标记仍然是不带任何属性的
+ * TOOL_CALL_OPEN（见 buildToolSystemPrompt 里那条「marker 从不带属性」的规则，
+ * 解析器与之锁步）。这里编号的是模型**读**到的过去，不是它现在要**写**的东西。
+ * 即便模型照抄了编号形式，触发器只认前缀，负载照样能恢复（tool-correlation.test.js 有钉）。
+ * @param {number|string} ordinal - 调用序号
+ * @returns {string} 带序号的调用开标记
+ */
+const numberedCallMarker = (ordinal) => TOOL_CALL_OPEN.replace(/\]$/, ` #${ordinal}]`);
+
+/**
+ * 带序号的结果开标记前缀，和 TOOL_RESULT_OPEN 锁步（换分隔符时只改一处）。
+ * @param {number|string} ordinal - 它回答的那次调用的序号
+ * @returns {string} 形如 `[TOOL RESULT #3: `
+ */
+const numberedResultOpen = (ordinal) => TOOL_RESULT_OPEN.replace(/:[ \t]*$/, ` #${ordinal}: `);
+
+/**
  * 构建用于注入 system 消息的工具调用提示词
  * @param {Array<Object>} tools - OpenAI 风格工具定义列表
  * @param {Object} [options] - 可选参数
@@ -1499,9 +1524,11 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '',
     'Tool results come back to you as user messages in this form:',
     '',
-    `${TOOL_RESULT_OPEN}<tool_name>]`,
+    `${numberedResultOpen('n')}<tool_name>]`,
     '<result text or JSON>',
     TOOL_RESULT_CLOSE,
+    '',
+    'Past calls are numbered in call order; a result carries the number of the `[TOOL CALL #n]` it answers, so two calls to the same tool are told apart. Never write a number in a marker you emit.',
     '',
     'Rules:',
     `- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a \`${TOOL_CALL_OPEN}\` block. Call the tool instead of describing the action.`,
@@ -1542,7 +1569,10 @@ const buildToolSystemPrompt = (tools, options = {}) => {
 const foldToolMessages = (messages) => {
   if (!Array.isArray(messages)) return messages;
 
-  const callIdToName = new Map();
+  // id -> { name, ordinal }。ordinal 在**本次请求内**从 1 开始按调用顺序单调递增，
+  // 结果消息靠 tool_call_id 回链到它。旧的 callIdToName 只给结果定名，定不了地址。
+  const callIdToRef = new Map();
+  let callOrdinal = 0;
 
   return messages.map((message) => {
     if (!message || typeof message !== 'object') return message;
@@ -1565,12 +1595,13 @@ const foldToolMessages = (messages) => {
         }
         const name = fn?.name || 'unknown';
         const id = call?.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
-        callIdToName.set(id, name);
+        callOrdinal += 1;
+        callIdToRef.set(id, { name, ordinal: callOrdinal });
         // 提示词里写的是 {name, arguments} 两个键，这里也只写两个。多出来的 id 是
         // <tool_call_id_1> 这一族坏标签的种子，而模型从来没有自己吐出过 id（name ×36、id ×0）。
-        // callIdToName 仍然留着 id，用来给下面的结果消息定名。
+        // callIdToRef 仍然留着 id，用来给下面的结果消息定名**和**定址。
         const payload = { name, arguments: args ?? {} };
-        return `${TOOL_CALL_OPEN}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
+        return `${numberedCallMarker(callOrdinal)}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
       });
       const original = typeof message.content === 'string' ? message.content : '';
       return {
@@ -1581,13 +1612,16 @@ const foldToolMessages = (messages) => {
 
     if (message.role === 'tool' || message.role === 'function') {
       const callId = message.tool_call_id || '';
-      const name = message.name || callIdToName.get(callId) || (message.role === 'function' ? 'function' : 'tool');
+      const ref = callId ? callIdToRef.get(callId) : null;
+      const name = message.name || ref?.name || (message.role === 'function' ? 'function' : 'tool');
       const content = typeof message.content === 'string'
         ? (message.content || 'null')
         : JSON.stringify(message.content ?? null);
+      // 认领不到调用就不编号：随便派一个序号等于指向**别人**的调用，比没有地址更坏。
+      const open = ref ? numberedResultOpen(ref.ordinal) : TOOL_RESULT_OPEN;
       return {
         role: 'user',
-        content: `${TOOL_RESULT_OPEN}${sanitizeMarkerName(name)}]\n${neutraliseResultMarkers(content)}\n${TOOL_RESULT_CLOSE}`
+        content: `${open}${sanitizeMarkerName(name)}]\n${neutraliseResultMarkers(content)}\n${TOOL_RESULT_CLOSE}`
       };
     }
 
@@ -1604,7 +1638,10 @@ const foldToolMessages = (messages) => {
  */
 const neutraliseResultMarkers = (value) => String(value)
   .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
-  .replace(/\[[ \t]*TOOL[ \t]+RESULT[ \t]*:/gi, '(TOOL RESULT:')
+  // 只打断头字符，不重写整段。结果头现在可能带序号（`[TOOL RESULT #3: X]`），旧写法
+  // 要求 RESULT 后面**紧跟冒号**，认不出编号形式 —— 于是不可信正文可以伪造一个编号头，
+  // 冒充某次真实调用的答复。这里不再要求冒号：`[` 后面是 TOOL RESULT 就失效。
+  .replace(/\[(?=[ \t]*TOOL[ \t]+RESULT\b)/gi, '(')
   // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
   // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
   // 触发器正则（与之锁步）就永远匹配不上。

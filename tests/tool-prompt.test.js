@@ -47,7 +47,7 @@ test('empty tool results remain visible in Agent history', () => {
     { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }] },
     { role: 'tool', tool_call_id: 'call_1', content: '' }
   ])
-  assert.match(folded[1].content, /^\[TOOL RESULT: read_file\]\nnull\n\[END TOOL RESULT\]$/)
+  assert.match(folded[1].content, /^\[TOOL RESULT #1: read_file\]\nnull\n\[END TOOL RESULT\]$/)
 })
 
 test('legacy function_call and function result messages remain executable history', () => {
@@ -56,7 +56,7 @@ test('legacy function_call and function result messages remain executable histor
     { role: 'function', name: 'read_file', content: 'file body' }
   ])
   assert.equal(folded[0].role, 'assistant')
-  assert.match(folded[0].content, /\[TOOL CALL\]/)
+  assert.match(folded[0].content, /\[TOOL CALL #1\]/)
   assert.match(folded[0].content, /"name":"read_file"/)
   assert.equal(folded[1].role, 'user')
   assert.match(folded[1].content, /^\[TOOL RESULT: read_file\]\n/)
@@ -543,7 +543,9 @@ test('tolerant tags: history is still written in the canonical form', () => {
       tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"a"}' } }]
     }
   ])
-  assert.match(folded[0].content, /^\[TOOL CALL\]\n/)
+  // El ordinal solo existe en la historia foldeada (ver tool-correlation.test.js):
+  // el marcador que el prompt le pide EMITIR al modelo sigue sin numero.
+  assert.match(folded[0].content, /^\[TOOL CALL #1\]\n/)
   assert.match(folded[0].content, /\n\[END TOOL CALL\]$/)
   // La forma nativa nunca se reescribe: cada aparicion en la historia re-sembraria
   // el formato que la plataforma intercepta.
