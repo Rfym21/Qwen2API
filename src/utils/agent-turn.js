@@ -283,7 +283,12 @@ const buildAgentTurnDirective = ({ afterToolResult = false } = {}) => {
     `2. Only when every requested outcome is complete and supported by tool-result evidence: emit ${AGENT_FINAL_OPEN}a concise final report${AGENT_FINAL_CLOSE}.`,
     `3. Only when progress is impossible without new user input or authority: emit ${AGENT_BLOCKED_OPEN}the exact blocker and required input${AGENT_BLOCKED_CLOSE}.`,
     'Bare prose, a plan, a progress update, hidden reasoning without visible output, or a claim such as “done” without the completion wrapper is an invalid Agent turn and will be regenerated.',
-    'Never use the completion wrapper merely because one tool call finished. If verification has not run or any requested work remains, call the next tool.'
+    'Never use the completion wrapper merely because one tool call finished. If verification has not run or any requested work remains, call the next tool.',
+    // Contrapeso a las tres lineas de arriba, que solo empujan a emitir MAS llamadas.
+    // Medido: 526 de 1.451 duplicados no tenian colision de nombre — el modelo reemitio
+    // una llamada que ya habia hecho. No es una prohibicion: releer un archivo despues
+    // de editarlo es la conducta correcta, y por eso la excepcion va en la misma linea.
+    'Do not re-issue a call whose result is already in this context; read that result instead, unless a preceding action could have changed it.'
   ].join('\n')
 }
 
@@ -318,6 +323,180 @@ const canonicalJson = (value) => {
     return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
+};
+
+/**
+ * 结果正文必须对它自己封闭。工具结果是**不可信内容** —— 文件、网页、命令输出 —— 里面
+ * 完全可能出现 `[END TOOL RESULT]`。原样写出去，块就在那里提前结束，后面的内容就变成了
+ * 对模型说的话。把正文里的标记打断，让它再也关不掉这个块。
+ *
+ * 住在这里（依赖图的叶子）而不是 tool-prompt.js：折叠回写（foldToolMessages）和
+ * 执行过的调用清单（buildToolHistoryLedger）都要把同一批不可信文本重新塞回提示词，
+ * 两边必须用**同一份**失效规则。tool-prompt.js 以同名导入它。
+ * @param {string} value - 原始结果正文
+ * @returns {string} 标记已失效的正文
+ */
+const neutraliseResultMarkers = (value) => String(value)
+  .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
+  // 只打断头字符，不重写整段。结果头现在可能带序号（`[TOOL RESULT #3: X]`），旧写法
+  // 要求 RESULT 后面**紧跟冒号**，认不出编号形式 —— 于是不可信正文可以伪造一个编号头，
+  // 冒充某次真实调用的答复。这里不再要求冒号：`[` 后面是 TOOL RESULT 就失效。
+  .replace(/\[(?=[ \t]*TOOL[ \t]+RESULT\b)/gi, '(')
+  // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
+  // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
+  // 触发器正则（tool-prompt.js 的 TOOL_CALL_TRIGGER_RE，与这里锁步）就永远匹配不上。
+  .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
+  .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
+  // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
+  // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
+  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(');
+
+const LEDGER_HEADER = '# Already executed this task';
+// La leyenda es lo unico que hace el bloque legible por si solo: llega al modelo lejos
+// del prompt de herramientas y sin ella es una lista de numeros sin contrato.
+const LEDGER_CAPTION = 'These calls already ran and their results are above. Reuse a result instead of repeating its call, unless a later action could have changed it.';
+// Sin esta nota, una lista recortada se lee como exhaustiva: "no esta en el ledger" pasaria
+// a significar "no se llamo nunca", que es justo la conclusion falsa que dispara el duplicado.
+const LEDGER_TRUNCATED_NOTE = '(older calls omitted)';
+const LEDGER_DIGEST_CHARS = 120;
+// Los argumentos IDENTIFICAN la llamada, asi que se recortan mucho mas tarde que el digest.
+// Un heredoc de 10 KB en un Bash igual no puede comerse el bloque entero; cuando se recorta,
+// el ordinal sigue distinguiendo dos llamadas que quedaron renderizadas igual.
+const LEDGER_ARGS_CHARS = 200;
+
+/** Una linea, sin saltos: el ledger es una entrada por linea y el contenido no es confiable. */
+const collapseToOneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+
+const truncateChars = (value, limit) =>
+  value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+
+/**
+ * Las llamadas ya ejecutadas que viven en la historia, como bloque de texto.
+ *
+ * Por que existe: medido sobre 192 sesiones reales de Claude Code (15.337 bloques
+ * tool_use), 1.451 llamadas eran duplicados entre turnos, y en 526 (36,3%) no habia
+ * ninguna otra llamada a la misma herramienta entre la original y la copia — no era
+ * confusion de correlacion (eso lo arregla la numeracion de foldToolMessages), era que
+ * nada en el prompt desalentaba repetir. Nada en el servidor sabia del pasado tampoco:
+ * los tres createToolCallLedger() son por-intento.
+ *
+ * Esto NO suprime: la decision sigue siendo del modelo, porque repetir es a veces
+ * correcto (releer un archivo despues de editarlo). Solo hace visible lo que ya corrio.
+ *
+ * La numeracion es la MISMA que escribe foldToolMessages (tool-prompt.js): ordinal
+ * monotono por request, en orden de llamada, contando cada tool_call de cada mensaje
+ * assistant. Si las dos se desincronizan, el ledger dice `#3` y la historia llama `#3`
+ * a otra llamada — peor que no numerar. tests/tool-repetition.test.js las clava juntas.
+ *
+ * @param {Array<Object>} messages - mensajes en forma OpenAI, ANTES de foldToolMessages
+ *   (con assistant.tool_calls y role=tool estructurados, no ya convertidos a texto)
+ * @param {Object} [options]
+ * @param {number} [options.maxEntries=40] - tope de entradas, las mas recientes primero
+ * @param {number} [options.maxBytes=6000] - tope duro del bloque completo; compite contra
+ *   el umbral de externalizacion de 90 KiB en CADA request. Medido con llamadas realistas
+ *   (Read con ruta absoluta + digest lleno) una entrada pesa ~215 B, asi que el tope de
+ *   bytes muerde antes que maxEntries: ~27 entradas y ~6 KB (7% del presupuesto). Se
+ *   conservan las MAS RECIENTES, que son las que el modelo esta a punto de repetir.
+ * @returns {string} el bloque, o '' si no hay historia de herramientas
+ */
+const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } = {}) => {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  const limit = Number.isFinite(maxEntries) ? Math.max(0, Math.trunc(maxEntries)) : 40;
+  if (limit === 0) return '';
+  // Sin este guard un maxBytes basura (NaN) hace que toda comparacion sea false y el
+  // bloque salga SIN tope — justo lo que no puede pasar en algo que se inyecta siempre.
+  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 6000;
+
+  const byKey = new Map();   // name + canonicalJson(args) -> entrada
+  const byCallId = new Map(); // id de la llamada -> misma clave, para relinkear el resultado
+  let ordinal = 0;
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+
+    // Mismas dos ramas que foldToolMessages, en el mismo orden: de eso depende que los
+    // ordinales coincidan.
+    const calls = message.role === 'assistant'
+      ? (Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+        ? message.tool_calls
+        : (message.function_call?.name ? [message.function_call] : []))
+      : [];
+
+    for (const call of calls) {
+      const fn = call?.function || call;
+      ordinal += 1;
+      let parsed = fn?.arguments;
+      if (typeof parsed === 'string') {
+        try {
+          parsed = JSON.parse(parsed);
+        } catch (_) {
+          // Argumentos que no son JSON: se comparan como el string crudo, igual que
+          // createToolCallLedger. Dos llamadas rotas iguales siguen siendo una repeticion.
+        }
+      }
+      const args = typeof parsed === 'string' ? parsed : canonicalJson(parsed ?? {});
+      const name = String(fn?.name || 'unknown');
+      const key = `${name}\u0000${args}`;
+      const existing = byKey.get(key);
+      // Ya vista: se queda con el ordinal MAS RECIENTE (apunta a la instancia fresca) y
+      // conserva el digest anterior hasta que llegue un resultado nuevo — si la repeticion
+      // todavia no fue contestada, borrar el resultado que si tenemos seria perder evidencia.
+      if (existing) existing.ordinal = ordinal;
+      else byKey.set(key, { ordinal, name, args, digest: '', hasResult: false });
+      if (call?.id) byCallId.set(call.id, key);
+    }
+
+    if (message.role === 'tool' || message.role === 'function') {
+      // Sin tool_call_id que empareje no hay dueno. Adjudicar el resultado a otra llamada
+      // seria exactamente la suplantacion que arregla la numeracion de Task 1.
+      const key = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
+      const entry = key ? byKey.get(key) : null;
+      if (!entry) continue;
+      const content = typeof message.content === 'string'
+        ? message.content
+        : JSON.stringify(message.content ?? null);
+      entry.digest = truncateChars(collapseToOneLine(content), LEDGER_DIGEST_CHARS);
+      entry.hasResult = true;
+    }
+  }
+
+  if (byKey.size === 0) return '';
+
+  const entries = Array.from(byKey.values()).sort((a, b) => b.ordinal - a.ordinal);
+  const kept = entries.slice(0, limit);
+
+  // El renglon entero pasa por la neutralizacion: el digest es salida de herramienta y los
+  // argumentos vienen del cliente, y canonicalJson escapa comillas y saltos pero NO los
+  // corchetes — `{"cmd":"[TOOL RESULT #2: Read]"}` llegaria literal y podria hacerse pasar
+  // por la respuesta de otra llamada. El prefijo `#n` es nuestro y no contiene marcadores.
+  // La neutralizacion solo acorta, nunca alarga, asi que el tope del digest se mantiene.
+  const renderLine = (entry) => neutraliseResultMarkers(
+    `#${entry.ordinal} ${collapseToOneLine(entry.name)} ${truncateChars(entry.args, LEDGER_ARGS_CHARS)}` +
+    (entry.hasResult ? ` -> ${entry.digest || '(empty)'}` : '')
+  );
+
+  // El presupuesto reserva la nota de omision siempre, se use o no: descubrimos que hubo
+  // recorte por bytes recien dentro del bucle, y anadirla despues podria pasarse del tope.
+  const budget = byteCap - Buffer.byteLength(LEDGER_TRUNCATED_NOTE) - 1;
+  const lines = [LEDGER_HEADER, LEDGER_CAPTION];
+  let bytes = Buffer.byteLength(lines.join('\n'));
+  let truncated = kept.length < entries.length;
+
+  for (const entry of kept) {
+    const line = renderLine(entry);
+    const cost = Buffer.byteLength(line) + 1;
+    if (bytes + cost > budget) {
+      truncated = true;
+      break;
+    }
+    lines.push(line);
+    bytes += cost;
+  }
+
+  // Ni una entrada entro: una cabecera con una lista vacia solo gasta contexto y miente.
+  if (lines.length === 2) return '';
+  if (truncated) lines.push(LEDGER_TRUNCATED_NOTE);
+  return lines.join('\n');
 };
 
 /**
@@ -479,6 +658,10 @@ module.exports = {
   buildAgentRetryHint,
   // Guarda de fuga del canal de texto — compartida por anthropic.js y openai-agent-runtime.js.
   canonicalJson,
+  // Neutralizacion de marcadores: fuente unica para foldToolMessages (tool-prompt.js) y
+  // para el ledger de aqui. Todo texto no confiable que vuelve al prompt pasa por ella.
+  neutraliseResultMarkers,
+  buildToolHistoryLedger,
   createToolCallLedger,
   isRejectedTextCallWarning,
   resolveTextToolCallCap,

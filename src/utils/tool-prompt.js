@@ -6,7 +6,10 @@ const {
   AGENT_BLOCKED_OPEN,
   AGENT_BLOCKED_CLOSE,
   TOOL_CALL_OPEN,
-  TOOL_CALL_CLOSE
+  TOOL_CALL_CLOSE,
+  // Vive en agent-turn.js (la hoja del grafo) porque el ledger de llamadas ejecutadas
+  // reinyecta el mismo texto no confiable y las dos rutas necesitan una unica regla.
+  neutraliseResultMarkers
 } = require('./agent-turn.js');
 
 // TOOL_CALL_OPEN / TOOL_CALL_CLOSE 从 agent-turn.js 引入：规范标记与重试提示必须锁步，
@@ -1538,6 +1541,11 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '- Use the exact tool name listed above.',
     '- Provide all required arguments; omit unknown ones.',
     `- You may emit multiple \`${TOOL_CALL_OPEN}\` blocks back-to-back when more than one tool is needed.`,
+    // Contrapeso a la linea de arriba y a la de "After every tool result...". Medido:
+    // 526 de 1.451 duplicados no tenian colision de nombre. No es una prohibicion —
+    // releer un archivo despues de editarlo es CORRECTO — asi que la excepcion viaja
+    // en la misma linea que la regla.
+    '- If the same call with the same arguments already ran, reuse its result instead of calling again — unless a preceding action could have changed it.',
     '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
     '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
     `- Do not call nonexistent tools, fabricate tool results, wrap \`${TOOL_CALL_OPEN}\` in code fences, or mix extra commentary into a tool-call turn.`,
@@ -1628,28 +1636,6 @@ const foldToolMessages = (messages) => {
     return message;
   });
 };
-
-/**
- * 结果正文必须对它自己封闭。工具结果是**不可信内容** —— 文件、网页、命令输出 —— 里面
- * 完全可能出现 `[END TOOL RESULT]`。原样写出去，块就在那里提前结束，后面的内容就变成了
- * 对模型说的话。把正文里的标记打断，让它再也关不掉这个块。
- * @param {string} value - 原始结果正文
- * @returns {string} 标记已失效的正文
- */
-const neutraliseResultMarkers = (value) => String(value)
-  .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
-  // 只打断头字符，不重写整段。结果头现在可能带序号（`[TOOL RESULT #3: X]`），旧写法
-  // 要求 RESULT 后面**紧跟冒号**，认不出编号形式 —— 于是不可信正文可以伪造一个编号头，
-  // 冒充某次真实调用的答复。这里不再要求冒号：`[` 后面是 TOOL RESULT 就失效。
-  .replace(/\[(?=[ \t]*TOOL[ \t]+RESULT\b)/gi, '(')
-  // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
-  // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
-  // 触发器正则（与之锁步）就永远匹配不上。
-  .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
-  .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
-  // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
-  // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
-  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(');
 
 /**
  * 结果标记占一整行，工具名里不能出现会把它撑破的字符
