@@ -1,10 +1,16 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
 const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
-const { uploadFileToQwenOss } = require('./upload.js')
+// Referencia al módulo, no desestructurada: un binding desestructurado no se puede
+// sustituir desde un test y la prueba acabaría pegando a la red de verdad.
+const uploadModule = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
+// Singleton a nivel de módulo. Antes se construía uno nuevo en cada parserMessages, o sea
+// en cada petición HTTP; como un turno del usuario son varias peticiones (el bucle de
+// tools), la misma imagen se re-subía entera cada vez.
+const imgCacheManager = new CacheManager()
 const { MODEL_SUFFIXES } = require('./model-suffixes.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -155,7 +161,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
 
         const buffer = Buffer.from(base64Content, 'base64')
         const uploadAccount = accountManager.getAccount()
-        const uploadResult = await uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
+        const uploadResult = await uploadModule.uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
         if (!uploadResult || uploadResult.status !== 200) {
             return null
@@ -365,7 +371,6 @@ const formatHistoryMessages = (messages) => {
 const parserMessages = async (messages, thinking_config, chat_type) => {
     try {
         const feature_config = thinking_config
-        const imgCacheManager = new CacheManager()
 
         // 如果只有一条消息,使用原有逻辑处理（不标注角色）
         if (messages.length <= 1) {
@@ -811,6 +816,8 @@ const attachMediaToLastMessage = (messages, media) => {
 }
 
 module.exports = {
+    // Exportado solo para que los tests puedan aislarse con clear().
+    imgCacheManager,
     extractMediaToFiles,
     harvestCurrentTurnMedia,
     attachMediaToLastMessage,
