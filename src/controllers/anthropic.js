@@ -276,11 +276,47 @@ const buildInternalRequest = async (anthropicReq) => {
   // 跳过它再开始找边界，否则同一回合 tool_result 里的图片永远收不到。
   if (flat[scanFrom]?.role === 'assistant') scanFrom -= 1;
   const lastFlatIndex = flat.length - 1;
+  // 同一张图会从两条路进来：用户消息的 content[]，以及 tool_result 的 media 旁路
+  // （Claude Code 贴图后又让 Read 读了同一个文件）。按 URL 去重，否则 files[] 里
+  // 会出现两条一模一样的记录 = 两次上传 + 提示词里两张一样的图。
+  //
+  // 种子**只**取最后一条 flat 消息的 content[]，绝不取它的 .media：正常的 Read 回合里
+  // 最后一条就是携带图片的 tool 消息，拿它的 .media 播种会把唯一那份也毙掉，图片直接消失。
+  const seenMediaUrls = new Set();
+  const isFreshMedia = (item) => {
+    const url = item?.image_url?.url;   // anthropicImageBlockToItem 产出的形状
+    if (typeof url !== 'string' || url.length === 0) return true;
+    if (seenMediaUrls.has(url)) return false;
+    seenMediaUrls.add(url);
+    return true;
+  };
+  if (Array.isArray(flat[lastFlatIndex]?.content)) {
+    flat[lastFlatIndex].content.filter(item => item?.type === 'image_url').forEach(isFreshMedia);
+  }
   for (let i = scanFrom; i >= 0; i--) {
     const candidate = flat[i];
-    if (candidate?.role === 'assistant') break;
+    if (candidate?.role === 'assistant') {
+      // 回合边界是**最终答复**，不是任意一条 assistant。工具循环里同一个用户回合会有
+      // 好几条 assistant，每条都带 tool_calls，都是中间步骤。按「任意 assistant」断
+      // （本函数的初版写法）意味着：用户贴的图在**第一次**工具调用就没了，tool_result
+      // 里的图片从第二个 assistant 回合起就没了。
+      //
+      // 2026-09-08 对着真实上游实测（/v1/messages，qwen3.8-max，446 字节品红 PNG）：
+      //   图片在最后一条、无工具        → uploads_delta=1，答 "magenta"
+      //   图片 + 一次 tool round-trip   → uploads_delta=0，答 "no image was provided"
+      //   图片 + 两次 tool round-trip   → uploads_delta=0，同上
+      // 与 chat-helpers.js#harvestCurrentTurnMedia 是孪生体，两边必须一起改。
+      // function_call 在本路径上是死分支（flattenAnthropicMessages 只产出 tool_calls），
+      // 保留它纯粹是为了和孪生体逐字对齐。
+      const midTurnCall = (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length > 0) ||
+        !!candidate.function_call?.name;
+      if (midTurnCall) continue;
+      break;
+    }
     const fromCandidate = [];
-    if (Array.isArray(candidate?.media)) fromCandidate.push(...candidate.media);
+    // media 旁路故意不加 lastFlatIndex 守卫：最后一条 tool 消息的 content 是字符串，
+    // parserMessages 从它身上一个媒体项也拿不到，单步 Read 回合能通正是靠这个不对称。
+    if (Array.isArray(candidate?.media)) fromCandidate.push(...candidate.media.filter(isFreshMedia));
     // content[] 里的图片同样只有挂在最后一条消息上才会被上传：parserMessages 的多条分支
     // 只对 lastMessage 调 normalizeMediaContentItem，更早那些被 extractTextFromContent
     // 整个抹掉，一行日志都没有。粘贴图片的 Claude Code 正好命中这里——它先发
@@ -289,7 +325,9 @@ const buildInternalRequest = async (anthropicReq) => {
     if (i !== lastFlatIndex && Array.isArray(candidate?.content)) {
       const carried = candidate.content.filter(item => item?.type === 'image_url');
       if (carried.length > 0) {
-        fromCandidate.push(...carried);
+        // 去重只影响**要不要重新挂上去**；摘除是无条件的。被去重毙掉的那份留在历史正文里
+        // 既进不了上游（历史只保留 text），又白占体积。
+        fromCandidate.push(...carried.filter(isFreshMedia));
         // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
         // 又会和重新挂到最后一条的那份重复。只剩一个文本项时收敛回字符串，
         // 正是 formatSingleMessage 期待的形状。

@@ -288,6 +288,109 @@ describe('image passthrough: Claude Code paste shape', () => {
   });
 });
 
+describe('image passthrough: Anthropic tool loops', () => {
+  // Measured live against the real upstream on 2026-09-08 (/v1/messages, qwen3.8-max,
+  // 446-byte magenta PNG), BEFORE the boundary fix:
+  //   image last, no tools        -> uploads_delta=1, model answered "magenta"
+  //   image + 1 tool round-trip   -> uploads_delta=0, model answered "no image was provided"
+  //   image + 2 tool round-trips  -> uploads_delta=0, same
+  // A single tool call was enough to erase it, and Claude Code calls tools constantly.
+  const IMG_URL_2 = 'https://example.invalid/second.png';
+  const imageBlock2 = { type: 'image', source: { type: 'url', url: IMG_URL_2 } };
+  const urls = (body) => imageFiles(body).map(f => f.url);
+
+  const toolStep = (i) => ([
+    { role: 'assistant', content: [{ type: 'tool_use', id: `toolu_s${i}`, name: 'Read', input: { path: `f${i}.txt` } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_s${i}`, content: `contents of f${i}.txt` }] }
+  ]);
+
+  const pastedImageThenNToolSteps = (n) => {
+    const msgs = [{ role: 'user', content: [{ type: 'text', text: 'what colour is it?' }, imageBlock] }];
+    for (let i = 0; i < n; i++) msgs.push(...toolStep(i));
+    return msgs;
+  };
+
+  const toolResultImageThenNSteps = (n) => {
+    const msgs = [
+      { role: 'user', content: [{ type: 'text', text: 'Read magenta.png and name the colour.' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_img', name: 'Read', input: { path: 'magenta.png' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_img', content: [imageBlock] }] }
+    ];
+    for (let i = 0; i < n; i++) msgs.push(...toolStep(i));
+    return msgs;
+  };
+
+  it('delivers a pasted image across one tool step', async () => {
+    assert.deepEqual(urls((await build(pastedImageThenNToolSteps(1))).body), [IMG_URL]);
+  });
+
+  it('delivers a pasted image across two tool steps', async () => {
+    assert.deepEqual(urls((await build(pastedImageThenNToolSteps(2))).body), [IMG_URL]);
+  });
+
+  it('delivers a pasted image across three tool steps', async () => {
+    assert.deepEqual(urls((await build(pastedImageThenNToolSteps(3))).body), [IMG_URL]);
+  });
+
+  it('delivers a tool_result image across two further tool steps', async () => {
+    assert.deepEqual(urls((await build(toolResultImageThenNSteps(2))).body), [IMG_URL]);
+  });
+
+  it('regression guard: same-turn parallel tool_use still delivers the image', async () => {
+    const body = (await build([
+      { role: 'user', content: [{ type: 'text', text: 'read both' }] },
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 'toolu_p1', name: 'Read', input: { path: 'a.png' } },
+        { type: 'tool_use', id: 'toolu_p2', name: 'Read', input: { path: 'b.txt' } }
+      ] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_p1', content: [imageBlock] },
+        { type: 'tool_result', tool_use_id: 'toolu_p2', content: 'plain text' }
+      ] }
+    ])).body;
+    assert.deepEqual(urls(body), [IMG_URL]);
+  });
+
+  it('keeps the turn boundary: an image before a real final answer is not re-attached', async () => {
+    const body = (await build([
+      { role: 'user', content: [{ type: 'text', text: 'first' }, imageBlock] },
+      { role: 'assistant', content: [{ type: 'text', text: 'magenta' }] },
+      { role: 'user', content: [{ type: 'text', text: 'and now?' }] },
+      ...toolStep(0)
+    ])).body;
+    assert.deepEqual(urls(body), [], 'previous-turn images stay behind the boundary');
+  });
+
+  it('dedupes: the same image pasted and then Read yields exactly one file', async () => {
+    const body = (await build([
+      { role: 'user', content: [{ type: 'text', text: 'what colour?' }, imageBlock] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_d', name: 'Read', input: { path: 'magenta.png' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_d', content: [imageBlock] }] }
+    ])).body;
+    assert.deepEqual(urls(body), [IMG_URL], 'one upload, not two');
+  });
+
+  it('does not over-dedupe: two parallel Reads of different images both survive', async () => {
+    const body = (await build([
+      { role: 'user', content: [{ type: 'text', text: 'read both images' }] },
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 'toolu_x1', name: 'Read', input: { path: 'a.png' } },
+        { type: 'tool_use', id: 'toolu_x2', name: 'Read', input: { path: 'b.png' } }
+      ] },
+      { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_x1', content: [imageBlock] },
+        { type: 'tool_result', tool_use_id: 'toolu_x2', content: [imageBlock2] }
+      ] }
+    ])).body;
+    assert.deepEqual(urls(body).sort(), [IMG_URL, IMG_URL_2].sort());
+  });
+
+  it('never lets a media side-channel reach the upstream body', async () => {
+    const { body } = await build(toolResultImageThenNSteps(1));
+    assert.ok(!JSON.stringify(body).includes('"media"'), 'media is an internal side-channel only');
+  });
+});
+
 describe('image passthrough: OpenAI /v1/chat/completions envelope', () => {
   const runMiddleware = async (body) => {
     const req = { body };
