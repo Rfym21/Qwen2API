@@ -1199,7 +1199,10 @@ test('默认严格模式：工具调用附带可见正文仍判为 invalid_tool_
     assert.deepEqual(evaluateAgentTurn(attempt), {
       accepted: false,
       finishReason: null,
-      retryReason: 'invalid_tool_call'
+      retryReason: 'invalid_tool_call',
+      // Ronda NO cortada (sin textChannelCut): el rechazo estricto se mantiene; `detail`
+      // sólo etiqueta cuál de los dos invalid_tool_call fue, para los logs de producción.
+      detail: 'prose_with_tools'
     })
   })
 })

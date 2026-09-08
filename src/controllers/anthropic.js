@@ -3,7 +3,7 @@ const { createUsageObject } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const {
-  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase,
+  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
   createUpstreamDeltaNormalizer, createClientToolNamePredicate
 } = require('../utils/chat-helpers.js');
 const {
@@ -19,7 +19,17 @@ const {
   TOOL_CALL_OPEN,
   TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js');
-const { createAgentTagStripper, stripAgentTags, buildAgentRetryHint, buildAgentTurnDirective } = require('../utils/agent-turn.js');
+const {
+  createAgentTagStripper,
+  stripAgentTags,
+  buildAgentRetryHint,
+  buildAgentTurnDirective,
+  // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
+  // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
+  createToolCallLedger,
+  resolveTextToolCallCap,
+  createTextChannelRunawayGuard
+} = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { mapIncomingModel } = require('../utils/model-map.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
@@ -124,13 +134,32 @@ const normalizeAnthropicToolChoice = (toolChoice) => {
 };
 
 /**
+ * 把一个 Anthropic `image` 块转成 parserMessages 认识的 OpenAI `image_url` 项。
+ * base64 source 转 data URI（由 normalizeMediaContentItem 负责上传），url source 直接透传。
+ * 单一实现：普通 image 块和 tool_result 里的 image 块共用它。
+ * @param {Object} block - Anthropic image 块
+ * @returns {{type: 'image_url', image_url: {url: string}}|null} 无法取到 url 时返回 null
+ */
+const anthropicImageBlockToItem = (block) => {
+  const src = block?.source || {};
+  const url = src.type === 'base64' && src.data
+    ? `data:${src.media_type || 'image/png'};base64,${src.data}`
+    : (src.url || '');
+  return url ? { type: 'image_url', image_url: { url } } : null;
+};
+
+/**
  * 把 Anthropic 风格的消息（含 content blocks 与 tool_use/tool_result）展开为
  * OpenAI 风格消息列表。tool_use 转为 assistant.tool_calls；tool_result 转为
  * role=tool 消息（保留 tool_call_id），后续由 foldToolMessages 折叠。
  * @param {Array<Object>} messages - Anthropic messages
  * @returns {Array<Object>} OpenAI 风格 messages
  */
+const UNSUPPORTED_BLOCK_NOTE = (type) => `[unsupported content block: ${type} — not forwarded]`;
+
 const flattenAnthropicMessages = (messages) => {
+  // 本次调用里被丢弃的块类型，用于收尾时一条 WARN（不是每块一条）。
+  const droppedBlockTypes = new Set();
   if (!Array.isArray(messages)) return [];
   const out = [];
 
@@ -169,6 +198,7 @@ const flattenAnthropicMessages = (messages) => {
     }
 
     // user 角色：tool_result 拆为独立 role=tool 消息，普通文本/图片合并保留
+    const outLenBeforeUserMsg = out.length;
     const collectedTextParts = [];
     const flushCollectedText = () => {
       if (collectedTextParts.length === 0) return;
@@ -183,36 +213,67 @@ const flattenAnthropicMessages = (messages) => {
           : Array.isArray(block.content)
             ? block.content.filter(b => b?.type === 'text').map(b => b.text || '').join('\n')
             : JSON.stringify(block.content ?? '');
-        out.push({
+        const toolMessage = {
           role: 'tool',
           tool_call_id: block.tool_use_id || '',
           content: resultContent
-        });
+        };
+        // Claude Code 的 Read 把图片放在 tool_result.content 里。resultContent 依旧只取
+        // text 块（保持逐字节不变），图片改走 media 旁路：role=tool 的 content 必须是
+        // 字符串，foldToolMessages 会把非字符串 JSON.stringify 掉，图片项塞进去就废了。
+        const toolResultMedia = Array.isArray(block.content)
+          ? block.content.filter(b => b?.type === 'image').map(anthropicImageBlockToItem).filter(Boolean)
+          : [];
+        if (toolResultMedia.length > 0) toolMessage.media = toolResultMedia;
+        out.push(toolMessage);
       } else if (block?.type === 'text' && typeof block.text === 'string') {
         collectedTextParts.push(block.text);
       } else if (block?.type === 'image') {
         // 透传 image 块给现有 parserMessages 处理（OpenAI image_url 形态）
-        const src = block.source || {};
-        const url = src.type === 'base64' && src.data
-          ? `data:${src.media_type || 'image/png'};base64,${src.data}`
-          : (src.url || '');
-        if (url) {
+        const imageItem = anthropicImageBlockToItem(block);
+        if (!imageItem) {
+          // source:{type:'file', file_id} 是 Anthropic 有文档的形态，我们不支持。
+          // 以前它在这里无声消失，模型对着「一张它从没收到的图」作答。
+          droppedBlockTypes.add(`image(${block?.source?.type || 'unknown'})`);
+          collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE('image'));
+        } else {
           if (collectedTextParts.length > 0) {
             out.push({
               role: 'user',
               content: [
                 { type: 'text', text: collectedTextParts.join('') },
-                { type: 'image_url', image_url: { url } }
+                imageItem
               ]
             });
             collectedTextParts.length = 0;
           } else {
-            out.push({ role: 'user', content: [{ type: 'image_url', image_url: { url } }] });
+            out.push({ role: 'user', content: [imageItem] });
           }
         }
+      } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+        // 故意丢弃：无法回放给 Qwen，而且丢掉它不会改变用户的意图。
+      } else {
+        // 兜底分支。以前这里什么都没有：document（PDF）、search_result、server_tool_use…
+        // 全部无声消失，模型只收到包围它们的那句话就去回答。
+        droppedBlockTypes.add(block?.type || 'unknown');
+        collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE(block?.type || 'unknown'));
       }
     }
     flushCollectedText();
+    // 整条用户消息一个块都没产出（例如 spec 合法的 content: []）时，绝不能让它凭空消失：
+    // 消息一旦少一条，parserMessages 会把**上一条 assistant** 当成 "# Current message"，
+    // 模型于是对着自己上一轮的回答作答；只有这一条时它直接抛错，被吞掉后上游收到的是
+    // 字面量 '聊天历史处理有误…'。保留一个空位，语义不变而结构完整。
+    if (out.length === outLenBeforeUserMsg) {
+      out.push({ role: 'user', content: '' });
+    }
+  }
+
+  if (droppedBlockTypes.size > 0) {
+    logger.warn(
+      `Anthropic content blocks not forwarded: ${Array.from(droppedBlockTypes).join(', ')}`,
+      'ANTHROPIC'
+    );
   }
 
   return out;
@@ -237,6 +298,86 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 1. 展开 Anthropic 消息（tool_use/tool_result 折叠由 foldToolMessages 完成）
   let flat = flattenAnthropicMessages(messages);
+  // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
+  // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
+  // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
+  const HARVEST_MEDIA_CAP = 4;
+  const currentTurnMedia = [];
+  let scanFrom = flat.length - 1;
+  // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
+  // 跳过它再开始找边界，否则同一回合 tool_result 里的图片永远收不到。
+  if (flat[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  const lastFlatIndex = flat.length - 1;
+  // 同一张图会从两条路进来：用户消息的 content[]，以及 tool_result 的 media 旁路
+  // （Claude Code 贴图后又让 Read 读了同一个文件）。按 URL 去重，否则 files[] 里
+  // 会出现两条一模一样的记录 = 两次上传 + 提示词里两张一样的图。
+  //
+  // 种子**只**取最后一条 flat 消息的 content[]，绝不取它的 .media：正常的 Read 回合里
+  // 最后一条就是携带图片的 tool 消息，拿它的 .media 播种会把唯一那份也毙掉，图片直接消失。
+  const seenMediaUrls = new Set();
+  const isFreshMedia = (item) => {
+    const url = item?.image_url?.url;   // anthropicImageBlockToItem 产出的形状
+    if (typeof url !== 'string' || url.length === 0) return true;
+    if (seenMediaUrls.has(url)) return false;
+    seenMediaUrls.add(url);
+    return true;
+  };
+  if (Array.isArray(flat[lastFlatIndex]?.content)) {
+    flat[lastFlatIndex].content.filter(item => item?.type === 'image_url').forEach(isFreshMedia);
+  }
+  for (let i = scanFrom; i >= 0; i--) {
+    const candidate = flat[i];
+    if (candidate?.role === 'assistant') {
+      // 回合边界是**最终答复**，不是任意一条 assistant。工具循环里同一个用户回合会有
+      // 好几条 assistant，每条都带 tool_calls，都是中间步骤。按「任意 assistant」断
+      // （本函数的初版写法）意味着：用户贴的图在**第一次**工具调用就没了，tool_result
+      // 里的图片从第二个 assistant 回合起就没了。
+      //
+      // 2026-09-08 对着真实上游实测（/v1/messages，qwen3.8-max，446 字节品红 PNG）：
+      //   图片在最后一条、无工具        → uploads_delta=1，答 "magenta"
+      //   图片 + 一次 tool round-trip   → uploads_delta=0，答 "no image was provided"
+      //   图片 + 两次 tool round-trip   → uploads_delta=0，同上
+      // 与 chat-helpers.js#harvestCurrentTurnMedia 是孪生体，两边必须一起改。
+      // function_call 在本路径上是死分支（flattenAnthropicMessages 只产出 tool_calls），
+      // 保留它纯粹是为了和孪生体逐字对齐。
+      const midTurnCall = (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length > 0) ||
+        !!candidate.function_call?.name;
+      if (midTurnCall) continue;
+      break;
+    }
+    const fromCandidate = [];
+    // media 旁路故意不加 lastFlatIndex 守卫：最后一条 tool 消息的 content 是字符串，
+    // parserMessages 从它身上一个媒体项也拿不到，单步 Read 回合能通正是靠这个不对称。
+    if (Array.isArray(candidate?.media)) fromCandidate.push(...candidate.media.filter(isFreshMedia));
+    // content[] 里的图片同样只有挂在最后一条消息上才会被上传：parserMessages 的多条分支
+    // 只对 lastMessage 调 normalizeMediaContentItem，更早那些被 extractTextFromContent
+    // 整个抹掉，一行日志都没有。粘贴图片的 Claude Code 正好命中这里——它先发
+    // [text, image]，再补一条只有文本的 meta 消息（`[Image: source: …png]`），
+    // 于是图片永远不是最后一条。最后一条不碰：那条 parserMessages 自己会处理。
+    if (i !== lastFlatIndex && Array.isArray(candidate?.content)) {
+      const carried = candidate.content.filter(item => item?.type === 'image_url');
+      if (carried.length > 0) {
+        // 去重只影响**要不要重新挂上去**；摘除是无条件的。被去重毙掉的那份留在历史正文里
+        // 既进不了上游（历史只保留 text），又白占体积。
+        fromCandidate.push(...carried.filter(isFreshMedia));
+        // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
+        // 又会和重新挂到最后一条的那份重复。只剩一个文本项时收敛回字符串，
+        // 正是 formatSingleMessage 期待的形状。
+        const rest = candidate.content.filter(item => item?.type !== 'image_url');
+        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+          ? rest[0].text
+          : rest;
+      }
+    }
+    if (fromCandidate.length > 0) currentTurnMedia.unshift(...fromCandidate);
+    // 与孪生体同一个上限，按项算不按消息算（chat-helpers.js#HARVEST_MEDIA_CAP）。
+    if (currentTurnMedia.length >= HARVEST_MEDIA_CAP) break;
+  }
+  // media 是内部旁路，绝不能进上游请求体。历史消息里的 media 携带完整 base64 data URI，
+  // 目前只是碰巧被 foldToolMessages 丢掉，而它只在带工具时才跑——所以在这里全量清掉。
+  for (const message of flat) {
+    if (message && 'media' in message) delete message.media;
+  }
   const systemText = normalizeAnthropicSystem(system);
 
   // 2. system 文本拼到首条用户消息内容前缀（不要作为独立 system 消息，
@@ -247,6 +388,17 @@ const buildInternalRequest = async (anthropicReq) => {
 
   if (hasTools) {
     flat = foldToolMessages(flat);
+  }
+
+  // 折叠之后再挂图片：parserMessages 只处理最后一条消息里的媒体，挂在这里的图片
+  // 才会被上传，而工具结果正文仍然留在 "# Current message" 里（agent 回合语义不变）。
+  if (currentTurnMedia.length > 0 && flat.length > 0) {
+    const lastFlat = flat[flat.length - 1];
+    if (typeof lastFlat.content === 'string') {
+      lastFlat.content = [{ type: 'text', text: lastFlat.content }, ...currentTurnMedia];
+    } else if (Array.isArray(lastFlat.content)) {
+      lastFlat.content = [...lastFlat.content, ...currentTurnMedia];
+    }
   }
 
   // 3. 走现有 parserMessages 复用图片上传与 thinking 配置
@@ -305,6 +457,9 @@ const buildInternalRequest = async (anthropicReq) => {
   const lastParsed = Array.isArray(parsedMessages) && parsedMessages.length > 0
     ? parsedMessages[parsedMessages.length - 1]
     : { role: 'user', content: '' };
+  // 媒体从 content[] 换到 files[]：content[] 带图 + files[] 带外置上下文文档的组合
+  // 会让上游 500（详见 extractMediaToFiles）。无媒体时原样返回，请求体逐字节不变。
+  const { content: envelopeContent, files: envelopeFiles } = extractMediaToFiles(lastParsed.content || '');
 
   const envelopeMessage = {
     id: null,
@@ -313,9 +468,9 @@ const buildInternalRequest = async (anthropicReq) => {
     parent_id: null,
     childrenIds: [generateUUID()],
     role: lastParsed.role || 'user',
-    content: lastParsed.content || '',
+    content: envelopeContent,
     user_action: 'chat',
-    files: [],
+    files: envelopeFiles,
     timestamp: now,
     models: [parsedModel],
     model: '',
@@ -519,38 +674,6 @@ const consumeUpstream = async (upstream, onDelta, options) => consumeSSEStream(u
   assertNoUpstreamFailure(parsed);
   await onDelta(parsed);
 }, options);
-
-/** 键排序后的规范 JSON：跨通道去重要把 `{"a":1,"b":2}` 与 `{"b": 2, "a": 1}` 判成同一份参数。 */
-const canonicalJson = (value) => {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-};
-
-/**
- * 本轮的工具调用登记簿：同名 + 规范 JSON 相同的第二个调用是跨通道的副本（文本解析器
- * 与原生累积器各自都能产出同一个调用），只保留先到的。文本解析器的调用是边收边发的，
- * 收不回来，所以规则只能是操作性的：丢后到的那个。
- * @returns {(call: Object) => boolean} true = 首次见到，可以发射
- */
-const createToolCallLedger = () => {
-  const seen = new Set();
-  return (call) => {
-    const args = call?.function?.arguments || '{}';
-    let canonical;
-    try {
-      canonical = canonicalJson(JSON.parse(args));
-    } catch (_) {
-      canonical = args;
-    }
-    const key = `${call?.function?.name || ''}\u0000${canonical}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  };
-};
 
 /**
  * 原生 function_call 帧的喂入与关闭判定（流式 / 非流式共用）。完成证据读的是**原始**
@@ -764,11 +887,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // malformed_protocol 与 think 晋升守卫的输入），不写任何字节到线上；tool_use
   // 照常放行。由构造只可能在最后一轮为真：名额一次性，任何再拒绝都直接 break。
   let suppressAttemptOutput = false;
-  // 原生晋升（D2）：本轮一旦有**原生**调用晋升，其后的文本/思考增量只做记账、不上线 ——
-  // 结果帧不到、早停（D3）点不起来时的那条保险带。只对原生晋升置位（与非流式的
-  // `promotedNativeCalls.length > 0` 守卫同源）：文本通道调用之后的正文是模型自己的话，
-  // main 一直照常交付，不能一并吞掉。按轮复位（startAttempt），与 suppressAttemptOutput
-  // 互不干扰：那个由抑制重试跨轮持有到最后一轮。
+  // tool_use 之后的输出抑制：其后的文本/思考增量只做记账、不上线。两处置位 ——
+  // 原生晋升（D2，drainPromotedNativeCalls：结果帧不到、早停 D3 点不起来时的保险带），
+  // 以及文本通道的失控截断（cutTextChannelTurn：spec agent-turn-cutoff-text-channel 推翻了
+  // "文本通道调用之后的正文照常交付"的老决定 —— 生产里那段正文就是失控的开头）。
+  // 按轮复位（startAttempt），与 suppressAttemptOutput 互不干扰：那个由抑制重试跨轮持有
+  // 到最后一轮。
   let suppressPostToolUseOutput = false;
   // 本轮跨通道去重登记簿；"已发射 tool_use"由 emitToolUse 自己置位，回合收尾不再重算。
   let admitToolCall = null;
@@ -779,6 +903,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let stopRequested = false;
   const nativePhases = new Map();
   const isClientToolName = createClientToolNamePredicate(allowedToolNames);
+  // 文本通道失控守卫（规则与产生背景见 createTextChannelRunawayGuard）。按轮复位。
+  let textRunaway = null;
+  const maxToolCalls = resolveTextToolCallCap();
   // 抑制重试开跑前，attempt 侧的抢救缓冲先按登记位置剥掉残渣、存进银行：抑制
   // 只对**重试轮**的文本生效，attempt 侧原本要交付的 recovered 文本仍要交付
   // （无闭标记 span 的尾巴可能是真实回答，不能整桶倒掉 —— review loop 1，条目 10）。
@@ -817,6 +944,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     nativeThinkEvidence = false;
     stopRequested = false;
     nativePhases.clear();
+    textRunaway = parser
+      ? createTextChannelRunawayGuard({ parser, maxToolCalls, label: 'Anthropic Agent', tag: 'ANTHROPIC' })
+      : null;
     // clientToolNames：只有客户端声明过的工具名才算拦截证据（见 chat-helpers.js）——
     // 平台内部工具的丢弃帧不再触发假 intercepted 重试、不再烧协议恢复名额。
     normalizeDelta = createUpstreamDeltaNormalizer({ clientToolNames: allowedToolNames });
@@ -906,10 +1036,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   /**
-   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃；
-   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：只有原生晋升
-   * 才置位（drainPromotedNativeCalls）。
+   * 输出一个完整的 tool_use 块（按 input_json_delta 切片）。跨通道副本在这里丢弃 ——
+   * 这不是失控信号（失控的判定在文本通道循环里，见 createTextChannelRunawayGuard）；
+   * 发射即置位 hasEmittedToolCalls。tool_use 之后的输出抑制不在这里：原生晋升
+   * （drainPromotedNativeCalls）与文本通道截断（cutTextChannelTurn）各自置位。
    * @param {Object} call - 工具调用
+   * @returns {boolean} 登记簿裁决：true = 已上线，false = 副本被丢弃
    */
   const emitToolUse = (call) => {
     if (!admitToolCall(call)) {
@@ -917,7 +1049,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         `Anthropic Agent 本轮重复的工具调用（${call.function.name}，跨通道同名同参数），丢弃后到的副本`,
         'ANTHROPIC'
       );
-      return;
+      return false;
     }
     hasEmittedToolCalls = true;
     closeThinkingBlockIfOpen();
@@ -937,6 +1069,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       });
     }
     writeAnthropicEvent(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    return true;
   };
 
   let completionContent = '';
@@ -961,6 +1094,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       suppressPostToolUseOutput = true;
       emitToolUse(call);
     }
+  };
+
+  /**
+   * 文本通道的失控截断（原生早停的镜像）：终止上游、其后一切文本/思考只记账不上线，
+   * 已放行的调用照常以 stop_reason=tool_use 收尾。告警由守卫留下（每次截断恰好一行）。
+   * @param {string} rule - duplicate / rejected / prose / think / cap
+   */
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    suppressPostToolUseOutput = true;
+    textRunaway.cut(rule);
   };
 
   /**
@@ -1015,6 +1159,15 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     completionContent += content;
 
     if (delta.phase === 'think') {
+      // 文本通道调用之后的思考是失控的开头（规则 c）：截断，这一帧一个字节都不上线。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 武装之后纯空白的思考也不上线（inspectThink 对空白不触发）：放行会在 tool_use
+      // 块之后另开一个空的 thinking 块。
+      if (textRunaway?.armed()) return;
       if (!thinkingStarted) {
         thinkingStarted = true;
         if (webSearchInfo) {
@@ -1032,9 +1185,24 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     } else if (delta.phase === 'answer') {
       if (parser) {
         const parsed = parser.push(content);
-        if (parsed.textDelta) emitTextDelta(agentTagStripper.push(parsed.textDelta));
-        recoveredBuffer += parsed.recoveredText;
-        for (const call of parsed.completedCalls) emitToolUse(call);
+        const text = agentTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：被拒绝的调用 / 非空白正文。触发时这一 push 的正文与抢救文本都不
+        // 上线；同一 push 里已登记完成的调用仍照常发射（下面的循环）。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) {
+          cutTextChannelTurn(pushRule);
+        } else {
+          if (text) emitTextDelta(text);
+          recoveredBuffer += parsed.recoveredText;
+        }
+        // 规则 (a)/(d)：文本通道的重复调用 / 第 N 个调用。到 cap 的那个照常交付，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, emitToolUse);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
       } else {
         emitTextDelta(agentTagStripper.push(content));
       }
@@ -1136,12 +1304,17 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       throw e;
     }
 
-    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。
+    // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。文本通道截断之后例外：
+    // 根本不 flush —— 解析器里压着的只是失控那一 push 的残余（半个触发器 / 半截负载），
+    // flush 会把它定罪成 truncated_tool_call，那是截断自己造成的假错误，不该进日志与
+    // finalToolErrors；抢救文本与迟到的调用同样不交付。
     if (parser) {
-      const tail = parser.flush();
-      if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
-      recoveredBuffer += tail.recoveredText;
-      for (const call of tail.completedCalls) emitToolUse(call);
+      if (!textRunaway.cutRule()) {
+        const tail = parser.flush();
+        if (tail.textDelta) emitTextDelta(agentTagStripper.push(tail.textDelta));
+        recoveredBuffer += tail.recoveredText;
+        for (const call of tail.completedCalls) emitToolUse(call);
+      }
       // 收取本轮被定罪的原文（flush 之后登记簿已完整），跨轮累计给交付层剥残渣。
       residueSpans.push(...parser.getResidueSpans());
     }
@@ -1477,6 +1650,55 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       promotedNativeCalls.push(call);
     }
   };
+  // 文本通道失控守卫 —— 流式分支的孪生（规则见 createTextChannelRunawayGuard）。非流式
+  // 没有线可写，回合定案前用一个边收边解析的解析器只做**检测**；截断的轮子以它已放行
+  // 的正文与调用为本轮结果（answerContent 在截断点结束：触发的那一 push 不累计），不再对
+  // 截断的原文整段重解析 —— 跨 push 的半截调用会被判成 truncated_tool_call、触发器按
+  // 正文泄漏、到 cap 的那个调用丢失，与流式分支交付的内容对不上。按轮复位。
+  // 沿袭的不对称（刻意不动）：原生晋升之后 `promotedNativeCalls.length > 0` 在守卫之前
+  // 就 return，此后的 delta 守卫看不见；流式分支则继续喂解析器。
+  const maxToolCalls = resolveTextToolCallCap();
+  let textParser = null;
+  let textTagStripper = null;
+  let textRunaway = null;
+  // 已放行的**原始** textDelta（未剥 agent 标签）：解析器 text 通道的登记落点就是它的
+  // 累计长度，交付层按位置剥残渣要同一坐标系；标签在交付点才剥（与未截断轮同序）。
+  let streamedRawText = '';
+  let streamedCalls = [];
+  // 搜索表前缀（回合定案时才知道）：拼在原文之前，登记落点整体后移。
+  let streamedPrefix = '';
+  const startTextRound = () => {
+    textParser = hasTools ? createToolCallStreamParser({ allowedToolNames, toolSchemas }) : null;
+    textTagStripper = createAgentTagStripper();
+    textRunaway = textParser
+      ? createTextChannelRunawayGuard({ parser: textParser, maxToolCalls, label: 'Anthropic 非流式 Agent', tag: 'ANTHROPIC' })
+      : null;
+    streamedRawText = '';
+    streamedCalls = [];
+    streamedPrefix = '';
+  };
+  startTextRound();
+  const collectTextCall = (call) => {
+    streamedCalls.push(call);
+    return true;
+  };
+  const cutTextChannelTurn = (rule) => {
+    stopRequested = true;
+    textRunaway.cut(rule);
+  };
+  /**
+   * 截断轮的结算：流式解析器已放行的原文与调用（形状同 parseToolCallsFromText）。只有
+   * text 通道的登记落在 streamedRawText 的坐标系里（recovered 通道非流式从不交付），
+   * 交付层照旧按位置剥残渣、再剥 agent 标签 —— 截断轮与未截断轮走同一条交付路径。
+   */
+  const settledStreamedRound = () => ({
+    cleanedText: streamedPrefix + streamedRawText,
+    toolCalls: streamedCalls,
+    errors: textParser.getErrors(),
+    residueSpans: textParser.getResidueSpans()
+      .filter(span => span.channel === 'text')
+      .map(span => ({ ...span, at: span.at + streamedPrefix.length }))
+  });
 
   /**
    * 处理一个上游 delta JSON
@@ -1526,9 +1748,35 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     delta.phase = normalized.phase;
     const content = normalized.content;
     if (delta.phase === 'think') {
+      // 与流式分支同一条：文本通道调用之后的思考是失控的开头，截断，这一帧不累计。
+      const thinkRule = textRunaway?.inspectThink(content);
+      if (thinkRule) {
+        cutTextChannelTurn(thinkRule);
+        return;
+      }
+      // 与流式分支同一条：武装之后纯空白的思考不累计。
+      if (textRunaway?.armed()) return;
       thinkingContent += content;
       attemptThinkingContent += content;
     } else if (delta.phase === 'answer') {
+      if (textParser) {
+        const parsed = textParser.push(content);
+        const text = textTagStripper.push(parsed.textDelta);
+        // 规则 (b)/(c)：触发时这一 push 的正文不进结果；同一 push 里已登记完成的调用仍收下。
+        const pushRule = textRunaway.inspectPush(parsed, text);
+        if (pushRule) cutTextChannelTurn(pushRule);
+        else streamedRawText += parsed.textDelta;
+        // 规则 (a)/(d)：到 cap 的那个照常收下，之后立刻停手。
+        for (const call of parsed.completedCalls) {
+          const callRule = textRunaway.inspectCall(call, collectTextCall);
+          if (!callRule) continue;
+          cutTextChannelTurn(callRule);
+          if (callRule === 'cap') break;
+        }
+        textRunaway.endPush();
+        // 截断：触发的那一 push 不累计 —— answerContent 在截断点结束。
+        if (textRunaway.cutRule()) return;
+      }
       answerContent += content;
     }
   };
@@ -1553,13 +1801,17 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
         thinkingContent = searchTable + '\n\n' + thinkingContent;
       } else {
         answerContent = searchTable + '\n\n' + answerContent;
+        streamedPrefix = searchTable + '\n\n';
       }
     } catch (_) {}
   }
 
-  let parsedTools = hasTools
-    ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
-    : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] };
+  // 文本通道截断的轮子以流式解析器的结果定案；其余照今天整段重解析。
+  let parsedTools = textRunaway?.cutRule()
+    ? settledStreamedRound()
+    : (hasTools
+      ? parseToolCallsFromText(answerContent, { allowedToolNames, toolSchemas })
+      : { cleanedText: answerContent, toolCalls: [], errors: [], residueSpans: [] });
   let cleanedText = stripAgentTags(parsedTools.cleanedText);
   // 回合结束：打开中的原生调用按 round_end 关闭并排出，再 finalize() 单发结算 OpenAI
   // 形状的 tool_calls（原生的已排空，不会出来第二次）。
@@ -1762,6 +2014,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     nativeThinkEvidence = false;
     stopRequested = false;
     nativePhases.clear();
+    // 文本通道守卫、检测解析器与已放行的正文/调用同样按轮全新。
+    startTextRound();
     // normalizeDelta 在本分支是跨 attempt 共享的 —— 这本身是个已知缺陷（流式分支
     // 每轮新建；统一两个循环的计划在 lohari 仓库
     // _bmad-output/implementation-artifacts/spec-qwen2api-unify-agent-loop.md）。
@@ -1779,7 +2033,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       break;
     }
     const retried = answerContent.slice(before.length);
-    const parsedRetry = parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
+    const parsedRetry = textRunaway?.cutRule()
+      ? settledStreamedRound()
+      : parseToolCallsFromText(retried, { allowedToolNames, toolSchemas });
     nativeToolCalls = settleNativeCalls();
     toolCalls = mergeToolCalls(nativeToolCalls, parsedRetry.toolCalls);
     cleanedText = stripAgentTags(parsedRetry.cleanedText);
@@ -1976,6 +2232,14 @@ const handleAnthropicMessages = async (req, res) => {
       });
     }
 
+    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+    if (upstreamResp.contextCompacted) {
+      res.set('X-Qwen2API-Context-Compacted', String(upstreamResp.contextSerializedBytes || 0));
+    }
+
     const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
     const ctx = {
       message_id,
@@ -2014,6 +2278,7 @@ module.exports = {
   buildAnthropicCompatibilityHeaders,
   // 暴露内部辅助以便测试
   flattenAnthropicMessages,
+  buildInternalRequest,
   normalizeAnthropicTools,
   normalizeAnthropicToolChoice,
   normalizeAnthropicSystem,

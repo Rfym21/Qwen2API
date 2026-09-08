@@ -55,7 +55,9 @@ const TOOL_RESULT_CLOSE = '[END TOOL RESULT]';
  * 第一个内容（buildToolSystemPrompt 的措辞不动），但解析器对叙述**宽容**：正文之后的
  * 触发器（或行首的裸负载 + 方括号闭标记）不再按位置一刀切压制，而是过**语义门**
  * （gateAfterProsePayload：白名单 + required 键）—— 且只在调用方带齐抢救上下文
- * （白名单 + toolSchemas，今天只有 anthropic 路径）时放行，否则保持旧的压制。
+ * （白名单 + toolSchemas）时放行，否则保持旧的压制。anthropic 与 OpenAI 的 Agent
+ * 运行时都传 toolSchemas（后者自 spec-agent-turn-cutoff-openai-parity 起），但都**只在
+ * answer phase**：think phase 的解析器两条路径都不带 schema。
  * 第一位置的规则一字不改。这样做的理由与接受的风险写在 spec 的 Intent 里：位置只是
  * 意图的弱代理，它从没保护过位置 0，却丢掉了每一个"Let me check…"后面的真实调用。
  *
@@ -112,6 +114,13 @@ const TOOL_CALL_CLOSE_BRACKET_RE =
   /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i;
 const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
   /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?/i;
+// 配平点之后、闭标记之前的**闭合残渣**：模型多写了一层 `}` / `]`。实测 2026-09-06
+// （Claude Code 经 /v1/messages）：`{"name":"Bash","arguments":{…}}}\n[END TOOL CALL]`
+// —— 多出的 '}' 让闭标记不再“紧邻”，调用按无闭标记收尾，'}' 作为正文放出，随后的
+// `[END TOOL CALL]` 成了孤儿也漏进正文，而且一条 WARN 都没有。残渣既不是负载也不是
+// 回答，只可能是协议，所以连同空白一起跳过，让闭标记重新紧邻。上界很小且全有全无：
+// 一屏 '}' 不是残渣，是别的东西，整段按原样当正文处理。
+const TRAILING_DEBRIS_MAX = 8;
 // 上界是两种闭标记里更长的那个。两个都是手写的镜像字面量，必须和上面的正则**用眼睛**保持
 // 同步 —— 这是这种写法的固有风险。当前方括号臂（63）其实盖过尖括号臂（58），而方括号闭标记
 // 最长也就 42 个字符，本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，
@@ -456,15 +465,40 @@ const skipTrailingFence = (text, from, tail, canGrow) => {
 };
 
 /**
- * 负载后面可能还跟着一个（同样写坏了的）闭标签，吞掉它，否则它会作为正文泄漏。
- * @returns {{ end: number, needMore: boolean }} end === from 表示没有闭标签
+ * 跳过配平点之后的空白和有上界的闭合残渣（见 TRAILING_DEBRIS_MAX）。
+ * 全有全无：残渣超过上界就当作根本没有残渣，index 停在第一个非空白字符上。
+ * @returns {{ index: number, debrisEnd: number }} index 是下一个待判定字符；
+ *   debrisEnd 是残渣之后的位置，=== from 表示没有残渣（或残渣超界）
  */
-const consumeTrailingCloser = (text, from, canGrow) => {
+const skipClosingDebris = (text, from) => {
   let index = from;
   while (index < text.length && /\s/.test(text[index])) index += 1;
-  if (index >= text.length) return { end: from, needMore: !!canGrow };
+  const firstNonBlank = index;
+  let debris = 0;
+  let debrisEnd = from;
+  while (index < text.length) {
+    const ch = text[index];
+    if (/\s/.test(ch)) { index += 1; continue; }
+    if (ch !== '}' && ch !== ']') break;
+    if (debris >= TRAILING_DEBRIS_MAX) return { index: firstNonBlank, debrisEnd: from };
+    debris += 1;
+    index += 1;
+    debrisEnd = index;
+  }
+  return { index, debrisEnd };
+};
+
+/**
+ * 负载后面可能还跟着一个（同样写坏了的）闭标签，吞掉它，否则它会作为正文泄漏。
+ * 配平点和闭标签之间允许有界的闭合残渣（`}}}` 多出的那个 '}'）；残渣不论后面有没有
+ * 闭标签都吞掉 —— 它绝不是回答的一部分。
+ * @returns {{ end: number, needMore: boolean }} end === from 表示既无闭标签也无残渣
+ */
+const consumeTrailingCloser = (text, from, canGrow) => {
+  const { index, debrisEnd } = skipClosingDebris(text, from);
+  if (index >= text.length) return { end: debrisEnd, needMore: !!canGrow };
   const head = text[index];
-  if (head !== '<' && head !== '[') return { end: from, needMore: false };
+  if (head !== '<' && head !== '[') return { end: debrisEnd, needMore: false };
   const slice = text.slice(index, index + TOOL_CALL_CLOSE_MAX);
   const match = slice.match(head === '<' ? TOOL_CALL_CLOSE_RE : TOOL_CALL_CLOSE_BRACKET_RE);
   if (match) return { end: index + match[0].length, needMore: false };
@@ -473,14 +507,25 @@ const consumeTrailingCloser = (text, from, canGrow) => {
     ? (!slice.includes('>') && !slice.includes('＞') && !slice.includes('<', 1))
     : (!slice.includes(']') && !slice.includes('[', 1));
   if (canGrow && slice.length < TOOL_CALL_CLOSE_MAX && terminator) {
-    return { end: from, needMore: true };
+    return { end: debrisEnd, needMore: true };
   }
   // 流已经结束了：光秃秃的 `</tool_call` / `[END TOOL CALL` 后面什么都没有，那它就是闭标记。
   const bare = slice.match(head === '<' ? TOOL_CALL_CLOSE_BARE_RE : TOOL_CALL_CLOSE_BRACKET_BARE_RE);
   if (!canGrow && bare && !slice.slice(bare[0].length).trim()) {
     return { end: index + slice.length, needMore: false };
   }
-  return { end: from, needMore: false };
+  // 流到此为止，尾巴是**半个**闭标记（`[END TOOL C` + EOF）：bare 正则要求关键字写全，
+  // 所以截断的前缀匹配不上，以前整段作为正文放出去。后果比"多出一段脏字"严重得多：
+  // 放出去的 `\n[END ` 让紧随其后的 `[TOOL CALL]` 通不过"触发器必须是首个内容"那道闸门，
+  // 于是一个**真实的工具调用被静默丢弃**（实测：期望两个调用，只拿到 Bash 一个）。
+  //
+  // isDanglingCloserPrefix 只认规范拼写的字面前缀且必须占满剩余单行，判不准就当正文放行；
+  // 光秃秃的一个 '[' 因此仍然是正文（rest 为空 → false），那确实无从判断。
+  // end 取 text.length 而不是 index + slice.length：slice 只是 63 字符的窗口。
+  if (!canGrow && isDanglingCloserPrefix(text.slice(index))) {
+    return { end: text.length, needMore: false };
+  }
+  return { end: debrisEnd, needMore: false };
 };
 
 /**
@@ -493,14 +538,15 @@ const consumeTrailingCloser = (text, from, canGrow) => {
  * 负载」永远凑不齐这里要求的闭标记，而「模型自己想调用却写坏了协议」的输出带着它。
  * 闭标记因此必须强制、必须紧邻（邻接规则）、必须是方括号形式 —— 三者都不许放松。
  *
- * 邻接规则的判定：配平点之后跳过空白；一旦出现既非空白、又不能开始闭标记（'['）
- * 的字符，立刻判负（found:false），调用方立即按正文放行。只有尾巴还是纯空白、
- * 或是一个仍可能长成闭标记的 '[' 前缀（上界 TOOL_CALL_CLOSE_MAX）时才等待更多输入。
+ * 邻接规则的判定：配平点之后跳过空白和有界的闭合残渣（skipClosingDebris —— 残渣是
+ * 模型自己写坏的协议，不是不可信内容能伪造出闭标记的途径，闭标记本身仍然强制）；
+ * 一旦出现既非空白、又不能开始闭标记（'['）的字符，立刻判负（found:false），调用方
+ * 立即按正文放行。只有尾巴还是纯空白、或是一个仍可能长成闭标记的 '[' 前缀
+ * （上界 TOOL_CALL_CLOSE_MAX）时才等待更多输入。
  * @returns {{ end: number, needMore: boolean, found: boolean }}
  */
 const consumeMandatoryBracketCloser = (text, from, canGrow) => {
-  let index = from;
-  while (index < text.length && /\s/.test(text[index])) index += 1;
+  const { index } = skipClosingDebris(text, from);
   if (index >= text.length) return { end: from, needMore: !!canGrow, found: false };
   if (text[index] !== '[') return { end: from, needMore: false, found: false };
   const slice = text.slice(index, index + TOOL_CALL_CLOSE_MAX);
@@ -1590,8 +1636,9 @@ const parseToolCallsFromText = (fullText, options = {}) => {
   // 捏出 tool_use。正则触发器保持旧行为。
   const salvage = !!allowedToolNames;
   // 引号修复 / 尾巴名字抢救的上下文：非空白名单**且** toolSchemas 齐备才存在
-  // （fail closed —— schema 闸门是抢救的一半边界）。只有 anthropic 路径传
-  // toolSchemas；chat.js / openai 路径不传，行为不变。
+  // （fail closed —— schema 闸门是抢救的一半边界）。anthropic 路径与 OpenAI Agent 运行时
+  // （openai-agent-runtime.js，自 spec-agent-turn-cutoff-openai-parity）都传 toolSchemas，
+  // 但只在 answer phase；think phase 的解析与 chat.js 的旧非-Agent 分支不传，行为不变。
   const repairSalvage = allowedToolNames && options.toolSchemas
     ? { allowedToolNames, toolSchemas: options.toolSchemas }
     : null;
@@ -1907,7 +1954,8 @@ const parseToolCallsFromText = (fullText, options = {}) => {
     // （"Let me check…"、"## Plan"），于是每一个叙述后的真调用都无声丢失。现在：
     // 调用方带齐抢救上下文（白名单 + toolSchemas）时，先构造负载，过
     // gateAfterProsePayload（白名单 + required 键）就晋升为调用，每次留一行来源日志；
-    // 不过（或没有抢救上下文 —— OpenAI 路径今天不传 toolSchemas，fail closed）则
+    // 不过（或没有抢救上下文 —— 没有 toolSchemas 就 fail closed：think phase 的解析和
+    // chat.js 的旧非-Agent 分支正是这种情况）则
     // 按旧规矩压制：不产生调用、不进 errors、不点火重试，但整段仍然**吞掉**（连带
     // 紧随其后的重复闭标记）：它是工具标记，不是回答。放回正文会让裸协议漏给客户端
     // —— 模型在 thinking 里写 `checking <tool_call>{…}</tool_call>` 正是这一种。

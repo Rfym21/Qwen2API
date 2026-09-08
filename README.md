@@ -103,6 +103,7 @@ LEGACY_REASONING_IN_CONTENT=false # 推理输出格式，false=reasoning_content
 SIMPLE_MODEL_MAP=false        # 简化模型映射 (true/false)
 MODELS_CACHE_TTL=3600         # 模型列表缓存有效期（秒），0=永不过期
 AGENT_TURN_MAX_ATTEMPTS=3     # 单个 Agent 回合生成有效工具调用/最终态的最大尝试数（2-6）
+AGENT_TURN_MAX_TOOL_CALLS=24  # Anthropic 路径单轮文本通道 tool_use 上限（4-256），到数即截断上游
 AGENT_TURN_ALLOW_PROSE_WITH_TOOLS=false  # 允许工具调用回合同时带可见正文（Anthropic 客户端）
 AGENT_TURN_ACCEPT_BARE_FINAL=false       # 允许没有 <agent_final> 包装的可见正文作为正常结束
 AGENT_CONTEXT_FILE_THRESHOLD_BYTES=92160 # 超过阈值时外置完整 Agent 上下文
@@ -140,6 +141,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `AGENT_TURN_ALLOW_PROSE_WITH_TOOLS` | 放宽回合门禁：允许同一回合既有有效工具调用又有可见正文。Anthropic Messages API 允许 `text` 与 `tool_use` 共存，Claude Code 等客户端因此会被严格模式反复判为 `invalid_tool_call` | `false` |
 | `AGENT_TURN_ACCEPT_BARE_FINAL` | 放宽回合门禁：把有可见正文但缺少 `<agent_final>` 包装的回合按 `finish_reason=stop` 接受，而不是判为 `bare` 并重试 | `false` |
 | `AGENT_TURN_MAX_ATTEMPTS` | 工具请求在一次 HTTP 回合内生成有效 `tool_calls`、明确完成态或阻塞态的最大尝试数；范围 2–6，耗尽后非流式请求返回 HTTP 429/503，SSE 请求返回显式错误帧，绝不伪装成正常 `stop` | `3` |
+| `AGENT_TURN_MAX_TOOL_CALLS` | Anthropic 路径：一轮 Agent 回合里文本通道 `tool_use` 的上限（4–256）。模型在叙述的 `[TOOL CALL]` 之后失控（同一调用重复上百次、幻想整段会话）时，第 N 个已放行的调用之后立刻终止上游，已放行的调用以 `stop_reason=tool_use` 交付；更早的 delta 里已放行过调用之后再出现重复、被拒绝的调用或正文/思考同样截断 | `24` |
 | `AGENT_CONTEXT_FILE_THRESHOLD_BYTES` | Agent 请求体超过此大小时，将完整工具定义和历史自动外置为 Qwen 文本文档，避免触发约 128 KiB 的 WAF 限制 | `92160`（90 KiB） |
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |

@@ -19,6 +19,7 @@ const { describe, it } = test;
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const { Readable } = require('node:stream');
 
 // Sin red en tests: mismos parches de require-cache que anthropic-native-toolcall.test.js.
@@ -27,7 +28,8 @@ modelsMap.getLatestModels = async () => { throw new Error('offline test: no mode
 const requestModule = require('../src/utils/request.js');
 requestModule.sendChatRequest = async () => ({ status: false });
 
-const { handleAnthropicStream } = require('../src/controllers/anthropic.js');
+const { handleAnthropicStream, handleAnthropicNonStream } = require('../src/controllers/anthropic.js');
+const { logger } = require('../src/utils/logger.js');
 
 test.after(() => {
   require('../src/utils/account.js').destroy();
@@ -44,6 +46,28 @@ const createMockStreamResponse = () => ({
   end(chunk = '') { this.output += String(chunk); this.writableEnded = true; }
 });
 
+const createMockJsonResponse = () => ({
+  statusCode: 200,
+  body: null,
+  headers: {},
+  set(headers) { Object.assign(this.headers, headers); return this; },
+  status(code) { this.statusCode = code; return this; },
+  json(payload) { this.body = payload; return this; }
+});
+
+/** Spy sobre logger.warn (el metodo REAL — logger.warning no existe en el singleton). */
+const captureWarns = async (fn) => {
+  const saved = logger.warn;
+  const lines = [];
+  logger.warn = (message) => { lines.push(String(message)); };
+  try {
+    await fn();
+  } finally {
+    logger.warn = saved;
+  }
+  return lines;
+};
+
 const answerFrame = (content) => `data: ${JSON.stringify({
   choices: [{ delta: { phase: 'answer', content }, finish_reason: null }]
 })}\n\n`;
@@ -58,10 +82,28 @@ const STOP = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [
 const turnOf = (...frames) => () => Readable.from([...frames, STOP]);
 
 /** El texto entero en frames de `chunk` bytes — la forma del incidente en el wire. */
-const chunkedTurn = (text, chunk = 9) => () => {
+const chunkFrames = (text, chunk = 9) => {
   const frames = [];
   for (let i = 0; i < text.length; i += chunk) frames.push(answerFrame(text.slice(i, i + chunk)));
-  return Readable.from([...frames, STOP]);
+  return frames;
+};
+const chunkedTurn = (text, chunk = 9) => () => Readable.from([...chunkFrames(text, chunk), STOP]);
+
+/**
+ * Upstream que registra cada frame que el consumidor le PIDE. Se entrega el generador
+ * crudo (consumeSSEStream solo necesita Symbol.asyncIterator): Readable.from
+ * pre-cargaria hasta highWaterMark objetos y served[] mentiria — un corte no se puede
+ * probar con chunkedTurn. Variante generador: frames + STOP, bajo demanda.
+ */
+const recordingUpstream = (frames) => {
+  const served = [];
+  async function* gen() {
+    for (const frame of frames) {
+      served.push(frame);
+      yield frame;
+    }
+  }
+  return { served, stream: gen() };
 };
 
 const scriptedSender = (...turns) => {
@@ -106,6 +148,11 @@ const baseCtx = (sendRequest, overrides) => ({
 const runStream = (upstream, sendRequest, overrides = {}) => {
   const res = createMockStreamResponse();
   return handleAnthropicStream(res, baseCtx(sendRequest, overrides), upstream()).then(() => res);
+};
+
+const runNonStream = (upstream, sendRequest, overrides = {}) => {
+  const res = createMockJsonResponse();
+  return handleAnthropicNonStream(res, baseCtx(sendRequest, overrides), upstream()).then(() => res);
 };
 
 /** Eventos Anthropic del wire, en orden. */
@@ -153,6 +200,11 @@ const visibleTextOf = (output) => eventsOf(output)
   .join('');
 
 const stopReasonOf = (output) => eventsOf(output).find(event => event.type === 'message_delta')?.delta?.stop_reason;
+
+const thinkingTextOf = (output) => eventsOf(output)
+  .filter(event => event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta')
+  .map(event => event.delta.thinking)
+  .join('');
 
 const FIXTURE = fs.readFileSync(
   path.join(__dirname, 'fixtures', 'incident-2026-09-02-narrated-batch.txt'),
@@ -316,5 +368,627 @@ describe('narrated tool calls reach the client (spec 2026-09-02)', () => {
     assert.doesNotMatch(res.output, /\[END/, 'the closer bytes are consumed');
     assert.equal(stopReasonOf(res.output), 'end_turn');
     assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+});
+
+// ── Spec agent-turn-cutoff-text-channel (2026-09-05) ──
+// Prod 2026-09-03..06: tras escribir un [TOOL_CALL] narrado el modelo seguia generando —
+// la misma llamada repetida cientos de veces o una sesion agentica entera alucinada
+// (respuestas con 245/437/531 tool_use consecutivos que Claude Code ejecuto en bypass;
+// streams de 6-60 min). Solo los lotes NATIVOS cortaban el upstream. Aqui se pina el
+// espejo para el canal de texto: admitida una llamada en un push ANTERIOR, la primera
+// senal de descontrol (duplicado / rechazo / prosa o thinking / la N-esima llamada) corta
+// el upstream y entrega lo admitido con stop_reason tool_use. `served.length` sobre el
+// generador crudo prueba el corte; el warn de corte nombra la regla.
+
+const CUT_RE = /提前终止上游/;
+const cutLinesOf = (warns) => warns.filter(line => CUT_RE.test(line));
+const callFrame = (name, args) => answerFrame(`[TOOL CALL]${JSON.stringify({ name, arguments: args })}[END TOOL CALL]`);
+const readCall = (file) => callFrame('Read', { file_path: file });
+const REJECTED_CALL_FRAME = answerFrame('[TOOL_CALL]{"name":"WebSearch","arguments":{"query":"x"}}[END TOOL CALL]');
+
+// Frames nativos byte-fieles a la captura foreign (copiados de anthropic-native-toolcall.test.js):
+// llamada del cliente por la via nativa (snapshot acumulativo, sin function_id) y el lookup
+// `role:function` que la cierra.
+const nativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
+  choices: [{
+    delta: {
+      role: 'assistant',
+      content: '',
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name, arguments: snapshot },
+      extra: { display_position: 'answer' }
+    },
+    finish_reason: null
+  }]
+})}\n\n`;
+const notExistsFrame = (name) => `data: ${JSON.stringify({
+  choices: [{
+    delta: { role: 'function', content: `Tool ${name} does not exists.`, phase: 'answer', status: 'typing', name },
+    finish_reason: null
+  }]
+})}\n\n`;
+
+const runStreamRecorded = async (frames, sender, overrides) => {
+  const { served, stream } = recordingUpstream(frames);
+  let res;
+  const warns = await captureWarns(async () => {
+    res = await runStream(() => stream, sender, overrides);
+  });
+  return { res, served, warns };
+};
+
+const runNonStreamRecorded = async (frames, sender, overrides) => {
+  const { served, stream } = recordingUpstream(frames);
+  let res;
+  const warns = await captureWarns(async () => {
+    res = await runNonStream(() => stream, sender, overrides);
+  });
+  return { res, served, warns };
+};
+
+const bodyToolUses = (res) => (res.body?.content || []).filter(block => block.type === 'tool_use');
+const bodyTextBlocks = (res) => (res.body?.content || []).filter(block => block.type === 'text').map(block => block.text);
+
+describe('text-channel runaway cut-off (spec agent-turn-cutoff-text-channel, stream)', () => {
+  it('legit parallel batch: 5 distinct calls separated by \\n\\n → 5 tool_use in order, tool_use stop, whole stream consumed, no cut', async () => {
+    const sender = scriptedSender();
+    const frames = ['a', 'b', 'c', 'd', 'e'].map((file, i) =>
+      answerFrame(`${i ? '\n\n' : ''}[TOOL CALL]{"name":"Read","arguments":{"file_path":"${file}"}}[END TOOL CALL]`));
+    const { res, served, warns } = await runStreamRecorded([...frames, STOP], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUsesOf(res.output).map(u => JSON.parse(u.args).file_path), ['a', 'b', 'c', 'd', 'e']);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.equal(served.length, frames.length + 1, 'the whole stream (STOP included) is consumed');
+    assert.deepEqual(cutLinesOf(warns), [], 'whitespace between back-to-back calls never cuts');
+    assert.equal(visibleTextOf(res.output).trim(), '');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('prose then first call in ONE push → text block + 1 tool_use, no cut', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      answerFrame('Let me look.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]'),
+      STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(textBlocksOf(res.output).map(t => t.trim()), ['Let me look.']);
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(served.length, 2, 'nothing to cut: the STOP is pulled');
+    assert.deepEqual(cutLinesOf(warns), []);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('repeat loop: call A, later push repeats A byte-identical → 1 tool_use, cut on the duplicate frame, 重复 warn + one cut warn naming duplicate', async () => {
+    const sender = scriptedSender();
+    const A = readCall('a');
+    const { res, served, warns } = await runStreamRecorded([A, A, A, A, STOP], sender);
+
+    assert.equal(sender.calls.length, 0, 'a cut turn never retries');
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(served.length, 2, 'the third repeat is never pulled from upstream');
+    assert.ok(warns.some(line => /重复/.test(line)), `expected the duplicate line, got:\n${warns.join('\n')}`);
+    const cuts = cutLinesOf(warns);
+    assert.equal(cuts.length, 1, 'exactly one cut line');
+    assert.match(cuts[0], /duplicate/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('repeat loop in 9-byte chunks (the wire shape of prod deltas): 1 tool_use, cut before the second repeat finishes streaming', async () => {
+    const sender = scriptedSender();
+    const A = '[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]';
+    const frames = chunkFrames(`${A}\n${A}\n${A}`, 9);
+    const { res, served, warns } = await runStreamRecorded([...frames, STOP], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.ok(served.length < frames.length, `cut mid-stream: served ${served.length} of ${frames.length + 1}`);
+    assert.match(cutLinesOf(warns).join('\n'), /duplicate/);
+    assert.equal(visibleTextOf(res.output).trim(), '', 'the whitespace between repeats never becomes prose');
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('rejected after admitted: call A, later push a [TOOL_CALL] to a tool not in the allowlist → 1 tool_use, cut on that frame, no retry, no 502, zero protocol bytes', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(GOOD_READ_CALL)));
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'), REJECTED_CALL_FRAME, answerFrame('and then more'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 0, 'the rejected call after an admitted one is a runaway signal, not a tool_error retry');
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(served.length, 2, 'cut on the rejected frame');
+    assert.match(cutLinesOf(warns).join('\n'), /rejected/);
+    assert.doesNotMatch(res.output, /TOOL.?CALL/i, 'the rejected span is stripped: zero protocol bytes on the wire');
+    assert.doesNotMatch(res.output, /WebSearch/);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('prose after call: call A, later push "Now I will…", then a think frame → 1 tool_use, cut on the prose frame, visible text and thinking both empty', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'), answerFrame('Now I will run the tests.'), thinkFrame('let me think'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(visibleTextOf(res.output), '');
+    assert.equal(thinkingTextOf(res.output), '');
+    assert.equal(served.length, 2, 'served frames end at the prose frame');
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('think after call: call A, later push phase think → cut, no thinking block after the tool_use', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'), thinkFrame('second thoughts'), answerFrame('Done.'), STOP
+    ], sender);
+
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(thinkingTextOf(res.output), '');
+    assert.equal(
+      eventsOf(res.output).some(e => e.type === 'content_block_start' && e.content_block?.type === 'thinking'),
+      false,
+      'no thinking block is ever opened after the tool_use'
+    );
+    assert.equal(served.length, 2, 'cut on the think frame');
+    assert.match(cutLinesOf(warns).join('\n'), /think/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('cap: 30 distinct calls back-to-back → exactly 24 tool_use, cut right after the 24th, warn names the cap', async () => {
+    const sender = scriptedSender();
+    const frames = Array.from({ length: 30 }, (_, i) => readCall(`f${i}`));
+    const { res, served, warns } = await runStreamRecorded([...frames, STOP], sender);
+
+    const files = toolUsesOf(res.output).map(u => JSON.parse(u.args).file_path);
+    assert.equal(files.length, 24);
+    assert.deepEqual(files, Array.from({ length: 24 }, (_, i) => `f${i}`), 'the first 24 in order, the 24th delivered');
+    assert.equal(served.length, 24, 'the 25th call is never pulled from upstream');
+    const cuts = cutLinesOf(warns);
+    assert.equal(cuts.length, 1);
+    assert.match(cuts[0], /cap/);
+    assert.match(cuts[0], /24\/24/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('cross-channel copy: native Bash + the same Bash narrated → 1 tool_use, no cut (the ledger drop is not a runaway signal)', async () => {
+    const sender = scriptedSender();
+    const { res, warns } = await runStreamRecorded([
+      nativeCallFrame('Bash', ''),
+      nativeCallFrame('Bash', '{"command": "git status"}'),
+      nativeCallFrame('Bash', '{"command": "git status"}'),
+      callFrame('Bash', { command: 'git status' }),
+      notExistsFrame('Bash'),
+      STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUseNames(res.output), ['Bash']);
+    assert.ok(warns.some(line => /跨通道/.test(line)), 'the narrated copy was dropped by the shared ledger');
+    assert.deepEqual(cutLinesOf(warns), [], 'a cross-channel duplicate never cuts');
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('fresh per attempt: a tool_error retry after a rejected first attempt starts with an empty flag/counter/ledger and still cuts on its own duplicate', async () => {
+    const A = readCall('a');
+    const retry = recordingUpstream([A, A, A, STOP]);
+    const sender = scriptedSender(() => retry.stream);
+    const { res, warns } = await runStreamRecorded([
+      answerFrame('[TOOL CALL]{"name":"NotATool","arguments":{}}[END TOOL CALL]'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 1, 'first-position unknown_tool → one tool_error retry');
+    assert.deepEqual(toolUseNames(res.output), ['Read'], 'the retry\'s first call is delivered once');
+    assert.equal(retry.served.length, 2, 'the retry attempt is cut on its own duplicate frame');
+    assert.equal(cutLinesOf(warns).length, 1);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+});
+
+describe('text-channel runaway cut-off (non-stream twin)', () => {
+  it('legit parallel batch → 5 tool_use, whole stream consumed, no cut', async () => {
+    const sender = scriptedSender();
+    const frames = ['a', 'b', 'c', 'd', 'e'].map((file, i) =>
+      answerFrame(`${i ? '\n\n' : ''}[TOOL CALL]{"name":"Read","arguments":{"file_path":"${file}"}}[END TOOL CALL]`));
+    const { res, served, warns } = await runNonStreamRecorded([...frames, STOP], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), ['a', 'b', 'c', 'd', 'e']);
+    assert.equal(res.body.stop_reason, 'tool_use');
+    assert.equal(served.length, frames.length + 1);
+    assert.deepEqual(cutLinesOf(warns), []);
+  });
+
+  it('repeat loop → 1 tool_use, cut on the duplicate frame, 重复 + cut warn', async () => {
+    const sender = scriptedSender();
+    const A = readCall('a');
+    const { res, served, warns } = await runNonStreamRecorded([A, A, A, STOP], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Read']);
+    assert.equal(res.body.stop_reason, 'tool_use');
+    assert.equal(served.length, 2);
+    assert.ok(warns.some(line => /重复/.test(line)));
+    assert.match(cutLinesOf(warns).join('\n'), /duplicate/);
+  });
+
+  it('rejected after admitted → 1 tool_use, no text block, no 502, no retry, zero protocol bytes in the body', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(GOOD_READ_CALL)));
+    const { res, served, warns } = await runNonStreamRecorded([
+      readCall('a'), REJECTED_CALL_FRAME, answerFrame('and then more'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Read']);
+    assert.deepEqual(bodyTextBlocks(res), [], 'answerContent ends at the cut: no text block at all');
+    assert.equal(res.body.stop_reason, 'tool_use');
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /rejected/);
+    assert.doesNotMatch(JSON.stringify(res.body), /TOOL.?CALL|WebSearch/i);
+  });
+
+  it('prose after call → 1 tool_use, the prose never enters the content, cut on the prose frame', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runNonStreamRecorded([
+      readCall('a'), answerFrame('Now I will run the tests.'), thinkFrame('let me think'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual((res.body?.content || []).map(b => b.type), ['tool_use'], 'no text block, no thinking block');
+    assert.equal(res.body.stop_reason, 'tool_use');
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+  });
+
+  it('cap → exactly 24 tool_use, cut right after the 24th', async () => {
+    const sender = scriptedSender();
+    const frames = Array.from({ length: 30 }, (_, i) => readCall(`f${i}`));
+    const { res, served, warns } = await runNonStreamRecorded([...frames, STOP], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), Array.from({ length: 24 }, (_, i) => `f${i}`));
+    assert.equal(res.body.stop_reason, 'tool_use');
+    assert.equal(served.length, 24);
+    assert.match(cutLinesOf(warns).join('\n'), /cap/);
+  });
+
+  it('fresh per attempt: the retry after a tool_error first attempt gets its own guard and is cut on its own duplicate', async () => {
+    const A = readCall('a');
+    const retry = recordingUpstream([A, A, A, STOP]);
+    const sender = scriptedSender(() => retry.stream);
+    const { res, warns } = await runNonStreamRecorded([
+      answerFrame('[TOOL CALL]{"name":"NotATool","arguments":{}}[END TOOL CALL]'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 1);
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Read']);
+    assert.equal(retry.served.length, 2, 'the retry stream is cut on its duplicate frame');
+    assert.equal(cutLinesOf(warns).length, 1);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+});
+
+describe('AGENT_TURN_MAX_TOOL_CALLS config knob', () => {
+  // config/index.js snapshots env at load, so each value is read in a child process.
+  const capWith = (value) => {
+    // '' en vez de borrar la clave: dotenv nunca sobreescribe una clave existente, asi que
+    // un .env local que fije AGENT_TURN_MAX_TOOL_CALLS no puede romper "unset → 24"
+    // (parseInt('') → NaN → 24).
+    const env = { ...process.env, AGENT_TURN_MAX_TOOL_CALLS: value === undefined ? '' : value };
+    const out = execFileSync(
+      process.execPath,
+      ['-e', 'process.stdout.write(String(require("./src/config/index.js").agentTurnMaxToolCalls))'],
+      { cwd: path.join(__dirname, '..'), env }
+    );
+    return Number(out.toString());
+  };
+
+  it('unset → 24; outside 4..256 is clamped; non-numeric → 24', () => {
+    assert.equal(capWith(undefined), 24);
+    assert.equal(capWith('100'), 100);
+    assert.equal(capWith('1000'), 256);
+    assert.equal(capWith('1'), 4);
+    assert.equal(capWith('0'), 4);
+    assert.equal(capWith('abc'), 24);
+  });
+});
+
+// ── Pines del review loop 1 (2026-09-05, tres revisores) ──
+
+const config = require('../src/config/index.js');
+const THIRTY_CALLS_ONE_PUSH = answerFrame(
+  Array.from({ length: 30 }, (_, i) => `[TOOL CALL]{"name":"Read","arguments":{"file_path":"f${i}"}}[END TOOL CALL]`).join('\n')
+);
+const TWENTY_FOUR_FILES = Array.from({ length: 24 }, (_, i) => `f${i}`);
+// Rule (b), warning arm: tras prosa, un Read sin file_path falla la puerta semantica →
+// solo un warning `triggered_unrecovered` con reason `after prose: …` (ni error ni recoveredText).
+const ARMED_AFTER_PROSE = answerFrame('Let me look.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]');
+const SCHEMA_REJECTED_AFTER_PROSE = answerFrame('\n[TOOL CALL]{"name":"Read","arguments":{}}[END TOOL CALL]');
+// Rule (f): prosa + llamada en el MISMO push tras armar → la llamada se entrega y el push corta.
+const SAME_PUSH_PROSE_AND_CALL = answerFrame('Now b:\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"b"}}[END TOOL CALL]');
+const withToolCallCap = async (cap, fn) => {
+  const saved = config.agentTurnMaxToolCalls;
+  config.agentTurnMaxToolCalls = cap;
+  try {
+    return await fn();
+  } finally {
+    config.agentTurnMaxToolCalls = saved;
+  }
+};
+// Frame de resultado de web_search (role function, plataforma): `webSearchInfo` se captura
+// ANTES del normalizador, que lo tira (no es herramienta del cliente → no cuenta como
+// interceptacion).
+const webSearchFrame = (sites) => `data: ${JSON.stringify({
+  choices: [{
+    delta: { role: 'function', name: 'web_search', phase: 'answer', content: '', extra: { web_search_info: sites } },
+    finish_reason: null
+  }]
+})}\n\n`;
+const SITES = [{ title: 'Doc', url: 'https://example.test/doc', hostname: 'example.test' }];
+
+describe('review loop 1 pins (stream)', () => {
+  it('P1: one push with 30 complete distinct calls → exactly 24 tool_use, cut warn names cap (no arming gate for the cap)', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([THIRTY_CALLS_ONE_PUSH, STOP], sender);
+
+    assert.deepEqual(toolUsesOf(res.output).map(u => JSON.parse(u.args).file_path), TWENTY_FOUR_FILES);
+    assert.equal(served.length, 1, 'cut inside the first push: the STOP is never pulled');
+    const cuts = cutLinesOf(warns);
+    assert.equal(cuts.length, 1);
+    assert.match(cuts[0], /cap/);
+    assert.match(cuts[0], /24\/24/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+    assert.doesNotMatch(res.output, /"type":"error"/);
+  });
+
+  it('P2: cut on prose with a closer-less call pending in the SAME push → no flush: exactly one tool_use, no truncated_tool_call / 工具协议出错 lines', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'),
+      answerFrame('Now I will\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"b"}}'),
+      answerFrame('[END TOOL CALL]'),
+      STOP
+    ], sender);
+
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(toolUsesOf(res.output).length, 1, 'the pending call is never flushed into a second tool_use');
+    assert.equal(served.length, 2);
+    assert.equal(visibleTextOf(res.output), '');
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+    assert.equal(warns.some(line => /truncated_tool_call|工具协议出错|解析 tool_call 负载失败/.test(line)), false,
+      `a cut must not convict its own leftover:\n${warns.join('\n')}`);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P2 (unbalanced variant): the half-streamed payload left by the cut is not convicted as truncated_tool_call', async () => {
+    const sender = scriptedSender();
+    const { res, warns } = await runStreamRecorded([
+      readCall('a'),
+      answerFrame('Now I will\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"b"'),
+      answerFrame('}}[END TOOL CALL]'),
+      STOP
+    ], sender);
+
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(warns.some(line => /truncated_tool_call|工具协议出错|解析 tool_call 负载失败/.test(line)), false,
+      `self-inflicted truncation must not be logged:\n${warns.join('\n')}`);
+    assert.doesNotMatch(res.output, /"type":"error"/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P4: whitespace-only think delta after arming opens no thinking block; the next non-whitespace think cuts', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'), thinkFrame('\n'), thinkFrame('more'), STOP
+    ], sender);
+
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.equal(
+      eventsOf(res.output).some(e => e.type === 'content_block_start' && e.content_block?.type === 'thinking'),
+      false,
+      'no thinking block behind the tool_use'
+    );
+    assert.equal(served.length, 3, 'cut on the non-whitespace think frame');
+    assert.match(cutLinesOf(warns).join('\n'), /think/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P6c: a non-default cap reaches the handler: agentTurnMaxToolCalls=5, 30 calls → 5 tool_use, served 5, warn 5/5', async () => {
+    const sender = scriptedSender();
+    const frames = Array.from({ length: 30 }, (_, i) => readCall(`f${i}`));
+    const { res, served, warns } = await withToolCallCap(5, () => runStreamRecorded([...frames, STOP], sender));
+
+    assert.equal(toolUsesOf(res.output).length, 5);
+    assert.equal(served.length, 5);
+    assert.match(cutLinesOf(warns).join('\n'), /5\/5/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P6d: rule (b) warning arm — a schema-rejected call after prose (triggered_unrecovered "after prose: …", no error) cuts as rejected', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(GOOD_READ_CALL)));
+    const { res, served, warns } = await runStreamRecorded([
+      ARMED_AFTER_PROSE, SCHEMA_REJECTED_AFTER_PROSE, answerFrame('tail'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(toolUseNames(res.output), ['Read']);
+    assert.deepEqual(textBlocksOf(res.output).map(t => t.trim()), ['Let me look.']);
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /rejected/);
+    assert.doesNotMatch(res.output, /TOOL CALL/i);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P6f: same-push prose + call after arming → the call is delivered AND the push cuts with prose', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runStreamRecorded([
+      readCall('a'), SAME_PUSH_PROSE_AND_CALL, answerFrame('tail'), STOP
+    ], sender);
+
+    assert.deepEqual(toolUsesOf(res.output).map(u => JSON.parse(u.args).file_path), ['a', 'b']);
+    assert.equal(visibleTextOf(res.output), '', 'the prose of the triggering push never reaches the wire');
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+    assert.equal(stopReasonOf(res.output), 'tool_use');
+  });
+
+  it('P7: the cut warn prints N/max only for cap; other rules print the count alone', async () => {
+    const sender = scriptedSender();
+    const { warns } = await runStreamRecorded([readCall('a'), answerFrame('Now more.'), STOP], sender);
+    const cut = cutLinesOf(warns)[0];
+    assert.match(cut, /已放行 1 个/);
+    assert.doesNotMatch(cut, /\d+\/\d+/);
+  });
+});
+
+describe('review loop 1 pins (non-stream twin)', () => {
+  it('P1: one push with 30 complete distinct calls → exactly 24 tool_use, cut warn names cap', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runNonStreamRecorded([THIRTY_CALLS_ONE_PUSH, STOP], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), TWENTY_FOUR_FILES);
+    assert.equal(served.length, 1);
+    assert.match(cutLinesOf(warns).join('\n'), /cap/);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('P3: protocol debris released as text BEFORE an admitted call is stripped at delivery on a cut round', async () => {
+    // El unico camino que suelta debris por textDelta con registro (channel text) en modo push
+    // es el payload sintetico de primera posicion que nunca balancea y desborda
+    // TOOL_CALL_SPAN_MAX (1 MiB): el parser lo suelta como debris registrado, reteniendo solo
+    // los ultimos TOOL_CALL_TRIGGER_MAX (16) bytes, que salen como prosa.
+    // Texto con espacios, no una sola "palabra" de 1 MiB: el estimador local de usage
+    // (tiktoken, wasm) revienta con `unreachable` sobre un token de 1 MiB — hallazgo
+    // preexistente, registrado en deferred-work, fuera de este spec.
+    const debris = `{"name":"Read","arguments":{"file_path":"DEBRIS_MARKER ${'word '.repeat(220 * 1024)}`;
+    const sender = scriptedSender();
+    const { res, served, warns } = await runNonStreamRecorded([
+      answerFrame(debris), readCall('a'), answerFrame('Now more.'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), ['a']);
+    assert.equal(served.length, 3, 'cut on the prose frame');
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+    const body = JSON.stringify(res.body);
+    assert.doesNotMatch(body, /DEBRIS_MARKER/, 'the registered debris never reaches the client');
+    const text = bodyTextBlocks(res).join('');
+    assert.ok(text.length <= 16, `only the parser's unregistered 16-byte tail may remain, got ${text.length} chars`);
+    assert.ok(warns.some(line => /按登记位置剥离协议残渣/.test(line)), 'delivery-time stripping ran on the cut round');
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('P6a: think after call → cut, content is only the tool_use, served 2, warn think', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runNonStreamRecorded([
+      readCall('a'), thinkFrame('second thoughts'), answerFrame('Done.'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual((res.body?.content || []).map(b => b.type), ['tool_use']);
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /think/);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('P6b: cross-channel copy (native Bash + the same Bash narrated) → 1 tool_use, no cut', async () => {
+    const sender = scriptedSender();
+    const { res, warns } = await runNonStreamRecorded([
+      nativeCallFrame('Bash', ''),
+      nativeCallFrame('Bash', '{"command": "git status"}'),
+      nativeCallFrame('Bash', '{"command": "git status"}'),
+      callFrame('Bash', { command: 'git status' }),
+      notExistsFrame('Bash'),
+      STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Bash']);
+    assert.deepEqual(cutLinesOf(warns), []);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('P6c: agentTurnMaxToolCalls=5 reaches the non-stream handler: 30 calls → 5 tool_use, served 5', async () => {
+    const sender = scriptedSender();
+    const frames = Array.from({ length: 30 }, (_, i) => readCall(`f${i}`));
+    const { res, served, warns } = await withToolCallCap(5, () => runNonStreamRecorded([...frames, STOP], sender));
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.equal(bodyToolUses(res).length, 5);
+    assert.equal(served.length, 5);
+    assert.match(cutLinesOf(warns).join('\n'), /5\/5/);
+  });
+
+  it('P6d: rule (b) warning arm on the non-stream twin → cut rejected, served 2, one tool_use, prose delivered', async () => {
+    const sender = scriptedSender(turnOf(answerFrame(GOOD_READ_CALL)));
+    const { res, served, warns } = await runNonStreamRecorded([
+      ARMED_AFTER_PROSE, SCHEMA_REJECTED_AFTER_PROSE, answerFrame('tail'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.equal(sender.calls.length, 0);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Read']);
+    assert.deepEqual(bodyTextBlocks(res).map(t => t.trim()), ['Let me look.']);
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /rejected/);
+    assert.doesNotMatch(JSON.stringify(res.body), /TOOL CALL/i);
+  });
+
+  it('P6e: retry-round settlement — tool_error first attempt, then 30 calls on the retry → 24 tool_use, retry served 24', async () => {
+    const frames = Array.from({ length: 30 }, (_, i) => readCall(`f${i}`));
+    const retry = recordingUpstream([...frames, STOP]);
+    const sender = scriptedSender(() => retry.stream);
+    const { res } = await runNonStreamRecorded([
+      answerFrame('[TOOL CALL]{"name":"NotATool","arguments":{}}[END TOOL CALL]'), STOP
+    ], sender);
+
+    assert.equal(sender.calls.length, 1);
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), TWENTY_FOUR_FILES, 'reparsing the cut answerContent would yield 23');
+    assert.equal(retry.served.length, 24);
+    assert.equal(res.body.stop_reason, 'tool_use');
+  });
+
+  it('P6f: same-push prose + call after arming → both calls in content, no text block, cut prose', async () => {
+    const sender = scriptedSender();
+    const { res, served, warns } = await runNonStreamRecorded([
+      readCall('a'), SAME_PUSH_PROSE_AND_CALL, answerFrame('tail'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.input.file_path), ['a', 'b']);
+    assert.deepEqual(bodyTextBlocks(res), [], 'the prose of the triggering push never enters the content');
+    assert.equal(served.length, 2);
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+  });
+
+  it('P6g: search table on a cut round → the table is delivered in the text block ahead of the tool_use', async () => {
+    const sender = scriptedSender();
+    const { res, warns } = await runNonStreamRecorded([
+      webSearchFrame(SITES), readCall('a'), answerFrame('Now more.'), STOP
+    ], sender);
+
+    assert.equal(res.statusCode, 200, `expected delivery, got ${JSON.stringify(res.body?.error || null)}`);
+    assert.deepEqual(bodyToolUses(res).map(b => b.name), ['Read']);
+    assert.match(cutLinesOf(warns).join('\n'), /prose/);
+    const text = bodyTextBlocks(res).join('');
+    assert.match(text, /\[1\] \[Doc\]\(https:\/\/example\.test\/doc\)/, 'the search table survives the cut');
+    assert.doesNotMatch(text, /Now more/);
+    assert.equal(res.body.stop_reason, 'tool_use');
   });
 });

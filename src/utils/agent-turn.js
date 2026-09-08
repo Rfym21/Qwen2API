@@ -1,3 +1,7 @@
+// El logger es la unica dependencia externa de este modulo (fs/path adentro): agent-turn.js
+// sigue siendo hoja del grafo — tool-prompt.js lo requiere, no al reves.
+const { logger } = require('./logger.js')
+
 const AGENT_FINAL_OPEN = '<agent_final>'
 const AGENT_FINAL_CLOSE = '</agent_final>'
 const AGENT_BLOCKED_OPEN = '<agent_blocked>'
@@ -307,6 +311,159 @@ const buildAgentRetryHint = (reason = 'incomplete') => {
   ].join('\n')
 }
 
+/** 键排序后的规范 JSON：跨通道去重要把 `{"a":1,"b":2}` 与 `{"b": 2, "a": 1}` 判成同一份参数。 */
+const canonicalJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
+
+/**
+ * 本轮的工具调用登记簿：同名 + 规范 JSON 相同的第二个调用是跨通道的副本（文本解析器
+ * 与原生累积器各自都能产出同一个调用），只保留先到的。文本解析器的调用是边收边发的，
+ * 收不回来，所以规则只能是操作性的：丢后到的那个。
+ * @returns {(call: Object) => boolean} true = 首次见到，可以发射
+ */
+const createToolCallLedger = () => {
+  const seen = new Set();
+  return (call) => {
+    const args = call?.function?.arguments || '{}';
+    let canonical;
+    try {
+      canonical = canonicalJson(JSON.parse(args));
+    } catch (_) {
+      canonical = args;
+    }
+    const key = `${call?.function?.name || ''}\u0000${canonical}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  };
+};
+
+/**
+ * 文本通道失控信号的告警形态：合成开端被拒（synthetic_rejected），或正文之后的触发器
+ * 没过语义门（after prose: …）。其余 triggered_unrecovered（谈论标签、代码围栏、
+ * Markdown 链接）不是调用，不算失控。
+ */
+const isRejectedTextCallWarning = (warning) =>
+  warning?.type === 'synthetic_rejected' ||
+  (warning?.type === 'triggered_unrecovered' && /^after prose: /.test(String(warning.reason || '')));
+
+/** 一轮里文本通道 tool_use 的上限（config 已钳位 4..256；与 maxAttempts 同样再兜一次底）。 */
+const resolveTextToolCallCap = () => {
+  const config = require('../config/index.js');
+  return Math.min(256, Math.max(4, Number(config.agentTurnMaxToolCalls) || 24));
+};
+
+/**
+ * 文本通道失控守卫（一轮 attempt 一个；流式 / 非流式共用）。
+ *
+ * 生产 2026-09-03..06：模型写完一个叙述的 [TOOL_CALL] 之后继续生成 —— 同一调用重复
+ * 上百次，或幻想整段 agent 会话（单条回复 245/437/531 个背靠背调用，客户端在 bypass
+ * 下全部执行；流长 6-60 分钟）。原生 function_call 批次早有早停（nativeBatchComplete），
+ * 文本通道的调用却从不置 stopRequested。这里是它的镜像：本轮**更早的一次 push**（push =
+ * 一个上游 delta）已经放行 ≥1 个文本通道调用之后，第一个失控信号就截断回合 ——
+ *   (a) duplicate：文本通道同名同参数的第二个调用。只看文本通道自己的登记簿：原生调用
+ *       + 它的文本抄本是跨通道去重，由共享登记簿静默丢弃，不是失控信号；
+ *   (b) rejected：解析器新增硬错误 / 非空 recoveredText / 合成开端被拒 / 正文之后的
+ *       触发器没过语义门；
+ *   (c) prose / think：剥掉 agent 标签后仍有非空白正文，或 think phase 的非空白内容；
+ *   (d) cap：第 N 个已放行的调用（agentTurnMaxToolCalls）—— 该调用照常交付，之后截断。
+ * 武装条件（armed）：本轮**更早的一次 push** 已经放行过 ≥1 个文本通道调用。(a)/(b)/(c)
+ * 只在武装后判定 —— 与完成调用同一 push 里的文本是调用之前的散文，照常交付；背靠背
+ * 调用之间纯空白的 textDelta 永不触发。(d) 不设武装门：第 N 个已放行的调用就是第 N 个，
+ * 与 push 边界无关（一个 delta 里挤着 30 个完整调用同样只交付 N 个）。截断之后守卫不再
+ * 产生规则 —— 同一 push 里剩下的已登记调用仍由调用方发射（cap 除外：调用方在第 N 个
+ * 之后立刻停手）。
+ */
+const createTextChannelRunawayGuard = ({ parser, maxToolCalls, label, tag }) => {
+  const admitTextCall = createToolCallLedger();
+  let admittedInPriorPush = false;
+  let admittedCount = 0;
+  let errorsSeen = 0;
+  let warningsSeen = 0;
+  let cutRule = null;
+
+  /** 正文 push 之后立刻调用（同时推进错误/告警游标）：规则 (b)/(c)，返回规则名或 null。 */
+  const inspectPush = (parsed, strippedText) => {
+    const errors = parser.getErrors().length;
+    const warnings = parser.getWarnings();
+    const rejected = errors > errorsSeen || !!parsed.recoveredText ||
+      warnings.slice(warningsSeen).some(isRejectedTextCallWarning);
+    errorsSeen = errors;
+    warningsSeen = warnings.length;
+    if (cutRule || !admittedInPriorPush) return null;
+    if (rejected) return 'rejected';
+    if (/\S/.test(strippedText)) return 'prose';
+    return null;
+  };
+
+  /**
+   * 每个完成的文本通道调用：先过文本登记簿；首次见到的交给 emit（返回 false = 共享
+   * 登记簿判为跨通道副本，没上线也不计数）。返回规则 (a)/(d) 或 null。
+   */
+  const inspectCall = (call, emit) => {
+    // El cap manda TAMBIEN mientras se drena el push que disparo un corte por otra regla.
+    // Tras un corte esta funcion deja de devolver reglas (incluida 'cap') —— ver el `return
+    // null` de mas abajo —— asi que sin este tope las llamadas restantes de ese mismo push
+    // se admitian y emitian todas: un solo delta con 40 llamadas mas entregaba 41 contra un
+    // cap de 24. En la rama de streaming de Anthropic `emitToolUse` escribe el bloque
+    // tool_use en el cable al instante, asi que ese exceso es irrecuperable.
+    //
+    // Va ANTES del registro (no se toca el ledger) y esta condicionado a `cutRule`, asi que
+    // no puede alterar el camino sin corte: ahi `inspectCall` devuelve 'cap' exactamente al
+    // llegar al tope y todos los llamadores hacen `break`, de modo que nunca se vuelve a
+    // entrar con admittedCount >= maxToolCalls. El unico modo de pasarse del cap era este.
+    if (cutRule && admittedCount >= maxToolCalls) return null;
+    if (!admitTextCall(call)) {
+      logger.warn(
+        `${label} 本轮文本通道重复的工具调用（${call.function.name}，同名同参数），丢弃后到的副本`,
+        tag
+      );
+      return cutRule || !admittedInPriorPush ? null : 'duplicate';
+    }
+    const emitted = emit(call);
+    if (emitted) admittedCount += 1;
+    if (cutRule) return null;
+    // cap 不设武装门：第 N 个就是第 N 个，与 push 边界无关。
+    return emitted && admittedCount >= maxToolCalls ? 'cap' : null;
+  };
+
+  /** think phase 的一帧：规则 (c) 的思考形态。 */
+  const inspectThink = (content) =>
+    (!cutRule && admittedInPriorPush && /\S/.test(content || '')) ? 'think' : null;
+
+  /** 一个 push 收尾：此后已放行的调用算"更早的 push"。 */
+  const endPush = () => {
+    if (admittedCount > 0) admittedInPriorPush = true;
+  };
+
+  /** 记录截断规则；每次截断恰好一行告警，点名规则。 */
+  const cut = (rule) => {
+    cutRule = rule;
+    // 分母只对 cap 有意义；其余规则只报数（"31/24" 读起来像 bug）。
+    const tally = rule === 'cap' ? `${admittedCount}/${maxToolCalls}` : `${admittedCount}`;
+    logger.warn(
+      `${label} 文本通道 tool_use 之后出现失控信号 (${rule})，提前终止上游（本轮已放行 ${tally} 个文本通道调用，用量按本地估算）`,
+      tag
+    );
+  };
+
+  return {
+    inspectPush,
+    inspectCall,
+    inspectThink,
+    endPush,
+    cut,
+    cutRule: () => cutRule,
+    /** 已武装 = 更早的 push 放行过文本通道调用。 */
+    armed: () => admittedInPriorPush
+  };
+};
+
 module.exports = {
   AGENT_FINAL_OPEN,
   AGENT_FINAL_CLOSE,
@@ -319,5 +476,11 @@ module.exports = {
   createAgentTagStripper,
   stripAgentTags,
   buildAgentTurnDirective,
-  buildAgentRetryHint
+  buildAgentRetryHint,
+  // Guarda de fuga del canal de texto — compartida por anthropic.js y openai-agent-runtime.js.
+  canonicalJson,
+  createToolCallLedger,
+  isRejectedTextCallWarning,
+  resolveTextToolCallCap,
+  createTextChannelRunawayGuard
 }

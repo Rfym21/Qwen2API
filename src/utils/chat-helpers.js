@@ -1,10 +1,16 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
 const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
-const { uploadFileToQwenOss } = require('./upload.js')
+// Referencia al módulo, no desestructurada: un binding desestructurado no se puede
+// sustituir desde un test y la prueba acabaría pegando a la red de verdad.
+const uploadModule = require('./upload.js')
 const { getLatestModels } = require('../models/models-map.js')
 const accountManager = require('./account.js')
 const CacheManager = require('./img-caches.js')
+// Singleton a nivel de módulo. Antes se construía uno nuevo en cada parserMessages, o sea
+// en cada petición HTTP; como un turno del usuario son varias peticiones (el bucle de
+// tools), la misma imagen se re-subía entera cada vez.
+const imgCacheManager = new CacheManager()
 const { MODEL_SUFFIXES } = require('./model-suffixes.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -155,7 +161,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
 
         const buffer = Buffer.from(base64Content, 'base64')
         const uploadAccount = accountManager.getAccount()
-        const uploadResult = await uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
+        const uploadResult = await uploadModule.uploadFileToQwenOss(buffer, filename, uploadAccount ? uploadAccount.token : null, uploadAccount)
 
         if (!uploadResult || uploadResult.status !== 200) {
             return null
@@ -170,6 +176,61 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
         logger.error(`${mediaType === 'video' ? '视频' : '图片'}上传失败`, 'UPLOAD', '', error)
         return null
     }
+}
+
+/**
+ * 把 parserMessages 产出的**图片**项从 content[] 移到 Qwen 的 files[] 通道。
+ *
+ * 为什么必须换通道：上游对「content[] 里带图」+「files[] 里带外置上下文文档」这个组合
+ * 返回 500。实测四格（本地复现，qwen3.8-max）：107KiB 无图 files=[txt] → 200；
+ * 61KiB 有图 files=[] → 200；108KiB 有图 files=[txt] → 500（换通道后 → 200）。
+ * 是形状问题，不是体积问题。
+ *
+ * 只搬图片：files[] 里唯一被上游验证过的形状是 {type:'image', url}
+ * （chat.image.video.js 的 image_edit，仓库里仅有的两处 files.push）。视频没有这样的
+ * 先例，所以继续留在 content[] 里，行为与今天完全一致。
+ *
+ * 也只搬 http(s) 图片：被验证过的形状是「已上传的 https URL」。normalizeMediaContentItem
+ * 没能识别的 data: URI 会原样落到这里，把几 MB 的 base64 塞进 files[] 既没有先例，
+ * 也会把请求体撑爆——这种项留在 content[] 里，维持今天的行为。
+ *
+ * @param {string|Array} content - parserMessages 产出的消息内容
+ * @returns {{ content: string|Array, files: Array<{type: 'image', url: string}> }}
+ */
+const extractMediaToFiles = (content) => {
+    if (!Array.isArray(content)) {
+        return { content, files: [] }
+    }
+
+    const files = []
+    const remaining = []
+    for (const item of content) {
+        const descriptor = isMediaContentItem(item) ? getMediaDescriptor(item) : null
+        if (descriptor?.url && descriptor.mediaType === 'image' && HTTP_URL_REGEX.test(descriptor.url)) {
+            files.push({ type: 'image', url: descriptor.url })
+        } else {
+            remaining.push(item)
+        }
+    }
+
+    // 没有图片就原样返回：无图片请求的上游请求体必须逐字节不变（视频也走这一支）。
+    if (files.length === 0) {
+        return { content, files: [] }
+    }
+
+    // 只剩一个纯文本项时收敛回字符串，正是 image_edit 里被上游验证过的形状
+    // （content 是文本，图片全部走 files[]）。
+    if (remaining.length === 1 && remaining[0]?.type === 'text' && typeof remaining[0].text === 'string') {
+        return { content: remaining[0].text, files }
+    }
+
+    // 内容里除了图片什么都没有：绝不能留下 content: []（空提示词）。收敛成空字符串，
+    // 也就是 image_edit 那个被验证过的形状——文本内容 + files[]。
+    if (remaining.length === 0) {
+        return { content: '', files }
+    }
+
+    return { content: remaining, files }
 }
 
 /**
@@ -310,7 +371,6 @@ const formatHistoryMessages = (messages) => {
 const parserMessages = async (messages, thinking_config, chat_type) => {
     try {
         const feature_config = thinking_config
-        const imgCacheManager = new CacheManager()
 
         // 如果只有一条消息,使用原有逻辑处理（不标注角色）
         if (messages.length <= 1) {
@@ -597,7 +657,170 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
     return normalize
 }
 
+// 一个回合最多重新安置几张媒体。deferred-work.md:91。
+const HARVEST_MEDIA_CAP = 4
+
+/**
+ * 这条消息会被 foldToolMessages 改写吗？
+ *
+ * 折叠会把 role=tool / 带 tool_calls 的 assistant 换成**字符串正文**的新对象：数组正文
+ * 被整个 JSON.stringify 掉。媒体项留在这种消息上等于被销毁 —— 几十万字符的 base64 变成
+ * 散文塞进 `[TOOL RESULT]` 块里，files[] 空着，一行日志都没有。所以这类消息即便是最后
+ * 一条，也必须先把媒体收走。
+ *
+ * 判据必须和 tool-prompt.js#foldToolMessages 的两个分支逐字对齐。
+ * @param {object} message
+ * @returns {boolean}
+ */
+const willBeFolded = (message) => {
+    if (!message) return false
+    if (message.role === 'tool' || message.role === 'function') return true
+    return message.role === 'assistant' &&
+        ((Array.isArray(message.tool_calls) && message.tool_calls.length > 0) ||
+            !!message.function_call?.name)
+}
+
+/**
+ * 把**当前回合**里挂错位置的媒体项收上来，交给 attachMediaToLastMessage 重新安置。
+ *
+ * 为什么需要：parserMessages 的多条分支只对 lastMessage 调 normalizeMediaContentItem
+ * （见本文件 :396）。更早那些消息走 formatHistoryMessages → extractTextFromContent，
+ * 非 text 项被整个抹掉，一行日志都没有。于是「图片不是最后一条」等于图片消失。
+ *
+ * 真实客户端恰好都这么发 —— 图片后面还跟着一条纯文本消息：
+ *   Claude Code   [text, image] + 一条 isMeta 的 `[Image: source: …png]`
+ *   OpenClaw      user[text,image_url] … user[text,image_url]（"Attached image(s) from
+ *                 tool result:"）+ 末尾的 OPENCLAW_INTERNAL_CONTEXT 纯文本消息
+ *
+ * 2026-09-08 抓的真实流量（OpenClaw → /v1/chat/completions，透明代理）：同一分钟内
+ * 3/3 条 agent 请求都因为末条是纯文本而丢图（0 次上传），而同期一条 image 结尾的
+ * 旁路请求正常上传。这是同一次抓包里的对照组。
+ *
+ * 只收当前回合：往回扫到上一条**最终答复**（不带 tool_calls 的 assistant）为止。工具
+ * 循环里同一个用户回合会有好几条 assistant，每条都带 tool_calls，都是中间步骤；按
+ * 「任意 assistant」断会让图片在循环的第二步之后就掉出窗口。
+ *
+ * 去重不在这里做，在 attachMediaToLastMessage 里做：那时最后一条已经折叠完毕，才是
+ * 判断「这份是不是已经在场」的正确时点。
+ *
+ * 是 anthropic.js#buildInternalRequest 那段扫描的孪生体。两边必须一起改。
+ *
+ * @param {Array} messages - OpenAI 格式消息数组，**会被就地修改**（摘掉媒体项）
+ * @returns {Array} 收上来的媒体项，按原始顺序
+ */
+const harvestCurrentTurnMedia = (messages) => {
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return []
+    }
+
+    const lastIndex = messages.length - 1
+    let scanFrom = lastIndex
+    // 末条是 assistant 时那通常是 prefill，属于当前回合而不是回合边界：跳过它再找边界。
+    // 但**会被折叠的**末条不能跳过 —— 它自己就是要收割的目标。
+    if (messages[scanFrom]?.role === 'assistant' && !willBeFolded(messages[scanFrom])) {
+        scanFrom -= 1
+    }
+
+    const harvested = []
+    for (let i = scanFrom; i >= 0; i--) {
+        const candidate = messages[i]
+        const isLast = i === lastIndex
+        if (candidate?.role === 'assistant' && !isLast) {
+            // 回合边界是最终答复，不是任意一条 assistant。见函数头。
+            const midTurnCall = (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length > 0) ||
+                !!candidate.function_call?.name
+            if (midTurnCall) {
+                continue
+            }
+            break
+        }
+        // 最后一条通常交给 parserMessages 自己处理，碰了会重复上传。例外是会被折叠的
+        // 最后一条：折叠会销毁它的数组正文，parserMessages 再也拿不到里面的媒体。
+        if ((isLast && !willBeFolded(candidate)) || !Array.isArray(candidate?.content)) {
+            continue
+        }
+
+        const carried = candidate.content.filter(isMediaContentItem)
+        if (carried.length === 0) {
+            continue
+        }
+
+        // 无条件摘除。留在历史载体上它进不了上游（formatHistoryMessages →
+        // extractTextFromContent 只保留 text），纯粹是死重。
+        //
+        // 注意：它**不会**泄漏进外置上下文文档。getMessageTextContent / extractTextFromContent
+        // 都只读 text，media 项对那份文档不可见 —— 5019f04 的提交信息在这一点上写错了。
+        // 真正会把 base64 变成散文的是 foldToolMessages，那条路由上面的 willBeFolded 处理。
+        const rest = candidate.content.filter(item => !isMediaContentItem(item))
+        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+            ? rest[0].text
+            : rest
+        harvested.unshift(...carried)
+        // 上限按**项**算，不按消息算：一个正当的回合可以横跨几十条消息。倒着扫，所以留下的
+        // 是最新的那些。这是保险，不是事故记录：需要它的病态形状（每条 assistant 都带
+        // tool_calls，整条历史因此没有边界）不在任何一次抓包里出现过。
+        if (harvested.length >= HARVEST_MEDIA_CAP) break
+    }
+
+    return harvested
+}
+
+/**
+ * 把收上来的媒体项挂到最后一条消息上，好让 parserMessages 去上传。去重也在这里。
+ * @param {Array} messages - 消息数组，**会被就地修改**
+ * @param {Array} media - harvestCurrentTurnMedia 的产出
+ */
+const attachMediaToLastMessage = (messages, media) => {
+    if (!Array.isArray(messages) || messages.length === 0 || !Array.isArray(media) || media.length === 0) {
+        return
+    }
+
+    const last = messages[messages.length - 1]
+    if (!last) {
+        return
+    }
+
+    // 去重种子取**折叠之后**的最后一条。折叠会把 tool/assistant 的数组正文变成字符串，
+    // 字符串正确地不播种任何 URL，于是收上来的那份能挂上去并被上传。在收割阶段播种是
+    // 错的：那时读到的是折叠**前**的正文，随后折叠把它销毁，而唯一幸存的那份已被压掉。
+    const seen = new Set(
+        (Array.isArray(last.content) ? last.content.filter(isMediaContentItem) : [])
+            .map(item => getMediaDescriptor(item)?.url)
+            .filter(url => typeof url === 'string' && url.length > 0)
+    )
+    // 边过滤边登记：同一张图会从两个载体收上来（用户消息 + 工具结果的搬运消息），
+    // 只对着初始种子过滤的话那两份都会通过。
+    const fresh = media.filter(item => {
+        const url = getMediaDescriptor(item)?.url
+        if (typeof url !== 'string' || url.length === 0) return true
+        if (seen.has(url)) return false
+        seen.add(url)
+        return true
+    })
+    if (fresh.length === 0) {
+        return
+    }
+
+    if (typeof last.content === 'string') {
+        last.content = [{ type: 'text', text: last.content }, ...fresh]
+    } else if (Array.isArray(last.content)) {
+        last.content = [...last.content, ...fresh]
+    } else {
+        // 没有折叠发生时（tool_choice:'none'、chat_type 非 t2t、或干脆没有 tools），OpenAI 的
+        // 规范形状 {role:'assistant', content:null, tool_calls:[…]} 会原样走到这里。缺这一支
+        // 的话：收割已经把媒体从载体上摘走了，这里再一声不吭地丢掉 —— 比不收割还糟。
+        // parserMessages 的产出恒为 role:'user'（本文件 :433），所以在 assistant/tool 上
+        // 物化一个数组是安全的。媒体必须排在文本之后。
+        last.content = [{ type: 'text', text: '' }, ...fresh]
+    }
+}
+
 module.exports = {
+    // Exportado solo para que los tests puedan aislarse con clear().
+    imgCacheManager,
+    extractMediaToFiles,
+    harvestCurrentTurnMedia,
+    attachMediaToLastMessage,
     isChatType,
     isThinkingEnabled,
     parserModel,

@@ -2093,7 +2093,9 @@ test('loop 1: escapeInnerQuotesInStrings — JSON valido es punto fijo (null), e
   // Una comilla dentro de una CLAVE tambien se escapa (solo ':' cierra una clave).
   assert.deepEqual(JSON.parse(escapeInnerQuotesInStrings('{"na"me": "x"}')), { 'na"me': 'x' })
   // Sin contexto de salvage la reparacion no corre (fail closed): el trigger canonico
-  // con comillas internas sigue siendo invalid_json en la ruta OpenAI de hoy.
+  // con comillas internas es invalid_json cuando la llamada no trae toolSchemas.
+  // (Desde spec-agent-turn-cutoff-openai-parity la ruta OpenAI SI los pasa; esto pina
+  // la puerta del parser, no la ruta.)
   const noSalvage = parseToolCallsFromText('[TOOL CALL]{"name":"Bash","arguments":{"command":"echo "hi""}}[END TOOL CALL]', { allowedToolNames: ['Bash'] })
   assert.equal(noSalvage.toolCalls.length, 0)
   assert.equal(noSalvage.errors[0]?.type, 'invalid_json')
@@ -2460,4 +2462,37 @@ test('loop 2 (P16): nombre en la cola del trigger tras prosa → una Read con {"
   const bad = assertParity('Some prose.\n[TOOL_CALL]NotATool{"file_path":"a"}[END TOOL CALL]', NARRATED_OPTS, 'loop2 bad name hint after prose')
   assert.equal(bad.toolCalls.length, 0)
   assert.equal(bad.errors.length, 0, 'tras prosa jamas error')
+})
+
+
+// ---- cierre truncado al final del stream (residuo [END… que además se comia una llamada) ----
+const CLOSER_CALL = '[TOOL CALL]\n{"name":"Bash","arguments":{"command":"ls"}}\n'
+const parseCloser = (text) => parseToolCallsFromText(text, { allowedToolNames: ['Bash', 'Read'] })
+
+test('cierre truncado: se traga medio [END TOOL CALL] en vez de soltarlo como prosa', () => {
+  for (const tail of ['[E', '[END', '[END TOOL', '[END TOOL C', '[END TOOL CAL']) {
+    const r = parseCloser(CLOSER_CALL + tail)
+    assert.deepEqual(r.toolCalls.map(c => c.function.name), ['Bash'], `tail ${JSON.stringify(tail)}`)
+    assert.equal(r.cleanedText.trim(), '', `tail ${JSON.stringify(tail)} solto prosa`)
+  }
+})
+
+test('cierre truncado: un "[" solo sigue siendo prosa — es genuinamente ambiguo', () => {
+  const r = parseCloser(CLOSER_CALL + '[')
+  assert.deepEqual(r.toolCalls.map(c => c.function.name), ['Bash'])
+  assert.equal(r.cleanedText.trim(), '[')
+})
+
+test('cierre truncado: nunca se come prosa real que solo se parece a un cierre', () => {
+  for (const tail of ['[END]', '[ENDING the run]', '[NOTE] done', 'END']) {
+    const r = parseCloser(CLOSER_CALL + tail)
+    assert.ok(r.cleanedText.includes(tail), `tail ${JSON.stringify(tail)} se lo comio: ${JSON.stringify(r.cleanedText)}`)
+  }
+})
+
+test('cierre truncado: ya no bloquea la llamada que viene detras', () => {
+  // El "\n[END " que se soltaba hacia que el siguiente [TOOL CALL] no pasara la puerta
+  // de "el trigger debe ser el primer contenido", perdiendo una llamada real en silencio.
+  const r = parseCloser(CLOSER_CALL + '[END TOOL C\n[TOOL CALL]\n{"name":"Read","arguments":{"path":"a"}}\n[END TOOL CALL]')
+  assert.ok(r.toolCalls.map(c => c.function.name).includes('Bash'))
 })
