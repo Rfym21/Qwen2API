@@ -281,3 +281,135 @@ test('directive: la clausula anti-repeticion permite el repetido legitimo', () =
     assert.doesNotMatch(directive, /<tool_call/i)
   }
 })
+
+// ---------------------------------------------------------------------------
+// Cableado del ledger en las DOS rutas.
+//
+// El bloque solo sirve si llega al modelo. Se ensambla en el mismo orden en
+// ambas rutas — toolPrompt -> ledger -> envelope (historia + mensaje actual)
+// -> directive — porque el ledger tiene que leerse como parte del contrato de
+// herramientas, antes de la historia que documenta, y el directive tiene que
+// seguir siendo lo ultimo que el modelo lee.
+//
+// Y se arma ANTES de foldToolMessages: despues del folding la historia es
+// texto (`[TOOL CALL #1]` dentro de un string) y ya no hay tool_calls ni
+// tool_call_id que recorrer, asi que un ledger armado tarde sale vacio y el
+// bloque desaparece sin ruido.
+// ---------------------------------------------------------------------------
+
+const { buildInternalRequest } = require('../src/controllers/anthropic.js')
+const { processRequestBody } = require('../src/middlewares/chat-middleware.js')
+
+const LEDGER_HEADER = '# Already executed this task'
+const TOOLS_HEADER = '# Tools'
+const HISTORY_HEADER = '# Conversation history (JSONL)'
+const CURRENT_HEADER = '# Current message'
+const DIRECTIVE_HEADER = '# Agent loop control'
+
+const ANTHROPIC_TOOLS = [{
+  name: 'Read',
+  description: 'lee un archivo',
+  input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] }
+}]
+
+const OPENAI_TOOLS = [{
+  type: 'function',
+  function: {
+    name: 'Read',
+    description: 'lee un archivo',
+    parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] }
+  }
+}]
+
+/** Una llamada ya ejecutada y contestada, en forma nativa Anthropic. */
+const ANTHROPIC_HISTORY = [
+  { role: 'user', content: [{ type: 'text', text: 'lee a.txt' }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: 'a.txt' } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'AAA' }] }
+]
+
+/** La misma historia en forma nativa OpenAI. */
+const OPENAI_HISTORY = [
+  { role: 'user', content: 'lee a.txt' },
+  { role: 'assistant', content: '', tool_calls: [call('c1', 'Read', { file_path: 'a.txt' })] },
+  result('c1', 'AAA')
+]
+
+const anthropicContent = async (extra = {}) => {
+  const out = await buildInternalRequest({
+    model: 'qwen3.8-max',
+    max_tokens: 128,
+    messages: ANTHROPIC_HISTORY,
+    tools: ANTHROPIC_TOOLS,
+    ...extra
+  })
+  return String(out.body.messages[0].content)
+}
+
+const openaiContent = async (extra = {}) => {
+  const req = { body: { model: 'qwen3.8-max', messages: OPENAI_HISTORY, tools: OPENAI_TOOLS, ...extra } }
+  let err = null
+  await processRequestBody(req, { status: () => ({ json: () => ({}) }) }, (e) => { err = e || null })
+  assert.equal(err, null, err && err.message)
+  return String(req.body.messages[0].content)
+}
+
+const occurrences = (haystack, needle) => haystack.split(needle).length - 1
+
+/** Las dos rutas son gemelas: mismo bloque, misma posicion, una sola vez. */
+const assertLedgerWiring = (content, label) => {
+  assert.equal(
+    occurrences(content, LEDGER_HEADER), 1,
+    `${label}: el ledger debe aparecer exactamente una vez, no ${occurrences(content, LEDGER_HEADER)}`
+  )
+  const at = (marker) => {
+    const index = content.indexOf(marker)
+    assert.ok(index >= 0, `${label}: falta el marcador ${marker} en el contenido ensamblado:\n${content}`)
+    return index
+  }
+  const tools = at(TOOLS_HEADER)
+  const ledger = at(LEDGER_HEADER)
+  const history = at(HISTORY_HEADER)
+  const current = at(CURRENT_HEADER)
+  const directive = at(DIRECTIVE_HEADER)
+
+  assert.ok(tools < ledger, `${label}: el ledger quedo ANTES del protocolo de herramientas`)
+  assert.ok(ledger < history, `${label}: el ledger quedo DESPUES de la historia que documenta`)
+  assert.ok(history < current, `${label}: se rompio el orden del envelope`)
+  assert.ok(current < directive, `${label}: el directive dejo de ser lo ultimo que lee el modelo`)
+}
+
+test('wiring: la ruta Anthropic inyecta el ledger una vez y en su posicion', async () => {
+  assertLedgerWiring(await anthropicContent(), 'anthropic')
+})
+
+test('wiring: la ruta OpenAI inyecta el ledger una vez y en su posicion', async () => {
+  assertLedgerWiring(await openaiContent(), 'openai')
+})
+
+test('wiring: el ledger se arma antes del folding, sobre bloques estructurados', async () => {
+  // Post-fold la llamada ya es texto dentro de un string: sin tool_calls ni
+  // tool_call_id el ledger sale vacio y el bloque desaparece en silencio.
+  // Esta linea solo puede existir si se armo sobre la historia estructurada.
+  for (const [label, content] of [['anthropic', await anthropicContent()], ['openai', await openaiContent()]]) {
+    const linea = content.split('\n').find(line => /^#1 Read /.test(line))
+    assert.ok(linea, `${label}: el ledger no lista la llamada ejecutada:\n${content}`)
+    assert.match(linea, /a\.txt/, `${label}: la entrada perdio los argumentos que la identifican`)
+    assert.match(linea, /-> AAA/, `${label}: la entrada perdio el digest del resultado`)
+  }
+})
+
+test('wiring: sin herramientas no hay ledger en ninguna ruta', async () => {
+  // Sin protocolo de herramientas el bloque no tiene contrato que lo explique:
+  // seria una lista de ordinales sueltos gastando presupuesto de contexto.
+  const casos = [
+    ['anthropic sin tools', await anthropicContent({ tools: undefined })],
+    ['anthropic con tool_choice none', await anthropicContent({ tool_choice: { type: 'none' } })],
+    ['openai sin tools', await openaiContent({ tools: undefined })],
+    ['openai con tool_choice none', await openaiContent({ tool_choice: 'none' })]
+  ]
+  for (const [label, content] of casos) {
+    assert.ok(content.length > 0, `${label}: el contenido salio vacio, el caso no prueba nada`)
+    assert.doesNotMatch(content, /Already executed this task/, `${label}: se inyecto el ledger sin herramientas`)
+  }
+})

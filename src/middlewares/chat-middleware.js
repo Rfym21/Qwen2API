@@ -1,7 +1,7 @@
 const { generateUUID } = require('../utils/tools.js')
 const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
-const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
+const { buildAgentTurnDirective, buildToolHistoryLedger } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
 const { mapIncomingModel } = require('../utils/model-map.js')
 
@@ -137,8 +137,14 @@ const processRequestBody = async (req, res, next) => {
 
     let preparedMessages = messages
     let toolSystemPrompt = ''
+    let toolHistoryLedger = ''
     if (hasTools) {
       toolSystemPrompt = buildToolSystemPrompt(tools, { tool_choice })
+      // Sobre los mensajes CRUDOS, antes del fold: despues foldToolMessages deja la
+      // llamada como texto (`[TOOL CALL #1]`) sin tool_calls ni tool_call_id, y el ledger
+      // saldria vacio sin que nada lo delate. Gemelo de anthropic.js#buildInternalRequest,
+      // que lo arma sobre `flat` antes de su propio fold.
+      toolHistoryLedger = buildToolHistoryLedger(messages || [])
       preparedMessages = foldToolMessages(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
@@ -219,15 +225,22 @@ const processRequestBody = async (req, res, next) => {
         body.messages[0].content,
         lastMessage.role || 'user'
       )
+      // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El
+      // ledger va pegado al protocolo porque es parte del contrato de herramientas (sin el
+      // protocolo delante seria una lista de ordinales sueltos), y delante de la historia
+      // que documenta. Vive en el prefijo, que parseAgentEnvelope (utils/request.js) nunca
+      // externaliza: dentro del bloque de historia el contrapeso desapareceria justo en las
+      // conversaciones largas, que son las que repiten llamadas.
+      const toolPrefix = [toolSystemPrompt, toolHistoryLedger].filter(Boolean).join('\n\n')
       const msgContent = body.messages[0].content
       if (typeof msgContent === 'string') {
-        body.messages[0].content = `${toolSystemPrompt}\n\n${msgContent}`
+        body.messages[0].content = `${toolPrefix}\n\n${msgContent}`
       } else if (Array.isArray(msgContent)) {
         const textIdx = msgContent.findIndex(c => c?.type === 'text')
         if (textIdx >= 0) {
-          msgContent[textIdx].text = `${toolSystemPrompt}\n\n${msgContent[textIdx].text || ''}`
+          msgContent[textIdx].text = `${toolPrefix}\n\n${msgContent[textIdx].text || ''}`
         } else {
-          msgContent.unshift({ type: 'text', text: toolSystemPrompt })
+          msgContent.unshift({ type: 'text', text: toolPrefix })
         }
       }
 

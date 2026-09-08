@@ -24,6 +24,7 @@ const {
   stripAgentTags,
   buildAgentRetryHint,
   buildAgentTurnDirective,
+  buildToolHistoryLedger,
   // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
@@ -385,6 +386,12 @@ const buildInternalRequest = async (anthropicReq) => {
   // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
   const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
   const toolPrompt = hasTools ? buildToolSystemPrompt(normalizedTools, { tool_choice: internalToolChoice }) : '';
+  // El ledger se arma sobre `flat` ANTES de foldToolMessages: despues del folding la
+  // llamada ya es texto dentro de un string (`[TOOL CALL #1]`), sin tool_calls ni
+  // tool_call_id que recorrer — el ledger saldria vacio y el bloque desapareceria sin
+  // ruido. Gemelo de chat-middleware.js#processRequestBody, que lo arma sobre `messages`
+  // antes de su propio fold; los dos caminos tienen que moverse juntos.
+  const toolLedger = hasTools ? buildToolHistoryLedger(flat) : '';
 
   if (hasTools) {
     flat = foldToolMessages(flat);
@@ -409,7 +416,13 @@ const buildInternalRequest = async (anthropicReq) => {
   const parsedModel = await parserModel(model);
 
   // 4. 合并 system 文本与工具提示词到最终用户消息开头
-  const prefixParts = [systemText, toolPrompt].filter(Boolean);
+  // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El ledger
+  // va pegado al protocolo porque es parte del contrato de herramientas (sin el protocolo
+  // delante seria una lista de ordinales sueltos), y delante de la historia que documenta.
+  // Vive en el prefijo, que parseAgentEnvelope (utils/request.js) nunca externaliza: si
+  // cayera dentro del bloque de historia, el contrapeso desapareceria justo en las
+  // conversaciones largas, que son las que repiten llamadas.
+  const prefixParts = [systemText, toolPrompt, toolLedger].filter(Boolean);
   if (prefixParts.length > 0 && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
     const prefix = prefixParts.join('\n\n');
     const last = parsedMessages[parsedMessages.length - 1];
