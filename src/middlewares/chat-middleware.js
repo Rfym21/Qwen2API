@@ -1,5 +1,5 @@
 const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
@@ -117,6 +117,12 @@ const processRequestBody = async (req, res, next) => {
     const hasTools = shouldEnableToolRuntime(tools, chatType, tool_choice)
     const originalLastMessage = Array.isArray(messages) ? messages[messages.length - 1] : null
     const afterToolResult = ['tool', 'function'].includes(String(originalLastMessage?.role || '').toLowerCase())
+    // 当前回合的图片几乎从来不在最后一条消息上：真实客户端会在图片后面再补一条纯文本
+    // 消息（OpenClaw 的 OPENCLAW_INTERNAL_CONTEXT，Claude Code 的 `[Image: source: …]`），
+    // 而 parserMessages 只上传最后一条的媒体。先收上来，折叠完再挂回去。
+    // 详见 chat-helpers.js#harvestCurrentTurnMedia（含 2026-09-08 的真实抓包证据）。
+    const currentTurnMedia = harvestCurrentTurnMedia(messages)
+
     let preparedMessages = messages
     let toolSystemPrompt = ''
     if (hasTools) {
@@ -164,6 +170,10 @@ const processRequestBody = async (req, res, next) => {
       req.allowed_tool_names = []
       req.tool_schemas = null
     }
+
+    // 必须在 foldToolMessages 之后再挂：折叠会把 role=tool/assistant 的消息换成新对象，
+    // 挂早了那份就被丢掉了。挂到最后一条，parserMessages 才会去上传它。
+    attachMediaToLastMessage(preparedMessages, currentTurnMedia)
 
     // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）
     const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType)

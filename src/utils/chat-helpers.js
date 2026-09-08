@@ -652,8 +652,99 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
     return normalize
 }
 
+/**
+ * 把**当前回合**里、挂在非最后一条消息上的媒体项收上来。
+ *
+ * 为什么需要：parserMessages 的多条分支只对 lastMessage 调 normalizeMediaContentItem
+ * （见本文件 :396）。更早那些消息走 formatHistoryMessages → extractTextFromContent，
+ * 非 text 项被整个抹掉，一行日志都没有。于是「图片不是最后一条」等于图片消失。
+ *
+ * 真实客户端恰好都这么发——图片后面还跟着一条纯文本消息：
+ *   Claude Code   [text, image] + 一条 isMeta 的 `[Image: source: …png]`
+ *   OpenClaw      user[text,image_url] … user[text,image_url]（"Attached image(s) from
+ *                 tool result:"）+ 末尾的 OPENCLAW_INTERNAL_CONTEXT 纯文本消息
+ *
+ * 2026-09-08 抓的真实流量（OpenClaw → /v1/chat/completions，透明代理）：同一分钟内
+ * 3/3 条 agent 请求都因为末条是纯文本而丢图（0 次上传），而同期一条 image 结尾的
+ * 旁路请求正常上传。这是同一次抓包里的对照组。
+ *
+ * 只收当前回合：从尾部往回扫到上一条 assistant 为止。更早的历史图片不重新附加——
+ * 那是 deferred-work.md 里明确排除的范围（每回合重传、CacheManager 是 per-request）。
+ *
+ * 最后一条不碰：那条 parserMessages 自己会处理，碰了就会重复上传。
+ *
+ * 是 anthropic.js#buildInternalRequest 那段扫描的孪生体。两边必须一起改。
+ *
+ * @param {Array} messages - OpenAI 格式消息数组，**会被就地修改**（摘掉媒体项）
+ * @returns {Array} 收上来的媒体项，按原始顺序
+ */
+const harvestCurrentTurnMedia = (messages) => {
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return []
+    }
+
+    const lastIndex = messages.length - 1
+    let scanFrom = lastIndex
+    // 末条就是 assistant 时那是 prefill，属于当前回合而不是回合边界：跳过它再找边界，
+    // 否则同一回合里的图片永远收不到。
+    if (messages[scanFrom]?.role === 'assistant') {
+        scanFrom -= 1
+    }
+
+    const harvested = []
+    for (let i = scanFrom; i >= 0; i--) {
+        const candidate = messages[i]
+        if (candidate?.role === 'assistant') {
+            break
+        }
+        // 最后一条交给 parserMessages，这里必须跳过（scanFrom 可能就等于 lastIndex）
+        if (i === lastIndex || !Array.isArray(candidate?.content)) {
+            continue
+        }
+
+        const carried = candidate.content.filter(isMediaContentItem)
+        if (carried.length === 0) {
+            continue
+        }
+
+        // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
+        // 又会和重新挂到最后一条的那份重复。
+        const rest = candidate.content.filter(item => !isMediaContentItem(item))
+        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+            ? rest[0].text
+            : rest
+        harvested.unshift(...carried)
+    }
+
+    return harvested
+}
+
+/**
+ * 把收上来的媒体项挂到最后一条消息上，好让 parserMessages 去上传。
+ * @param {Array} messages - 消息数组，**会被就地修改**
+ * @param {Array} media - harvestCurrentTurnMedia 的产出
+ */
+const attachMediaToLastMessage = (messages, media) => {
+    if (!Array.isArray(messages) || messages.length === 0 || !Array.isArray(media) || media.length === 0) {
+        return
+    }
+
+    const last = messages[messages.length - 1]
+    if (!last) {
+        return
+    }
+
+    if (typeof last.content === 'string') {
+        last.content = [{ type: 'text', text: last.content }, ...media]
+    } else if (Array.isArray(last.content)) {
+        last.content = [...last.content, ...media]
+    }
+}
+
 module.exports = {
     extractMediaToFiles,
+    harvestCurrentTurnMedia,
+    attachMediaToLastMessage,
     isChatType,
     isThinkingEnabled,
     parserModel,

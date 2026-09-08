@@ -2,7 +2,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
 const anthropic = require('../src/controllers/anthropic.js');
-const { extractMediaToFiles } = require('../src/utils/chat-helpers.js');
+const { extractMediaToFiles, harvestCurrentTurnMedia } = require('../src/utils/chat-helpers.js');
 const { processRequestBody } = require('../src/middlewares/chat-middleware.js');
 const { externalizeOversizedAgentContext } = require('../src/utils/request.js');
 
@@ -350,6 +350,168 @@ describe('image passthrough: OpenAI /v1/chat/completions envelope', () => {
     });
     assert.equal(out.chat_type, 't2i');
     assert.ok(Array.isArray(out.messages[0].content));
+  });
+});
+
+describe('image passthrough: OpenClaw agent shape', () => {
+  // Captured live on 2026-09-08 with a transparent proxy in front of /v1/chat/completions
+  // (OpenClaw -> Qwen2API). Every agent request ends with a text-only user message that
+  // carries OpenClaw's runtime context block, so the image is never last. 3/3 agent
+  // requests in that capture uploaded nothing, while a sibling request in the same
+  // minute whose last message WAS the image uploaded fine — the control group.
+  const OPENAI_TOOLS = [{
+    type: 'function',
+    function: {
+      name: 'read',
+      description: 'Read a file',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+    }
+  }];
+  const IMG_ITEM = { type: 'image_url', image_url: { url: IMG_URL } };
+  const RUNTIME_CTX = '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>> conversation info';
+
+  const runOpenClaw = async (messages, extra = {}) => {
+    const req = { body: { model: 'qwen3.8-max', messages, tools: OPENAI_TOOLS, ...extra } };
+    const res = {
+      statusCode: 200,
+      status(c) { this.statusCode = c; return this; },
+      json(p) { this.body = p; return this; }
+    };
+    let err = null;
+    await processRequestBody(req, res, (e) => { err = e || null; });
+    assert.equal(err, null, err && err.message);
+    return req.body;
+  };
+
+  it('delivers an image that a trailing runtime-context message displaced', async () => {
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'que ves nova?' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [{ type: 'image', url: IMG_URL }]);
+    assert.ok(out.messages[0].content.includes('que ves nova'), 'carrier text must survive');
+    assert.ok(out.messages[0].content.includes('BEGIN_OPENCLAW_INTERNAL_CONTEXT'));
+    assert.ok(!out.messages[0].content.includes(IMG_URL), 'image must not also ride as text');
+  });
+
+  it('delivers the image from the tool-result carrier in a full tool loop', async () => {
+    // Exact shape of captured request live-006.json.
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'que ves nova?' }, IMG_ITEM] },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{"path":"a.png"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'Read image file [image/jpeg]' },
+      { role: 'user', content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    // Only the current turn is harvested: index 1 is an assistant boundary, so the
+    // user's original copy at index 0 stays behind and just index 3 is delivered.
+    assert.deepEqual(out.messages[0].files, [{ type: 'image', url: IMG_URL }]);
+    assert.ok(out.messages[0].content.includes('Attached image(s) from tool result'));
+  });
+
+  it('does not duplicate an image that already sits in the last message', async () => {
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'ctx' }] },
+      { role: 'user', content: [{ type: 'text', text: 'que ves?' }, IMG_ITEM] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [{ type: 'image', url: IMG_URL }], 'exactly one upload');
+  });
+
+  it('does not re-attach an image from an earlier turn', async () => {
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'first' }, IMG_ITEM] },
+      { role: 'assistant', content: 'era magenta' },
+      { role: 'user', content: [{ type: 'text', text: 'y ahora?' }] },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [], 'only the current turn is harvested');
+  });
+
+  it('leaves a media-free agent request byte-identical', async () => {
+    const messages = () => ([
+      { role: 'user', content: [{ type: 'text', text: 'hola' }] },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+    const norm = async () => JSON.stringify(JSON.parse(
+      JSON.stringify(await runOpenClaw(messages())).replace(UUID, '<uuid>')
+    ), (k, v) => (k === 'timestamp' ? 0 : v));
+    assert.equal(await norm(), await norm());
+    assert.deepEqual((await runOpenClaw(messages())).messages[0].files, []);
+  });
+
+  it('harvests without tools too — the defect is about media placement, not tools', async () => {
+    const req = {
+      body: {
+        model: 'qwen3.8-max',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'que ves?' }, IMG_ITEM] },
+          { role: 'user', content: [{ type: 'text', text: 'contexto' }] }
+        ]
+      }
+    };
+    const res = { status(c) { this.statusCode = c; return this; }, json(p) { this.body = p; return this; } };
+    let err = null;
+    await processRequestBody(req, res, (e) => { err = e || null; });
+    assert.equal(err, null, err && err.message);
+    assert.deepEqual(req.body.messages[0].files, [{ type: 'image', url: IMG_URL }]);
+  });
+});
+
+describe('harvestCurrentTurnMedia', () => {
+  const IMG_ITEM = { type: 'image_url', image_url: { url: IMG_URL } };
+
+  it('strips the harvested item from its carrier and collapses a lone text item', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hola' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }] }
+    ];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), [IMG_ITEM]);
+    assert.equal(messages[0].content, 'hola', 'carrier collapses back to a string');
+  });
+
+  it('never touches the last message', () => {
+    const messages = [{ role: 'user', content: [{ type: 'text', text: 'x' }, IMG_ITEM] }];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), []);
+    assert.ok(Array.isArray(messages[0].content), 'last message is left to parserMessages');
+  });
+
+  it('treats a trailing assistant prefill as part of the current turn', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'x' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }] },
+      { role: 'assistant', content: '' }
+    ];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), [IMG_ITEM]);
+  });
+
+  it('stops at the turn boundary', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'old' }, IMG_ITEM] },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: [{ type: 'text', text: 'new' }] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }] }
+    ];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), []);
+  });
+
+  it('preserves order across several carriers', () => {
+    const A = { type: 'image_url', image_url: { url: 'https://example.invalid/a.png' } };
+    const B = { type: 'image_url', image_url: { url: 'https://example.invalid/b.png' } };
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: '1' }, A] },
+      { role: 'user', content: [{ type: 'text', text: '2' }, B] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }] }
+    ];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), [A, B]);
+  });
+
+  it('is a no-op on media-free and malformed input', () => {
+    assert.deepEqual(harvestCurrentTurnMedia(undefined), []);
+    assert.deepEqual(harvestCurrentTurnMedia([]), []);
+    const messages = [{ role: 'user', content: 'plain' }, { role: 'user', content: 'meta' }];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), []);
+    assert.equal(messages[0].content, 'plain');
   });
 });
 
