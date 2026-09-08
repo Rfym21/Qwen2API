@@ -2,7 +2,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
 const anthropic = require('../src/controllers/anthropic.js');
-const { extractMediaToFiles, harvestCurrentTurnMedia } = require('../src/utils/chat-helpers.js');
+const { extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage } = require('../src/utils/chat-helpers.js');
 const { processRequestBody } = require('../src/middlewares/chat-middleware.js');
 const { externalizeOversizedAgentContext } = require('../src/utils/request.js');
 
@@ -446,6 +446,34 @@ describe('image passthrough: OpenAI /v1/chat/completions envelope', () => {
     assert.deepEqual(out.messages[0].files, []);
   });
 
+  it('does not harvest for t2i: the prompt must stay a plain string', async () => {
+    // Without the chat_type allowlist the harvest lifts the image onto the last message,
+    // turning a plain-string prompt into an array and paying for an upload that
+    // generateImageVideoResult never reads.
+    const out = await runMiddleware({
+      model: 'qwen3.8-max-image',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'reference' }, { type: 'image_url', image_url: { url: IMG_URL } }] },
+        { role: 'user', content: 'a cat @16:9' }
+      ]
+    });
+    assert.equal(out.chat_type, 't2i');
+    assert.equal(typeof out.messages[0].content, 'string', 'prompt must stay a string for size sniffing');
+    assert.ok(out.messages[0].content.includes('@16:9'));
+  });
+
+  it('still harvests for image_edit: that path needs the image in files[]', async () => {
+    const out = await runMiddleware({
+      model: 'qwen3.8-max-image-edit',
+      messages: [{
+        role: 'user',
+        content: [{ type: 'text', text: 'make it blue' }, { type: 'image_url', image_url: { url: IMG_URL } }]
+      }]
+    });
+    assert.equal(out.chat_type, 'image_edit');
+    assert.ok(Array.isArray(out.messages[0].content), 'image_edit content must stay an array');
+  });
+
   it('leaves t2i content as an array too', async () => {
     const out = await runMiddleware({
       model: 'qwen3.8-max-image',
@@ -558,6 +586,48 @@ describe('image passthrough: OpenClaw agent shape', () => {
     assert.deepEqual(out.messages[0].files, [], 'an assistant with no tool_calls is still the boundary');
   });
 
+  it('rescues an image from a last role=tool message that folding would stringify', async () => {
+    // foldToolMessages JSON.stringify's an array tool-message body into the
+    // [TOOL RESULT] text block. Left alone, the base64 becomes prose and files[] is empty.
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: [{ type: 'text', text: 'Read image file' }, IMG_ITEM] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [{ type: 'image', url: IMG_URL }]);
+    assert.ok(!JSON.stringify(out).includes(IMG_URL + '"},{'), 'image must not also ride inside the folded text');
+  });
+
+  it('attaches to a last assistant message whose content is null', async () => {
+    // Canonical OpenAI assistant-tool-call shape. With tool_choice none there is no
+    // folding, so this arrives verbatim; without the terminal else the harvest strips
+    // the image off its carrier and then silently drops it.
+    const req = {
+      body: {
+        model: 'qwen3.8-max',
+        tool_choice: 'none',
+        tools: OPENAI_TOOLS,
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'que ves?' }, IMG_ITEM] },
+          { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] }
+        ]
+      }
+    };
+    const res = { status(c) { this.statusCode = c; return this; }, json(p) { this.body = p; return this; } };
+    let err = null;
+    await processRequestBody(req, res, (e) => { err = e || null; });
+    assert.equal(err, null, err && err.message);
+    assert.deepEqual(req.body.messages[0].files, [{ type: 'image', url: IMG_URL }]);
+  });
+
+  it('uploads exactly once when the image already sits on the last user message', async () => {
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'ctx' }] },
+      { role: 'user', content: [{ type: 'text', text: 'que ves?' }, IMG_ITEM] }
+    ]);
+    assert.equal(out.messages[0].files.length, 1);
+  });
+
   it('leaves a media-free agent request byte-identical', async () => {
     const messages = () => ([
       { role: 'user', content: [{ type: 'text', text: 'hola' }] },
@@ -647,17 +717,35 @@ describe('harvestCurrentTurnMedia', () => {
     assert.deepEqual(harvestCurrentTurnMedia(messages), [A, B]);
   });
 
-  it('dedupes the same image across carriers and against the last message', () => {
+  it('collects every carrier; dedupe is attach\'s job, not harvest\'s', () => {
     const messages = [
       { role: 'user', content: [{ type: 'text', text: '1' }, IMG_ITEM] },
       { role: 'user', content: [{ type: 'text', text: '2' }, IMG_ITEM] },
       { role: 'user', content: [{ type: 'text', text: 'meta' }, IMG_ITEM] }
     ];
-    // The last message already carries it, so parserMessages will upload that copy;
-    // the two earlier carriers must be stripped but contribute nothing.
-    assert.deepEqual(harvestCurrentTurnMedia(messages), []);
-    assert.equal(messages[0].content, '1', 'carrier is still stripped');
+    // Harvest deliberately does NOT dedupe: at this point the last message has not been
+    // folded yet, so seeding from it would suppress a copy that folding then destroys.
+    assert.deepEqual(harvestCurrentTurnMedia(messages), [IMG_ITEM, IMG_ITEM]);
+    assert.equal(messages[0].content, '1', 'carriers are stripped unconditionally');
     assert.equal(messages[1].content, '2');
+    // attach is where it collapses, seeded from the post-fold last message.
+    attachMediaToLastMessage(messages, harvestCurrentTurnMedia([
+      { role: 'user', content: [{ type: 'text', text: 'x' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }, IMG_ITEM] }
+    ]));
+    const last = messages[messages.length - 1];
+    assert.equal(last.content.filter(i => i.type === 'image_url').length, 1, 'exactly one copy survives');
+  });
+
+  it('caps how many media items one turn can re-attach', () => {
+    const mk = (n) => ({ type: 'image_url', image_url: { url: `https://example.invalid/${n}.png` } });
+    const messages = [];
+    for (let i = 0; i < 10; i++) messages.push({ role: 'user', content: [{ type: 'text', text: String(i) }, mk(i)] });
+    messages.push({ role: 'user', content: [{ type: 'text', text: 'meta' }] });
+    const got = harvestCurrentTurnMedia(messages);
+    assert.equal(got.length, 4, 'bounded');
+    // Backwards scan keeps the newest ones.
+    assert.deepEqual(got.map(i => i.image_url.url), [6, 7, 8, 9].map(n => `https://example.invalid/${n}.png`));
   });
 
   it('is a no-op on media-free and malformed input', () => {

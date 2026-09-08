@@ -270,6 +270,7 @@ const buildInternalRequest = async (anthropicReq) => {
   // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
   // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
   // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
+  const HARVEST_MEDIA_CAP = 4;
   const currentTurnMedia = [];
   let scanFrom = flat.length - 1;
   // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
@@ -338,6 +339,8 @@ const buildInternalRequest = async (anthropicReq) => {
       }
     }
     if (fromCandidate.length > 0) currentTurnMedia.unshift(...fromCandidate);
+    // 与孪生体同一个上限，按项算不按消息算（chat-helpers.js#HARVEST_MEDIA_CAP）。
+    if (currentTurnMedia.length >= HARVEST_MEDIA_CAP) break;
   }
   // media 是内部旁路，绝不能进上游请求体。历史消息里的 media 携带完整 base64 data URI，
   // 目前只是碰巧被 foldToolMessages 丢掉，而它只在带工具时才跑——所以在这里全量清掉。

@@ -12,6 +12,8 @@ const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
   toolChoice !== 'none'
 )
 
+const HARVEST_CHAT_TYPES = new Set(['t2t', 'search', 'image_edit'])
+
 const AGENT_CURRENT_MESSAGE_MARKER = '# Current message'
 
 const ensureAgentCurrentEnvelope = (content, role = 'user') => {
@@ -121,7 +123,17 @@ const processRequestBody = async (req, res, next) => {
     // 消息（OpenClaw 的 OPENCLAW_INTERNAL_CONTEXT，Claude Code 的 `[Image: source: …]`），
     // 而 parserMessages 只上传最后一条的媒体。先收上来，折叠完再挂回去。
     // 详见 chat-helpers.js#harvestCurrentTurnMedia（含 2026-09-08 的真实抓包证据）。
-    const currentTurnMedia = harvestCurrentTurnMedia(messages)
+    // 白名单，不是黑名单：routes/chat.js 的分发表把 deep_research 和**所有未知类型**都
+    // 交给 handleImageVideoCompletion，而那个控制器只在 t2i/t2v/image_edit 里给 content
+    // 赋值。用黑名单的话，任何新增/未知类型都会默默落进收割区。
+    //
+    // image_edit 必须留在名单里：那条路正是靠收割把输入图放进 files[]
+    // （chat.image.video.js:1290-1313）。t2i/t2v 排除掉：那里 content 是纯文本提示词，
+    // 收割会把它变成数组、塞进空的 '\n\n' 分隔符，还会为一张控制器根本不看的图付一次上传，
+    // 顺带打断 '@16:9' 这类尺寸嗅探。
+    const currentTurnMedia = HARVEST_CHAT_TYPES.has(chatType)
+      ? harvestCurrentTurnMedia(messages)
+      : []
 
     let preparedMessages = messages
     let toolSystemPrompt = ''
