@@ -112,12 +112,17 @@ const scriptedSender = () => {
   return fn;
 };
 
-const ALLOWED = ['Bash'];
+const ALLOWED = ['Bash', 'Read'];
 const SCHEMAS = {
   Bash: {
     type: 'object',
     properties: { command: { type: 'string' }, description: { type: 'string' } },
     required: ['command']
+  },
+  Read: {
+    type: 'object',
+    properties: { file_path: { type: 'string' } },
+    required: ['file_path']
   }
 };
 
@@ -227,5 +232,115 @@ describe('stop_reason: truncation outranks tool_use', () => {
       ['Bash']
     );
     assert.equal(res.body.stop_reason, 'tool_use');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tarea 6: espacio de nombres de ids `toolu_` en /v1/messages
+// ---------------------------------------------------------------------------
+//
+// El constructor compartido (`createToolCallObject` / `buildEmitted` en
+// tool-prompt.js) acuna `call_<24 hex>` porque esa es la forma que
+// /v1/chat/completions pone en el wire. La API nativa de Anthropic usa `toolu_`,
+// y este controller YA generaba `toolu_` para la direccion de ENTRADA
+// (flattenAnthropicMessages, al rellenar un `tool_use` sin id): las dos
+// direcciones vivian en espacios de nombres distintos dentro del mismo archivo.
+//
+// La reescritura va en el borde de emision de ESTA ruta, no en el constructor
+// compartido: la ruta OpenAI debe seguir emitiendo `call_`. Los dos sitios de
+// emision (stream `emitToolUse`, y el bucle no-stream que arma `content[]`) son
+// gemelos y cambian juntos.
+
+const READ_ARGS = '{"file_path": "a.txt"}';
+const READ_SNAPSHOTS = ['', '{"file_path": ', READ_ARGS, READ_ARGS];
+
+// Dos llamadas nativas cerradas en un mismo turno (mismo orden que la captura
+// FOREIGN_TURN_FRAMES: las dos llamadas, luego los dos frames de lookup).
+const twoToolTurn = () => Readable.from([
+  ...BASH_SNAPSHOTS.map(snapshot => nativeCallFrame('Bash', snapshot)),
+  ...READ_SNAPSHOTS.map(snapshot => nativeCallFrame('Read', snapshot)),
+  notExistsFrame('Bash'),
+  notExistsFrame('Read'),
+  CLEAN_STOP
+]);
+
+const toolUseBlocksOf = (output) => eventsOf(output)
+  .filter(e => e.type === 'content_block_start' && e.content_block?.type === 'tool_use')
+  .map(e => e.content_block);
+
+const TOOLU_ID = /^toolu_[0-9a-f]{24}$/;
+
+describe('tool_use ids: the Anthropic path uses the toolu_ namespace', () => {
+  it('stream: a single tool_use block carries a toolu_ id', async () => {
+    const res = await runStream(toolTurn(CLEAN_STOP));
+    const blocks = toolUseBlocksOf(res.output);
+    assert.equal(blocks.length, 1);
+    assert.match(blocks[0].id, TOOLU_ID, `id ajeno al namespace nativo: ${blocks[0].id}`);
+  });
+
+  it('stream: two tool_use blocks in one turn carry distinct toolu_ ids', async () => {
+    const res = await runStream(twoToolTurn);
+    const blocks = toolUseBlocksOf(res.output);
+    assert.deepEqual(blocks.map(b => b.name), ['Bash', 'Read']);
+    for (const block of blocks) {
+      assert.match(block.id, TOOLU_ID, `id ajeno al namespace nativo: ${block.id}`);
+    }
+    assert.equal(new Set(blocks.map(b => b.id)).size, 2, 'dos llamadas del mismo turno comparten id');
+  });
+
+  it('stream: the tool_use id never leaks the call_ prefix anywhere on the wire', async () => {
+    const res = await runStream(twoToolTurn);
+    assert.doesNotMatch(res.output, /"id":"call_/, 'un id call_ llego al cliente Anthropic');
+  });
+
+  it('non-stream: tool_use ids are toolu_ and unique within the turn', async () => {
+    const res = await runNonStream(twoToolTurn);
+    const blocks = res.body.content.filter(b => b.type === 'tool_use');
+    assert.deepEqual(blocks.map(b => b.name), ['Bash', 'Read']);
+    for (const block of blocks) {
+      assert.match(block.id, TOOLU_ID, `id ajeno al namespace nativo: ${block.id}`);
+    }
+    assert.equal(new Set(blocks.map(b => b.id)).size, 2, 'dos llamadas del mismo turno comparten id');
+  });
+});
+
+// El gemelo OpenAI NO cambia: la reescritura es local al borde Anthropic. Si esta
+// prueba se pone en rojo, la implementacion se fue al constructor compartido.
+const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime.js');
+
+const openaiAnswerFrame = (content) => `data: ${JSON.stringify({
+  choices: [{ delta: { phase: 'answer', content }, finish_reason: null }]
+})}\n\n`;
+
+// Generador crudo: Readable.from precargaria frames y falsearia el consumo.
+const rawStream = (frames) => {
+  async function* gen() { for (const frame of frames) yield frame; }
+  return gen();
+};
+
+const TWO_TEXT_CALLS =
+  '[TOOL CALL]{"name":"Bash","arguments":{"command":"git status"}}[END TOOL CALL]' +
+  '[TOOL CALL]{"name":"Read","arguments":{"file_path":"a.txt"}}[END TOOL CALL]';
+
+describe('tool_call ids: the OpenAI path keeps the call_ namespace', () => {
+  it('two tool calls in one turn keep call_ ids and stay unique', async () => {
+    const result = await runOpenAIAgentTurn(
+      rawStream([openaiAnswerFrame(TWO_TEXT_CALLS), CLEAN_STOP]),
+      {
+        has_tools: true,
+        tool_choice: 'auto',
+        allowed_tool_names: ALLOWED,
+        tool_schemas: SCHEMAS,
+        upstream_request_body: { messages: [] },
+        sendChatRequest: async () => ({ status: false })
+      }
+    );
+
+    const calls = result.attempt.toolCalls;
+    assert.deepEqual(calls.map(c => c.function.name), ['Bash', 'Read']);
+    for (const call of calls) {
+      assert.match(call.id, /^call_[0-9a-f]{24}$/, `la ruta OpenAI cambio de namespace: ${call.id}`);
+    }
+    assert.equal(new Set(calls.map(c => c.id)).size, 2, 'dos llamadas del mismo turno comparten id');
   });
 });

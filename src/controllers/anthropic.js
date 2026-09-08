@@ -57,6 +57,44 @@ const mapAnthropicStopReason = (upstreamReason, hasToolCalls, upstreamCompleted)
   return null;
 };
 
+/**
+ * Acuna un id de `tool_use` en el espacio de nombres nativo de Anthropic.
+ * @returns {string} `toolu_` + 24 hex minusculas
+ */
+const newAnthropicToolUseId = () => `toolu_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
+
+const ANTHROPIC_TOOL_USE_ID = /^toolu_[0-9a-f]{24}$/;
+// La forma que acuna el constructor compartido (tool-prompt.js createToolCallObject /
+// buildEmitted): `call_` + los mismos 24 hex.
+const SHARED_TOOL_CALL_ID = /^call_([0-9a-f]{24})$/;
+
+/**
+ * Reetiqueta al namespace nativo el id de una llamada en el BORDE DE EMISION de esta
+ * ruta. La reescritura no puede vivir en el constructor compartido: /v1/chat/completions
+ * emite `call_` y esa forma es parte de su contrato. Los dos sitios de emision de
+ * /v1/messages (stream `emitToolUse` y el bucle no-stream que arma `content[]`) son
+ * gemelos y llaman aqui los dos.
+ *
+ * El reetiquetado conserva los 24 hex, asi que dos llamadas distintas del mismo turno
+ * (ids frescos por UUID) siguen siendo distintas. Un id de otra forma no se puede
+ * reetiquetar sin arriesgar colisiones: se acuna uno nuevo.
+ *
+ * Ojo con la direccion de ENTRADA: `flattenAnthropicMessages` NO pasa por aqui. Ahi el
+ * id lo pone el cliente (`toolu_01LhEfp5...`, base62, no 24 hex) y es la clave que
+ * enlaza el `tool_use` con su `tool_result`; reescribirlo romperia la correlacion.
+ *
+ * @param {string} id - id de la llamada tal como lo acuno el constructor compartido
+ * @returns {string} id en el namespace `toolu_`
+ */
+const toAnthropicToolUseId = (id) => {
+  if (typeof id === 'string') {
+    if (ANTHROPIC_TOOL_USE_ID.test(id)) return id;
+    const shared = SHARED_TOOL_CALL_ID.exec(id);
+    if (shared) return `toolu_${shared[1]}`;
+  }
+  return newAnthropicToolUseId();
+};
+
 const writeAnthropicError = (res, message, errorType = 'api_error') => {
   writeAnthropicEvent(res, 'error', {
     type: 'error',
@@ -189,7 +227,7 @@ const flattenAnthropicMessages = (messages) => {
           textParts.push(block.text);
         } else if (block?.type === 'tool_use') {
           toolCalls.push({
-            id: block.id || `toolu_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+            id: block.id || newAnthropicToolUseId(),
             type: 'function',
             function: {
               name: block.name,
@@ -1085,7 +1123,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     writeAnthropicEvent(res, 'content_block_start', {
       type: 'content_block_start',
       index: blockIndex,
-      content_block: { type: 'tool_use', id: call.id, name: call.function.name, input: {} }
+      content_block: {
+        type: 'tool_use',
+        id: toAnthropicToolUseId(call.id),
+        name: call.function.name,
+        input: {}
+      }
     });
     const args = call.function.arguments || '{}';
     for (const piece of sliceArgsJson(args)) {
@@ -2202,7 +2245,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     try { input = JSON.parse(call.function.arguments || '{}'); } catch (_) { input = {}; }
     contentBlocks.push({
       type: 'tool_use',
-      id: call.id,
+      id: toAnthropicToolUseId(call.id),
       name: call.function.name,
       input
     });
