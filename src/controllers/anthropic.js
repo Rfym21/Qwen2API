@@ -155,7 +155,11 @@ const anthropicImageBlockToItem = (block) => {
  * @param {Array<Object>} messages - Anthropic messages
  * @returns {Array<Object>} OpenAI 风格 messages
  */
+const UNSUPPORTED_BLOCK_NOTE = (type) => `[unsupported content block: ${type} — not forwarded]`;
+
 const flattenAnthropicMessages = (messages) => {
+  // 本次调用里被丢弃的块类型，用于收尾时一条 WARN（不是每块一条）。
+  const droppedBlockTypes = new Set();
   if (!Array.isArray(messages)) return [];
   const out = [];
 
@@ -194,6 +198,7 @@ const flattenAnthropicMessages = (messages) => {
     }
 
     // user 角色：tool_result 拆为独立 role=tool 消息，普通文本/图片合并保留
+    const outLenBeforeUserMsg = out.length;
     const collectedTextParts = [];
     const flushCollectedText = () => {
       if (collectedTextParts.length === 0) return;
@@ -226,7 +231,12 @@ const flattenAnthropicMessages = (messages) => {
       } else if (block?.type === 'image') {
         // 透传 image 块给现有 parserMessages 处理（OpenAI image_url 形态）
         const imageItem = anthropicImageBlockToItem(block);
-        if (imageItem) {
+        if (!imageItem) {
+          // source:{type:'file', file_id} 是 Anthropic 有文档的形态，我们不支持。
+          // 以前它在这里无声消失，模型对着「一张它从没收到的图」作答。
+          droppedBlockTypes.add(`image(${block?.source?.type || 'unknown'})`);
+          collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE('image'));
+        } else {
           if (collectedTextParts.length > 0) {
             out.push({
               role: 'user',
@@ -240,9 +250,30 @@ const flattenAnthropicMessages = (messages) => {
             out.push({ role: 'user', content: [imageItem] });
           }
         }
+      } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+        // 故意丢弃：无法回放给 Qwen，而且丢掉它不会改变用户的意图。
+      } else {
+        // 兜底分支。以前这里什么都没有：document（PDF）、search_result、server_tool_use…
+        // 全部无声消失，模型只收到包围它们的那句话就去回答。
+        droppedBlockTypes.add(block?.type || 'unknown');
+        collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE(block?.type || 'unknown'));
       }
     }
     flushCollectedText();
+    // 整条用户消息一个块都没产出（例如 spec 合法的 content: []）时，绝不能让它凭空消失：
+    // 消息一旦少一条，parserMessages 会把**上一条 assistant** 当成 "# Current message"，
+    // 模型于是对着自己上一轮的回答作答；只有这一条时它直接抛错，被吞掉后上游收到的是
+    // 字面量 '聊天历史处理有误…'。保留一个空位，语义不变而结构完整。
+    if (out.length === outLenBeforeUserMsg) {
+      out.push({ role: 'user', content: '' });
+    }
+  }
+
+  if (droppedBlockTypes.size > 0) {
+    logger.warn(
+      `Anthropic content blocks not forwarded: ${Array.from(droppedBlockTypes).join(', ')}`,
+      'ANTHROPIC'
+    );
   }
 
   return out;

@@ -514,6 +514,17 @@ const consumeTrailingCloser = (text, from, canGrow) => {
   if (!canGrow && bare && !slice.slice(bare[0].length).trim()) {
     return { end: index + slice.length, needMore: false };
   }
+  // 流到此为止，尾巴是**半个**闭标记（`[END TOOL C` + EOF）：bare 正则要求关键字写全，
+  // 所以截断的前缀匹配不上，以前整段作为正文放出去。后果比"多出一段脏字"严重得多：
+  // 放出去的 `\n[END ` 让紧随其后的 `[TOOL CALL]` 通不过"触发器必须是首个内容"那道闸门，
+  // 于是一个**真实的工具调用被静默丢弃**（实测：期望两个调用，只拿到 Bash 一个）。
+  //
+  // isDanglingCloserPrefix 只认规范拼写的字面前缀且必须占满剩余单行，判不准就当正文放行；
+  // 光秃秃的一个 '[' 因此仍然是正文（rest 为空 → false），那确实无从判断。
+  // end 取 text.length 而不是 index + slice.length：slice 只是 63 字符的窗口。
+  if (!canGrow && isDanglingCloserPrefix(text.slice(index))) {
+    return { end: text.length, needMore: false };
+  }
   return { end: debrisEnd, needMore: false };
 };
 

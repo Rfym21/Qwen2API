@@ -288,6 +288,61 @@ describe('image passthrough: Claude Code paste shape', () => {
   });
 });
 
+describe('anthropic: unsupported content blocks are visible, never silent', () => {
+  const pdfBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBER' } };
+
+  it('leaves a breadcrumb instead of dropping an unknown block', () => {
+    const flat = flattenAnthropicMessages([
+      { role: 'user', content: [{ type: 'text', text: 'summarise this' }, pdfBlock] }
+    ]);
+    assert.equal(flat.length, 1);
+    assert.match(flat[0].content, /summarise this/);
+    assert.match(flat[0].content, /unsupported content block: document/);
+  });
+
+  it('keeps a user message that consists only of unsupported blocks', () => {
+    const flat = flattenAnthropicMessages([{ role: 'user', content: [pdfBlock] }]);
+    assert.equal(flat.length, 1, 'the message must not vanish');
+    assert.match(flat[0].content, /unsupported content block: document/);
+  });
+
+  it('never lets the previous assistant reply become the current message', async () => {
+    const { body } = await build([
+      { role: 'user', content: [{ type: 'text', text: 'hola' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ASSISTANT_PREVIOUS_REPLY' }] },
+      { role: 'user', content: [pdfBlock] }
+    ]);
+    const current = body.messages[0].content.split('# Current message')[1] || '';
+    assert.ok(!current.includes('ASSISTANT_PREVIOUS_REPLY'), 'the assistant reply must not be the current message');
+    assert.match(current, /unsupported content block: document/);
+  });
+
+  it('preserves the slot of a spec-legal empty user message', () => {
+    const flat = flattenAnthropicMessages([
+      { role: 'user', content: [{ type: 'text', text: 'first' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+      { role: 'user', content: [] }
+    ]);
+    assert.equal(flat.length, 3, 'the empty user message keeps its slot');
+    assert.equal(flat[2].role, 'user');
+    assert.equal(flat[2].content, '');
+  });
+
+  it('surfaces an image source shape we cannot forward', () => {
+    const flat = flattenAnthropicMessages([
+      { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', source: { type: 'file', file_id: 'file_123' } }] }
+    ]);
+    assert.match(flat[0].content, /unsupported content block: image/);
+  });
+
+  it('still drops thinking blocks silently — they carry no user intent', () => {
+    const flat = flattenAnthropicMessages([
+      { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'thinking', thinking: 'x' }] }
+    ]);
+    assert.equal(flat[0].content, 'hi');
+  });
+});
+
 describe('image passthrough: Anthropic tool loops', () => {
   // Measured live against the real upstream on 2026-09-08 (/v1/messages, qwen3.8-max,
   // 446-byte magenta PNG), BEFORE the boundary fix:
