@@ -43,8 +43,13 @@ const {
 } = require('./anthropic.compatibility.js');
 
 const mapAnthropicStopReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
-  if (hasToolCalls) return 'tool_use';
+  // El truncamiento manda SOBRE tool_use. Un turno que el upstream corto a mitad de
+  // emision puede llevar una llamada con los argumentos incompletos; `tool_use` le dice
+  // al cliente "ya termine de pedirla, ejecutala" y la ejecuta igual. La API nativa
+  // reporta `max_tokens` ahi: el turno no termino. Los bloques `tool_use` ya emitidos
+  // siguen viajando —— esto es precedencia de stop_reason, no supresion de la llamada.
   if (upstreamReason === 'length' || upstreamReason === 'max_tokens') return 'max_tokens';
+  if (hasToolCalls) return 'tool_use';
   if (upstreamReason === 'stop_sequence') return 'stop_sequence';
   if (upstreamReason === 'content_filter' || upstreamReason === 'refusal') return 'refusal';
   if (upstreamReason === 'stop' || upstreamReason === 'end_turn') return 'end_turn';
