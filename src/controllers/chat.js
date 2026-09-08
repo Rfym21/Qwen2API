@@ -1362,6 +1362,8 @@ const handleChatCompletion = async (req, res) => {
                 // Puertas de schema del parser (reparacion de comillas / aceptacion tras
                 // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
                 tool_schemas: req.tool_schemas,
+                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+                tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
@@ -1378,6 +1380,8 @@ const handleChatCompletion = async (req, res) => {
                 // Puertas de schema del parser (reparacion de comillas / aceptacion tras
                 // prosa). Sin esto ambas fallan cerradas en el runtime de Agent.
                 tool_schemas: req.tool_schemas,
+                // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
+                tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {

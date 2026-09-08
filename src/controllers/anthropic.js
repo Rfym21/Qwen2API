@@ -25,6 +25,7 @@ const {
   buildAgentRetryHint,
   buildAgentTurnDirective,
   buildToolHistoryLedger,
+  extractHistoryToolCalls,
   // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
@@ -392,6 +393,11 @@ const buildInternalRequest = async (anthropicReq) => {
   // ruido. Gemelo de chat-middleware.js#processRequestBody, que lo arma sobre `messages`
   // antes de su propio fold; los dos caminos tienen que moverse juntos.
   const toolLedger = hasTools ? buildToolHistoryLedger(flat) : '';
+  // Semilla del ledger de deduplicacion, del MISMO recorrido pre-fold y con los mismos
+  // ordinales que ve el modelo. No suprime nada: marca la llamada como ya ejecutada para
+  // poder registrarla (los tres createToolCallLedger eran por-intento y jamas miraron la
+  // historia). Gemelo de chat-middleware.js#processRequestBody -> req.tool_history_calls.
+  const historyToolCalls = hasTools ? extractHistoryToolCalls(flat) : [];
 
   if (hasTools) {
     flat = foldToolMessages(flat);
@@ -548,6 +554,7 @@ const buildInternalRequest = async (anthropicReq) => {
   return {
     body,
     hasTools,
+    historyToolCalls,
     toolChoice: internalToolChoice,
     allowedToolNames: normalizedTools.map(tool => tool.function.name).filter(Boolean),
     toolSchemas,
@@ -827,7 +834,7 @@ const runWithAnthropicPing = async (res, work, intervalMs) => {
 const handleAnthropicStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = []
   } = ctx;
 
   res.set({
@@ -952,7 +959,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     attemptThinkText = '';
     attemptThinkEvidence = false;
     suppressPostToolUseOutput = false;
-    admitToolCall = createToolCallLedger();
+    // Sembrado con la historia: una llamada ya ejecutada se emite igual (releer tras un
+    // edit es correcto) y solo deja un warn. La supresion sigue siendo por-attempt.
+    admitToolCall = createToolCallLedger({ seed: historyToolCalls });
     hasEmittedToolCalls = false;
     nativeThinkEvidence = false;
     stopRequested = false;
@@ -1626,7 +1635,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = []
   } = ctx;
 
   let thinkingContent = '';
@@ -1836,7 +1845,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   };
   // 跨通道去重登记簿替代原来的 concat：同名同参数只留先到的（原生在前 —— 它先关闭）。
   const mergeToolCalls = (native, parsed) => {
-    const admit = createToolCallLedger();
+    // Misma semilla que la rama de streaming: informa, no suprime.
+    const admit = createToolCallLedger({ seed: historyToolCalls });
     return [...native, ...parsed]
       .filter(call => {
         if (admit(call)) return true;
@@ -2235,7 +2245,7 @@ const handleAnthropicMessages = async (req, res) => {
     }
 
     const built = await buildInternalRequest(req.body || {});
-    const { body, hasTools, toolChoice, allowedToolNames, toolSchemas, model } = built;
+    const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
 
     const upstreamResp = await sendChatRequest(body);
     if (!upstreamResp.status || !upstreamResp.response) {
@@ -2258,6 +2268,7 @@ const handleAnthropicMessages = async (req, res) => {
       message_id,
       model,
       hasTools,
+      historyToolCalls,
       toolChoice,
       allowedToolNames,
       toolSchemas,

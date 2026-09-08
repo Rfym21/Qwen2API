@@ -461,7 +461,9 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       'AGENT'
     )
   }
-  const admitToolCall = createToolCallLedger()
+  // Sembrado con las llamadas ya ejecutadas (chat-middleware.js#processRequestBody).
+  // Una entrada sembrada NO suprime — solo deja un warn con nombre y ordinal.
+  const admitToolCall = createToolCallLedger({ seed: options.tool_history_calls })
   const toolCalls = [
     ...nativeToolCalls,
     ...(nativeToolCalls.length > 0 ? [] : textChannelCalls)

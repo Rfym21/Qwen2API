@@ -500,26 +500,97 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
 };
 
 /**
+ * 历史里**已经执行过**的工具调用，按调用顺序，用来给登记簿播种。
+ *
+ * 序号必须与 foldToolMessages（tool-prompt.js）写进历史的 `[TOOL CALL #n]` 逐一对应：
+ * 同一套遍历（assistant 的 tool_calls，退回单个 function_call），每个调用 +1。两边一旦
+ * 错位，日志里的 #2 就指向模型看到的另一次调用 —— 比不编号更坏。
+ * @param {Array<Object>} messages - OpenAI 形状、**折叠之前**的消息（折叠后调用只剩文本）
+ * @returns {Array<{name: string, arguments: string, ordinal: number}>}
+ */
+const extractHistoryToolCalls = (messages) => {
+  if (!Array.isArray(messages)) return [];
+  const out = [];
+  for (const message of messages) {
+    if (!message || typeof message !== 'object' || message.role !== 'assistant') continue;
+    const calls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+      ? message.tool_calls
+      : (message.function_call?.name ? [message.function_call] : []);
+    for (const call of calls) {
+      const fn = call?.function || call;
+      const raw = fn?.arguments;
+      out.push({
+        name: String(fn?.name || 'unknown'),
+        // 统一成字符串：登记簿的键对出站调用做 JSON.parse，历史必须走同一条路径才能对上。
+        arguments: typeof raw === 'string' ? raw : JSON.stringify(raw ?? {}),
+        ordinal: out.length + 1
+      });
+    }
+  }
+  return out;
+};
+
+/** 出站调用与历史种子共用的键：不同的规范化 = 播了也永远匹配不上。 */
+const toolCallLedgerKey = (name, rawArgs) => {
+  const args = rawArgs || '{}';
+  let canonical;
+  try {
+    canonical = canonicalJson(JSON.parse(args));
+  } catch (_) {
+    canonical = args;
+  }
+  return `${name || ''}\u0000${canonical}`;
+};
+
+/**
  * 本轮的工具调用登记簿：同名 + 规范 JSON 相同的第二个调用是跨通道的副本（文本解析器
  * 与原生累积器各自都能产出同一个调用），只保留先到的。文本解析器的调用是边收边发的，
  * 收不回来，所以规则只能是操作性的：丢后到的那个。
- * @returns {(call: Object) => boolean} true = 首次见到，可以发射
+ *
+ * seed = 历史里跑过的调用（extractHistoryToolCalls）。**种下的条目绝不抑制**：三个
+ * 登记簿一直都是「按 attempt」的，谁都没比对过入站 messages 里的 tool_use，所以
+ * 1.451 次跨回合重复一行日志都没留下。但压制会毁掉合法的重复 —— 编辑完再读一遍同一个
+ * 文件是**正确**行为。所以发射判定一个字节都不变，新增的只有告警：名字 + 序号，
+ * 永远不带参数负载（tests/tool-prompt.test.js:1503,1774）。
+ * @param {Object} [options]
+ * @param {Iterable<{name: string, arguments: string, ordinal?: number}>} [options.seed]
+ * @returns {((call: Object) => boolean) & { wasInHistory: (call: Object) => boolean }}
+ *   true = 本轮首次见到，可以发射
  */
-const createToolCallLedger = () => {
+const createToolCallLedger = ({ seed } = {}) => {
   const seen = new Set();
-  return (call) => {
-    const args = call?.function?.arguments || '{}';
-    let canonical;
-    try {
-      canonical = canonicalJson(JSON.parse(args));
-    } catch (_) {
-      canonical = args;
+  // key -> 历史序号。只用于报告，永远不进 seen。
+  const history = new Map();
+  if (seed && typeof seed[Symbol.iterator] === 'function') {
+    let index = 0;
+    for (const entry of seed) {
+      index += 1;
+      if (!entry) continue;
+      // 同一把调用在历史里出现多次时留**最新**的序号，与 buildToolHistoryLedger 的选择
+      // 一致：两处报出来的 #n 必须是同一个，否则日志和模型看到的清单互相矛盾。
+      history.set(
+        toolCallLedgerKey(entry.name, entry.arguments),
+        Number.isFinite(entry.ordinal) ? entry.ordinal : index
+      );
     }
-    const key = `${call?.function?.name || ''}\u0000${canonical}`;
+  }
+
+  const admit = (call) => {
+    const key = toolCallLedgerKey(call?.function?.name, call?.function?.arguments);
     if (seen.has(key)) return false;
     seen.add(key);
+    const ordinal = history.get(key);
+    if (ordinal !== undefined) {
+      logger.warn(
+        `Agent 工具调用在历史里已经执行过（${call?.function?.name || 'unknown'}，历史 #${ordinal}）；按设计不抑制，仅记录`,
+        'AGENT'
+      );
+    }
     return true;
   };
+  admit.wasInHistory = (call) =>
+    history.has(toolCallLedgerKey(call?.function?.name, call?.function?.arguments));
+  return admit;
 };
 
 /**
@@ -662,6 +733,7 @@ module.exports = {
   // para el ledger de aqui. Todo texto no confiable que vuelve al prompt pasa por ella.
   neutraliseResultMarkers,
   buildToolHistoryLedger,
+  extractHistoryToolCalls,
   createToolCallLedger,
   isRejectedTextCallWarning,
   resolveTextToolCallCap,

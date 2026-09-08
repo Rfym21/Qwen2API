@@ -1,7 +1,7 @@
 const { generateUUID } = require('../utils/tools.js')
 const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
-const { buildAgentTurnDirective, buildToolHistoryLedger } = require('../utils/agent-turn.js')
+const { buildAgentTurnDirective, buildToolHistoryLedger, extractHistoryToolCalls } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
 const { mapIncomingModel } = require('../utils/model-map.js')
 
@@ -145,6 +145,11 @@ const processRequestBody = async (req, res, next) => {
       // saldria vacio sin que nada lo delate. Gemelo de anthropic.js#buildInternalRequest,
       // que lo arma sobre `flat` antes de su propio fold.
       toolHistoryLedger = buildToolHistoryLedger(messages || [])
+      // Semilla del ledger de deduplicacion del runtime (openai-agent-runtime.js), del
+      // mismo recorrido pre-fold y con los mismos ordinales que ve el modelo. No suprime:
+      // marca la llamada como ya ejecutada para poder registrarla. Gemelo de
+      // anthropic.js#buildInternalRequest -> built.historyToolCalls.
+      req.tool_history_calls = extractHistoryToolCalls(messages || [])
       preparedMessages = foldToolMessages(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
@@ -187,6 +192,7 @@ const processRequestBody = async (req, res, next) => {
       req.has_tools = false
       req.allowed_tool_names = []
       req.tool_schemas = null
+      req.tool_history_calls = []
     }
 
     // 必须在 foldToolMessages 之后再挂：折叠会把 role=tool/assistant 的消息换成新对象，

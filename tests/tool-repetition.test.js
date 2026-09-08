@@ -7,6 +7,15 @@ const {
 } = require('../src/utils/agent-turn.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../src/utils/tool-prompt.js')
 
+// El controller Anthropic captura sendChatRequest por destructuring en su PRIMER require
+// (anthropic.js:3), asi que el parche va aqui arriba, antes de que nada lo requiera.
+// Los tests de esta mitad del archivo nunca envian; para ellos es inerte.
+const requestModule = require('../src/utils/request.js')
+let upstreamFactory = null
+requestModule.sendChatRequest = async () => (upstreamFactory
+  ? { status: true, response: upstreamFactory(), currentAccount: null }
+  : { status: false })
+
 // ---------------------------------------------------------------------------
 // Repeticion de llamadas ya ejecutadas.
 //
@@ -412,4 +421,310 @@ test('wiring: sin herramientas no hay ledger en ninguna ruta', async () => {
     assert.ok(content.length > 0, `${label}: el contenido salio vacio, el caso no prueba nada`)
     assert.doesNotMatch(content, /Already executed this task/, `${label}: se inyecto el ledger sin herramientas`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Ledger de deduplicacion sembrado desde la historia (root cause 3).
+//
+// Los tres createToolCallLedger() son POR INTENTO: nada en el servidor comparo
+// jamas una llamada saliente contra los tool_use que ya venian en el array de
+// mensajes. Por eso los 1.451 duplicados entre turnos pasaban sin dejar una
+// sola linea de log — el servidor literalmente no sabia que ya habian corrido.
+//
+// La restriccion que manda: una entrada SEMBRADA NO SUPRIME. Marca la llamada
+// como ya vista para poder registrarla. Suprimir romperia la relectura legitima
+// despues de un edit, que es conducta correcta. La decision de emitir no cambia
+// ni un byte; lo unico nuevo es el warn.
+// ---------------------------------------------------------------------------
+
+const { createToolCallLedger, extractHistoryToolCalls } = require('../src/utils/agent-turn.js')
+const { logger } = require('../src/utils/logger.js')
+
+/** Spy sobre logger.warn (el metodo REAL; logger.warning no existe en el singleton). */
+const captureWarns = async (fn) => {
+  const saved = logger.warn
+  const entries = []
+  logger.warn = (message, module) => { entries.push({ message: String(message), module }) }
+  try {
+    await fn()
+  } finally {
+    logger.warn = saved
+  }
+  return entries
+}
+
+/** Argumento centinela: si aparece en un log, el payload se filtro. */
+const SENTINEL = '/tmp/SENTINEL_ARG_XYZ.txt'
+
+/** Llamada saliente en forma OpenAI (lo que producen parser y acumulador nativo). */
+const outgoing = (name, args) => ({
+  id: 'call_out',
+  type: 'function',
+  function: { name, arguments: JSON.stringify(args) }
+})
+
+const historyWarns = (warns) => warns.filter(entry => /已经执行过/.test(entry.message))
+
+test('ledger sembrado: una llamada ya ejecutada SE SIGUE EMITIENDO', async () => {
+  const seed = [{ name: 'Read', arguments: JSON.stringify({ file_path: SENTINEL }) }]
+  const call = outgoing('Read', { file_path: SENTINEL })
+
+  const admit = createToolCallLedger({ seed })
+  await captureWarns(async () => {
+    assert.equal(admit(call), true, 'la semilla suprimio la llamada: rompe la relectura tras un edit')
+  })
+  assert.equal(admit.wasInHistory(call), true, 'la llamada historica no quedo marcada')
+
+  // Sin semilla nada es historico, y el ledger sigue construyendose sin argumentos.
+  const virgen = createToolCallLedger()
+  assert.equal(virgen.wasInHistory(call), false)
+  assert.equal(virgen(call), true)
+})
+
+test('ledger sembrado: el duplicado DENTRO del intento se sigue suprimiendo', async () => {
+  const seed = [{ name: 'Read', arguments: JSON.stringify({ file_path: SENTINEL }) }]
+  const admit = createToolCallLedger({ seed })
+  await captureWarns(async () => {
+    assert.equal(admit(outgoing('Read', { file_path: SENTINEL })), true, 'la primera se emite')
+    assert.equal(admit(outgoing('Read', { file_path: SENTINEL })), false, 'la copia del MISMO intento debe caer')
+    assert.equal(admit(outgoing('Read', { file_path: '/otro.txt' })), true, 'otra ruta no es duplicado')
+  })
+})
+
+test('ledger sembrado: la coincidencia es canonica, no textual', async () => {
+  const admit = createToolCallLedger({
+    seed: [{ name: 'Bash', arguments: '{"timeout":1,"command":"ls"}' }]
+  })
+  // Mismas claves, otro orden: canonicalJson las iguala.
+  assert.equal(admit.wasInHistory(outgoing('Bash', { command: 'ls', timeout: 1 })), true)
+  assert.equal(admit.wasInHistory(outgoing('Bash', { command: 'pwd', timeout: 1 })), false, 'otro comando no es la misma llamada')
+  assert.equal(admit.wasInHistory(outgoing('Read', { command: 'ls', timeout: 1 })), false, 'otra herramienta no es la misma llamada')
+})
+
+test('ledger sembrado: un warn por repeticion, con nombre y ordinal, JAMAS con los argumentos', async () => {
+  const seed = [
+    { name: 'Bash', arguments: JSON.stringify({ command: 'ls' }) },
+    { name: 'Read', arguments: JSON.stringify({ file_path: SENTINEL }) }
+  ]
+  const admit = createToolCallLedger({ seed })
+  const warns = await captureWarns(async () => {
+    admit(outgoing('Read', { file_path: SENTINEL }))
+    admit(outgoing('Edit', { file_path: SENTINEL }))   // nueva: no es repeticion
+  })
+
+  const repeats = historyWarns(warns)
+  assert.equal(repeats.length, 1, `un warn por repeticion historica, no ${repeats.length}:\n${warns.map(w => w.message).join('\n')}`)
+  assert.equal(repeats[0].module, 'AGENT', 'el warn debe ir etiquetado AGENT')
+  assert.match(repeats[0].message, /Read/, 'el warn no nombra la herramienta')
+  assert.match(repeats[0].message, /#2/, 'el warn no lleva el ordinal que ve el modelo')
+  // tool-prompt.test.js:1503,1774 clavan que los logs nunca llevan fragmentos del payload.
+  assert.doesNotMatch(repeats[0].message, /SENTINEL_ARG_XYZ/, 'el payload se filtro al log')
+  assert.doesNotMatch(repeats[0].message, /file_path/, 'el payload se filtro al log')
+})
+
+test('extractHistoryToolCalls: ordinales gemelos de foldToolMessages', () => {
+  const messages = [
+    { role: 'user', content: 'haz las dos cosas' },
+    { role: 'assistant', content: '', tool_calls: [call('c1', 'Read', { file_path: 'a.txt' }), call('c2', 'Read', { file_path: 'b.txt' })] },
+    result('c1', 'AAA'),
+    result('c2', 'BBB'),
+    // function_call legacy: misma rama, mismo contador.
+    { role: 'assistant', content: '', function_call: { name: 'Bash', arguments: '{"command":"ls"}' } }
+  ]
+
+  const extracted = extractHistoryToolCalls(messages)
+  assert.deepEqual(extracted.map(e => `#${e.ordinal} ${e.name}`), ['#1 Read', '#2 Read', '#3 Bash'])
+
+  // El ordinal DEBE ser el mismo numero que el modelo lee en la historia plegada: si se
+  // desincronizan, el warn dice #2 y la historia llama #2 a otra llamada.
+  const folded = foldToolMessages(messages)
+    .map(m => String(m.content || ''))
+    .join('\n')
+  for (const entry of extracted) {
+    assert.ok(folded.includes(`[TOOL CALL #${entry.ordinal}]`), `falta [TOOL CALL #${entry.ordinal}] en la historia plegada`)
+  }
+  assert.deepEqual(extractHistoryToolCalls(null), [], 'sin mensajes no hay historia')
+  assert.deepEqual(extractHistoryToolCalls([result('c9', 'x')]), [], 'un resultado no es una llamada')
+})
+
+test('ledger sembrado: el ordinal del warn es el #n que ve el modelo', async () => {
+  const messages = [
+    { role: 'assistant', content: '', tool_calls: [call('c1', 'Bash', { command: 'ls' })] },
+    result('c1', 'a b'),
+    { role: 'assistant', content: '', tool_calls: [call('c2', 'Read', { file_path: SENTINEL })] },
+    result('c2', 'AAA')
+  ]
+  const admit = createToolCallLedger({ seed: extractHistoryToolCalls(messages) })
+  const warns = await captureWarns(async () => {
+    admit(outgoing('Read', { file_path: SENTINEL }))
+  })
+  const repeats = historyWarns(warns)
+  assert.equal(repeats.length, 1)
+  assert.match(repeats[0].message, /#2/, 'el ordinal no coincide con el de la historia plegada')
+  assert.ok(foldToolMessages(messages).some(m => String(m.content || '').includes('[TOOL CALL #2]')))
+})
+
+test('wiring: la ruta OpenAI expone las llamadas de la historia', async () => {
+  const req = { body: { model: 'qwen3.8-max', messages: OPENAI_HISTORY, tools: OPENAI_TOOLS } }
+  await processRequestBody(req, { status: () => ({ json: () => ({}) }) }, () => {})
+  assert.deepEqual(
+    (req.tool_history_calls || []).map(e => `#${e.ordinal} ${e.name}`),
+    ['#1 Read'],
+    'la ruta OpenAI no extrae las llamadas de la historia'
+  )
+
+  // tool_choice:'none' apaga el runtime de herramientas: sin semilla que sembrar.
+  const sinTools = { body: { model: 'qwen3.8-max', messages: OPENAI_HISTORY, tools: OPENAI_TOOLS, tool_choice: 'none' } }
+  await processRequestBody(sinTools, { status: () => ({ json: () => ({}) }) }, () => {})
+  assert.deepEqual(sinTools.tool_history_calls || [], [])
+})
+
+test('wiring: la ruta Anthropic expone las llamadas de la historia', async () => {
+  const built = await buildInternalRequest({
+    model: 'qwen3.8-max',
+    max_tokens: 128,
+    messages: ANTHROPIC_HISTORY,
+    tools: ANTHROPIC_TOOLS
+  })
+  assert.deepEqual(
+    (built.historyToolCalls || []).map(e => `#${e.ordinal} ${e.name}`),
+    ['#1 Read'],
+    'la ruta Anthropic no extrae las llamadas de la historia'
+  )
+
+  const sinTools = await buildInternalRequest({
+    model: 'qwen3.8-max',
+    max_tokens: 128,
+    messages: ANTHROPIC_HISTORY,
+    tools: ANTHROPIC_TOOLS,
+    tool_choice: { type: 'none' }
+  })
+  assert.deepEqual(sinTools.historyToolCalls || [], [])
+})
+
+// ─────────── e2e: la llamada repetida llega al cliente en las DOS rutas ───────────
+
+const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime.js')
+const { handleAnthropicMessages } = require('../src/controllers/anthropic.js')
+
+const answerFrame = (content) => `data: ${JSON.stringify({
+  choices: [{ delta: { phase: 'answer', content }, finish_reason: null }]
+})}\n\n`
+const STOP = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+
+/** Generador crudo: Readable.from precargaria frames. */
+const rawStream = (frames) => {
+  async function* gen () { for (const frame of frames) yield frame }
+  return gen()
+}
+
+const REPEATED_CALL_TEXT = `[TOOL CALL]${JSON.stringify({ name: 'Read', arguments: { file_path: SENTINEL } })}[END TOOL CALL]`
+
+/** La misma llamada ya ejecutada, en historia nativa de cada ruta. */
+const OPENAI_REPEAT_HISTORY = [
+  { role: 'user', content: 'lee el archivo' },
+  { role: 'assistant', content: '', tool_calls: [call('c1', 'Read', { file_path: SENTINEL })] },
+  result('c1', 'AAA')
+]
+const ANTHROPIC_REPEAT_HISTORY = [
+  { role: 'user', content: [{ type: 'text', text: 'lee el archivo' }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: SENTINEL } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'AAA' }] }
+]
+
+const toolUsesOf = (output) => output
+  .split('\n\n')
+  .filter(Boolean)
+  .map(chunk => chunk.split('\n').find(line => line.startsWith('data: ')))
+  .filter(Boolean)
+  .map(line => JSON.parse(line.slice(6)))
+  .filter(event => event.type === 'content_block_start' && event.content_block?.type === 'tool_use')
+
+const mockStreamRes = () => ({
+  output: '', headers: {}, writableEnded: false,
+  set (headers) { Object.assign(this.headers, headers); return this },
+  status () { return this },
+  write (chunk) { this.output += String(chunk); return true },
+  end (chunk = '') { this.output += String(chunk); this.writableEnded = true }
+})
+
+const mockJsonRes = () => ({
+  statusCode: 200, body: null, headers: {},
+  set (headers) { Object.assign(this.headers, headers); return this },
+  status (code) { this.statusCode = code; return this },
+  json (payload) { this.body = payload; return this }
+})
+
+test('e2e OpenAI: la llamada repetida de la historia se entrega igual, con un warn', async () => {
+  const req = { body: { model: 'qwen3.8-max', messages: OPENAI_REPEAT_HISTORY, tools: OPENAI_TOOLS } }
+  await processRequestBody(req, { status: () => ({ json: () => ({}) }) }, () => {})
+
+  let result = null
+  const warns = await captureWarns(async () => {
+    result = await runOpenAIAgentTurn(rawStream([answerFrame(REPEATED_CALL_TEXT), STOP]), {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: req.allowed_tool_names,
+      tool_schemas: req.tool_schemas,
+      tool_history_calls: req.tool_history_calls,
+      upstream_request_body: { messages: [] },
+      sendChatRequest: async () => ({ status: false })
+    })
+  })
+
+  assert.equal(result.attempt.toolCalls.length, 1, 'la semilla suprimio una llamada que el cliente debe ejecutar')
+  assert.equal(result.finishReason, 'tool_calls')
+  const repeats = historyWarns(warns)
+  assert.equal(repeats.length, 1, `un warn de repeticion historica, no ${repeats.length}`)
+  assert.equal(repeats[0].module, 'AGENT')
+  assert.doesNotMatch(repeats[0].message, /SENTINEL_ARG_XYZ/)
+})
+
+test('e2e Anthropic streaming: la llamada repetida se entrega igual, con un warn', async () => {
+  upstreamFactory = () => rawStream([answerFrame(REPEATED_CALL_TEXT), STOP])
+  const res = mockStreamRes()
+  const warns = await captureWarns(async () => {
+    await handleAnthropicMessages({
+      body: {
+        model: 'qwen3.8-max',
+        max_tokens: 128,
+        stream: true,
+        messages: ANTHROPIC_REPEAT_HISTORY,
+        tools: ANTHROPIC_TOOLS
+      }
+    }, res)
+  })
+  upstreamFactory = null
+
+  const uses = toolUsesOf(res.output)
+  assert.equal(uses.length, 1, `la llamada repetida no llego al cliente:\n${res.output}`)
+  assert.equal(uses[0].content_block.name, 'Read')
+  const repeats = historyWarns(warns)
+  assert.equal(repeats.length, 1, `un warn de repeticion historica, no ${repeats.length}`)
+  assert.equal(repeats[0].module, 'AGENT')
+  assert.doesNotMatch(repeats[0].message, /SENTINEL_ARG_XYZ/)
+})
+
+test('e2e Anthropic no-streaming: la llamada repetida se entrega igual, con un warn', async () => {
+  upstreamFactory = () => rawStream([answerFrame(REPEATED_CALL_TEXT), STOP])
+  const res = mockJsonRes()
+  const warns = await captureWarns(async () => {
+    await handleAnthropicMessages({
+      body: {
+        model: 'qwen3.8-max',
+        max_tokens: 128,
+        messages: ANTHROPIC_REPEAT_HISTORY,
+        tools: ANTHROPIC_TOOLS
+      }
+    }, res)
+  })
+  upstreamFactory = null
+
+  const uses = (res.body?.content || []).filter(block => block.type === 'tool_use')
+  assert.equal(uses.length, 1, `la llamada repetida no llego al cliente:\n${JSON.stringify(res.body)}`)
+  assert.equal(uses[0].name, 'Read')
+  const repeats = historyWarns(warns)
+  assert.equal(repeats.length, 1, `un warn de repeticion historica, no ${repeats.length}`)
+  assert.equal(repeats[0].module, 'AGENT')
+  assert.doesNotMatch(repeats[0].message, /SENTINEL_ARG_XYZ/)
 })
