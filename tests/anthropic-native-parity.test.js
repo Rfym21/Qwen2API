@@ -344,3 +344,117 @@ describe('tool_call ids: the OpenAI path keeps the call_ namespace', () => {
     assert.equal(new Set(calls.map(c => c.id)).size, 2, 'dos llamadas del mismo turno comparten id');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tarea 8: la historia de herramientas NO se tira cuando la peticion no trae tools
+// ---------------------------------------------------------------------------
+//
+// `foldToolMessages` iba detras de `hasTools`. Sin `tools` (o con
+// `tool_choice: 'none'`) no se plegaba nada, asi que el assistant que solo lleva un
+// bloque `tool_use` conservaba `content: ''`, `formatSingleMessage`
+// (chat-helpers.js) descarta todo mensaje cuyo texto queda vacio y EL TURNO ENTERO
+// desaparecia de la historia — mientras su `tool_result` sobrevivia como una linea
+// JSONL con el rol inexistente "tool". Las peticiones de compactacion y de resumen
+// de Claude Code tienen exactamente esa forma.
+//
+// El arreglo es de RENDERIZADO, no de protocolo: la historia se pliega segun lo que
+// contiene, pero el prompt del protocolo de herramientas y la directiva de turno
+// siguen atados a `hasTools` (una peticion sin tools no debe aprender a llamarlas).
+const { buildInternalRequest } = require('../src/controllers/anthropic.js');
+
+const TOOL_HISTORY = [
+  { role: 'user', content: [{ type: 'text', text: 'Lee a.txt' }] },
+  {
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_01abc', name: 'Read', input: { file_path: 'a.txt' } }]
+  },
+  {
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 'toolu_01abc', content: 'contenido de a.txt' }]
+  },
+  { role: 'assistant', content: [{ type: 'text', text: 'El archivo dice hola.' }] },
+  { role: 'user', content: [{ type: 'text', text: 'Resume la conversacion.' }] }
+];
+
+const READ_TOOL = [{
+  name: 'Read',
+  description: 'Lee un archivo',
+  input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] }
+}];
+
+const buildBody = (extra = {}) => buildInternalRequest({
+  model: 'qwen3.8-max',
+  max_tokens: 256,
+  messages: TOOL_HISTORY,
+  ...extra
+});
+
+// El envelope es texto plano: `# Conversation history (JSONL)` seguido de una linea
+// JSON por turno, y luego `# Current message`. Se leen las lineas de la historia.
+const historyLines = (body) => {
+  const content = body.messages[0].content;
+  assert.equal(typeof content, 'string', 'el envelope debe seguir siendo texto');
+  const start = content.indexOf('# Conversation history (JSONL)');
+  assert.ok(start >= 0, 'falta el bloque de historia');
+  const end = content.indexOf('# Current message', start);
+  assert.ok(end > start, 'falta el marcador de mensaje actual');
+  return content
+    .slice(start + '# Conversation history (JSONL)'.length, end)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => JSON.parse(line));
+};
+
+describe('history rendering: tool turns survive a request that declares no tools', () => {
+  it('renders both tool turns, in order and with the right roles, with no tools array', async () => {
+    const { body } = await buildBody();
+    const lines = historyLines(body);
+
+    assert.deepEqual(
+      lines.map(l => l.role),
+      ['user', 'assistant', 'user', 'assistant'],
+      'el turno del assistant que solo lleva tool_use se perdio, o el resultado quedo con rol "tool"'
+    );
+    assert.equal(lines[0].content, 'Lee a.txt');
+    assert.match(lines[1].content, /\[TOOL CALL #1\]/, 'la llamada del assistant no se renderizo');
+    assert.match(lines[1].content, /"name":"Read"/);
+    assert.match(lines[2].content, /\[TOOL RESULT #1: Read\]/, 'el resultado no se correlaciono con su llamada');
+    assert.match(lines[2].content, /contenido de a\.txt/);
+    assert.equal(lines[3].content, 'El archivo dice hola.');
+  });
+
+  it('does the same when the client sends tools but tool_choice none', async () => {
+    const { body, hasTools } = await buildBody({ tools: READ_TOOL, tool_choice: { type: 'none' } });
+    assert.equal(hasTools, false, 'tool_choice none debe seguir apagando el runtime de herramientas');
+    const lines = historyLines(body);
+    assert.deepEqual(lines.map(l => l.role), ['user', 'assistant', 'user', 'assistant']);
+    assert.match(lines[1].content, /\[TOOL CALL #1\]/);
+    assert.match(lines[2].content, /\[TOOL RESULT #1: Read\]/);
+  });
+
+  it('renders the history without teaching the protocol: no tool prompt, no ledger, no directive', async () => {
+    const { body } = await buildBody();
+    const content = body.messages[0].content;
+    // Plegar la historia la hace legible; NO debe convertir la peticion en una de
+    // herramientas. Estos tres bloques siguen atados a hasTools.
+    assert.ok(!content.includes('## Available tools'), 'se filtro el prompt de protocolo');
+    assert.ok(!content.includes('# Already executed this task'), 'se filtro el ledger');
+    assert.ok(!content.includes('# Agent loop control'), 'se filtro la directiva de turno');
+  });
+
+  it('leaves a history with no tool blocks byte-identical', async () => {
+    const plain = [
+      { role: 'user', content: [{ type: 'text', text: 'hola' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'que tal' }] },
+      { role: 'user', content: [{ type: 'text', text: 'bien' }] }
+    ];
+    const { body } = await buildInternalRequest({ model: 'qwen3.8-max', max_tokens: 256, messages: plain });
+    const lines = historyLines(body);
+    assert.deepEqual(lines, [
+      { role: 'user', content: 'hola' },
+      { role: 'assistant', content: 'que tal' }
+    ]);
+    assert.ok(!body.messages[0].content.includes('[TOOL'), 'una historia sin herramientas no debe ganar marcadores');
+  });
+});

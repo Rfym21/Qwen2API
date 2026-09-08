@@ -828,5 +828,9 @@ module.exports = {
     formatHistoryMessages,
     isThinkPhase,
     createClientToolNamePredicate,
-    createUpstreamDeltaNormalizer
+    createUpstreamDeltaNormalizer,
+    // Exportado para anthropic.js#buildInternalRequest: alli decide si la historia
+    // trae bloques de herramienta y hay que plegarla aunque la peticion no declare
+    // `tools`. Una tercera copia del criterio se desincronizaria de foldToolMessages.
+    willBeFolded
 }

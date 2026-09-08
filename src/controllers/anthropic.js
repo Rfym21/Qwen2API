@@ -4,7 +4,7 @@ const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const {
   isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
-  createUpstreamDeltaNormalizer, createClientToolNamePredicate
+  createUpstreamDeltaNormalizer, createClientToolNamePredicate, willBeFolded
 } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
@@ -442,7 +442,23 @@ const buildInternalRequest = async (anthropicReq) => {
   // historia). Gemelo de chat-middleware.js#processRequestBody -> req.tool_history_calls.
   const historyToolCalls = hasTools ? extractHistoryToolCalls(flat) : [];
 
-  if (hasTools) {
+  // La historia se pliega segun lo que CONTIENE, no segun lo que esta peticion declara.
+  // Con el fold detras de `hasTools`, una peticion sin `tools` (o con
+  // `tool_choice: 'none'`) dejaba intacto al assistant que solo lleva `tool_use`: su
+  // `content` es '' y formatSingleMessage (chat-helpers.js) descarta todo mensaje cuyo
+  // texto queda vacio, asi que EL TURNO ENTERO desaparecia de la historia mientras su
+  // `tool_result` sobrevivia como una linea JSONL con el rol inexistente "tool" — el
+  // modelo veia un resultado sin la llamada que lo pidio. La compactacion y el resumen
+  // de Claude Code tienen justo esa forma, y llegan sin `tools`.
+  //
+  // Esto es RENDERIZADO, no protocolo: el prompt de herramientas, el ledger y la
+  // directiva de turno siguen atados a `hasTools` (arriba y en el paso 5). Una peticion
+  // sin herramientas recupera su historia legible sin aprender a llamarlas.
+  //
+  // El criterio se importa de chat-helpers.js#willBeFolded en vez de reescribirlo: esa
+  // funcion ya existe para el barrido de medios y su contrato es "¿foldToolMessages
+  // reescribe este mensaje?", alineado literal con las dos ramas del fold.
+  if (hasTools || flat.some(willBeFolded)) {
     flat = foldToolMessages(flat);
   }
 
