@@ -275,10 +275,31 @@ const buildInternalRequest = async (anthropicReq) => {
   // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
   // 跳过它再开始找边界，否则同一回合 tool_result 里的图片永远收不到。
   if (flat[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  const lastFlatIndex = flat.length - 1;
   for (let i = scanFrom; i >= 0; i--) {
     const candidate = flat[i];
     if (candidate?.role === 'assistant') break;
-    if (Array.isArray(candidate?.media)) currentTurnMedia.unshift(...candidate.media);
+    const fromCandidate = [];
+    if (Array.isArray(candidate?.media)) fromCandidate.push(...candidate.media);
+    // content[] 里的图片同样只有挂在最后一条消息上才会被上传：parserMessages 的多条分支
+    // 只对 lastMessage 调 normalizeMediaContentItem，更早那些被 extractTextFromContent
+    // 整个抹掉，一行日志都没有。粘贴图片的 Claude Code 正好命中这里——它先发
+    // [text, image]，再补一条只有文本的 meta 消息（`[Image: source: …png]`），
+    // 于是图片永远不是最后一条。最后一条不碰：那条 parserMessages 自己会处理。
+    if (i !== lastFlatIndex && Array.isArray(candidate?.content)) {
+      const carried = candidate.content.filter(item => item?.type === 'image_url');
+      if (carried.length > 0) {
+        fromCandidate.push(...carried);
+        // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
+        // 又会和重新挂到最后一条的那份重复。只剩一个文本项时收敛回字符串，
+        // 正是 formatSingleMessage 期待的形状。
+        const rest = candidate.content.filter(item => item?.type !== 'image_url');
+        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+          ? rest[0].text
+          : rest;
+      }
+    }
+    if (fromCandidate.length > 0) currentTurnMedia.unshift(...fromCandidate);
   }
   // media 是内部旁路，绝不能进上游请求体。历史消息里的 media 携带完整 base64 data URI，
   // 目前只是碰巧被 foldToolMessages 丢掉，而它只在带工具时才跑——所以在这里全量清掉。

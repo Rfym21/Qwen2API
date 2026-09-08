@@ -228,6 +228,66 @@ describe('image passthrough: assembled Anthropic upstream body', () => {
   });
 });
 
+describe('image passthrough: Claude Code paste shape', () => {
+  // Captured from a real session (transcript 1d349b1a): Claude Code sends the pasted
+  // image in one user message and then appends a text-only meta message pointing at
+  // its local cache, so the image is never the last message. parserMessages only
+  // uploads media from the last one, and extractTextFromContent erases it from every
+  // earlier one — the image died with no upload attempt and no log.
+  const META = '[Image: source: /Users/x/.claude-qwen/image-cache/s/1.png]';
+  const pasteTurn = () => ([
+    { role: 'user', content: [{ type: 'text', text: '[Image #1] que puedes ver en la imagen?' }, imageBlock] },
+    { role: 'user', content: [{ type: 'text', text: META }] }
+  ]);
+
+  it('delivers a pasted image that a trailing text-only meta message displaced', async () => {
+    const { body } = await build(pasteTurn());
+    assert.deepEqual(imageFiles(body), [{ type: 'image', url: IMG_URL }]);
+    assert.equal(typeof body.messages[0].content, 'string');
+  });
+
+  it('keeps both the prompt and the meta text in the envelope', async () => {
+    const { body } = await build(pasteTurn());
+    assert.ok(body.messages[0].content.includes('que puedes ver en la imagen'), 'carrier text must survive');
+    assert.ok(body.messages[0].content.includes(META), 'meta message is the current message');
+    assert.ok(!body.messages[0].content.includes(IMG_URL), 'image must not also ride in the text');
+  });
+
+  it('delivers an image whose carrier message has no text at all', async () => {
+    // Same defect, other trigger: an image block placed before the prompt becomes its
+    // own message, so it is not last either.
+    const { body } = await build([
+      { role: 'user', content: [imageBlock] },
+      { role: 'user', content: [{ type: 'text', text: 'describe it' }] }
+    ]);
+    assert.deepEqual(imageFiles(body), [{ type: 'image', url: IMG_URL }]);
+    assert.ok(body.messages[0].content.includes('describe it'));
+  });
+
+  it('does not re-attach a paste from an earlier turn', async () => {
+    const { body } = await build([
+      { role: 'user', content: [{ type: 'text', text: 'first' }, imageBlock] },
+      { role: 'assistant', content: [{ type: 'text', text: 'magenta' }] },
+      { role: 'user', content: [{ type: 'text', text: 'thanks' }] }
+    ]);
+    assert.deepEqual(imageFiles(body), [], 'only the current turn is harvested');
+  });
+
+  it('leaves a media-free two-message turn byte-identical', async () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'hola' }] },
+      { role: 'user', content: [{ type: 'text', text: META }] }
+    ];
+    const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+    const norm = async () => JSON.stringify(JSON.parse(
+      JSON.stringify((await build(messages)).body).replace(UUID, '<uuid>')
+    ), (k, v) => (k === 'timestamp' ? 0 : v));
+    assert.equal(await norm(), await norm());
+    const { body } = await build(messages);
+    assert.deepEqual(body.messages[0].files, []);
+  });
+});
+
 describe('image passthrough: OpenAI /v1/chat/completions envelope', () => {
   const runMiddleware = async (body) => {
     const req = { body };
