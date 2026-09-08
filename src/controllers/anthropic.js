@@ -30,7 +30,10 @@ const {
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
   resolveTextToolCallCap,
-  createTextChannelRunawayGuard
+  createTextChannelRunawayGuard,
+  // Misma regla de neutralizacion que usan el fold y el ledger: el texto de un bloque
+  // `thinking` es contenido del modelo que vuelve al prompt, y puede citar marcadores.
+  neutraliseResultMarkers
 } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { mapIncomingModel } = require('../utils/model-map.js');
@@ -193,6 +196,65 @@ const anthropicImageBlockToItem = (block) => {
   return url ? { type: 'image_url', image_url: { url } } : null;
 };
 
+// Los bloques `thinking` / `redacted_thinking` que llegan de vuelta.
+//
+// Antes se tiraban: la rama `assistant` ni siquiera tenia clausula (el bloque se caia
+// del if/else sin dejar rastro) y la rama `user` lo descartaba a proposito. Con extended
+// thinking + tools, Claude Code reenvia el `thinking` JUNTO al `tool_use` que produjo,
+// asi que tirarlo borra el registro que el propio modelo dejo de POR QUE hizo esa
+// llamada — justo lo que alimenta el duplicado que este plan ataca.
+//
+// El delimitador es de la misma familia que los marcadores que el modelo ya ve en la
+// historia (`[TOOL CALL #1]`, `[TOOL RESULT #1: Read]`), y por construccion no dispara
+// TOOL_CALL_TRIGGER_RE (tool-prompt.js:82), que exige `tool call` tras el corchete.
+const THINKING_OPEN = '[THINKING]';
+const THINKING_CLOSE = '[END THINKING]';
+// `redacted_thinking` trae bytes opacos cifrados: no le dicen nada a Qwen y pueden ser
+// enormes. Se marca que hubo razonamiento y se tira el payload.
+const REDACTED_THINKING_NOTE = '(redacted thinking omitted)';
+// Tope de razonamiento retenido POR MENSAJE. Un bloque de extended thinking pasa de
+// diez mil caracteres con facilidad y la historia entera tiene que caber en
+// AGENT_CONTEXT_FILE_THRESHOLD_BYTES (92160 por defecto): 1200 x 40 turnos ~ 48 KB deja
+// sitio a la conversacion real y sigue conservando el tramo de decision.
+const THINKING_CHARS_PER_MESSAGE = 1200;
+
+/**
+ * Todos los bloques de razonamiento de UNA consulta, como un fragmento delimitado.
+ * Se llama una vez por mensaje, asi que el tope de abajo es por mensaje por construccion.
+ * @param {string[]} parts - textos ya extraidos, en orden de aparicion
+ * @returns {string} fragmento delimitado, o '' si no hay nada que poner
+ */
+const renderThinkingParts = (parts) => {
+  if (!Array.isArray(parts) || parts.length === 0) return '';
+  const joined = parts.join('\n');
+  // Se recorta por la CABECERA, no por la cola: la decision que produjo la llamada
+  // esta al final del razonamiento. Quedarse con el principio conserva el planteo
+  // y tira exactamente el porque, que es lo unico que veniamos a rescatar.
+  const capped = joined.length <= THINKING_CHARS_PER_MESSAGE
+    ? joined
+    : `…${joined.slice(joined.length - (THINKING_CHARS_PER_MESSAGE - 1))}`;
+  // Recortar primero y neutralizar despues: asi la neutralizacion tiene la ultima
+  // palabra (un corte a mitad de marcador deja un fragmento inerte, no un marcador).
+  // Ninguna sustitucion cambia la longitud, el tope se respeta igual.
+  const safe = neutraliseResultMarkers(capped)
+    // El cierre del propio delimitador tambien es forjable desde el cuerpo, y un
+    // delimitador que el contenido puede escribir no delimita nada.
+    .replace(/\[(?=[ \t]*(?:END[ \t]+)?THINKING[ \t]*\])/gi, '(');
+  return `${THINKING_OPEN}\n${safe}\n${THINKING_CLOSE}`;
+};
+
+/**
+ * El texto util de un bloque de razonamiento. La `signature` es un opaco del wire de
+ * Anthropic: no aporta nada al modelo y ocupa, asi que no viaja.
+ * @param {Object} block - bloque thinking o redacted_thinking
+ * @returns {string} texto a retener, o '' si el bloque no aporta nada
+ */
+const thinkingBlockText = (block) => {
+  if (block?.type === 'redacted_thinking') return REDACTED_THINKING_NOTE;
+  const text = typeof block?.thinking === 'string' ? block.thinking : '';
+  return text.trim() ? text : '';
+};
+
 /**
  * 把 Anthropic 风格的消息（含 content blocks 与 tool_use/tool_result）展开为
  * OpenAI 风格消息列表。tool_use 转为 assistant.tool_calls；tool_result 转为
@@ -221,10 +283,14 @@ const flattenAnthropicMessages = (messages) => {
 
     if (role === 'assistant') {
       const textParts = [];
+      const thinkingParts = [];
       const toolCalls = [];
       for (const block of msg.content) {
         if (block?.type === 'text' && typeof block.text === 'string') {
           textParts.push(block.text);
+        } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+          const text = thinkingBlockText(block);
+          if (text) thinkingParts.push(text);
         } else if (block?.type === 'tool_use') {
           toolCalls.push({
             id: block.id || newAnthropicToolUseId(),
@@ -236,7 +302,13 @@ const flattenAnthropicMessages = (messages) => {
           });
         }
       }
-      const out_msg = { role: 'assistant', content: textParts.join('') };
+      // El razonamiento va DELANTE del texto y, tras foldToolMessages, delante de los
+      // bloques de llamada: se lee en orden cronologico penso -> dijo -> llamo.
+      // Sin bloques thinking `content` queda byte a byte como antes.
+      const out_msg = {
+        role: 'assistant',
+        content: [renderThinkingParts(thinkingParts), textParts.join('')].filter(Boolean).join('\n')
+      };
       if (toolCalls.length > 0) out_msg.tool_calls = toolCalls;
       out.push(out_msg);
       continue;
@@ -296,7 +368,10 @@ const flattenAnthropicMessages = (messages) => {
           }
         }
       } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
-        // 故意丢弃：无法回放给 Qwen，而且丢掉它不会改变用户的意图。
+        // Se tira A PROPOSITO, y la asimetria con la rama assistant es deliberada:
+        // segun la spec el razonamiento vuelve en turnos de assistant, y ahi si lo
+        // retenemos (es el porque de la llamada). En rol user no hay intencion de
+        // usuario que preservar. Fijado por image-passthrough.test.js:387.
       } else {
         // 兜底分支。以前这里什么都没有：document（PDF）、search_result、server_tool_use…
         // 全部无声消失，模型只收到包围它们的那句话就去回答。
