@@ -427,6 +427,34 @@ describe('image passthrough: OpenClaw agent shape', () => {
     assert.deepEqual(out.messages[0].files, [], 'only the current turn is harvested');
   });
 
+  it('keeps the image across a multi-step tool loop (mid-turn assistant is not a boundary)', async () => {
+    // Captured 2026-09-08 18:54: the model saw the image and issued a web_search that
+    // failed schema validation, adding a SECOND assistant step inside the same user
+    // turn. Breaking on any assistant dropped the image from that follow-up request and
+    // the final answer was invented from the system prompt instead.
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'QUE VES EN LA IMAGEN NOVA?' }, IMG_ITEM] },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{"path":"a.png"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'Read image file [image/jpeg]' },
+      { role: 'user', content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, IMG_ITEM] },
+      { role: 'assistant', content: 'END', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'read', arguments: '{"path":"b.png"}' } }] },
+      { role: 'tool', tool_call_id: 'c2', content: 'Validation failed for tool' },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [{ type: 'image', url: IMG_URL }], 'image must survive the second tool step');
+  });
+
+  it('still stops at a real final answer from the previous turn', async () => {
+    const out = await runOpenClaw([
+      { role: 'user', content: [{ type: 'text', text: 'first' }, IMG_ITEM] },
+      { role: 'assistant', content: 'era magenta' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'user', content: [{ type: 'text', text: RUNTIME_CTX }] }
+    ]);
+    assert.deepEqual(out.messages[0].files, [], 'an assistant with no tool_calls is still the boundary');
+  });
+
   it('leaves a media-free agent request byte-identical', async () => {
     const messages = () => ([
       { role: 'user', content: [{ type: 'text', text: 'hola' }] },
@@ -495,6 +523,16 @@ describe('harvestCurrentTurnMedia', () => {
     assert.deepEqual(harvestCurrentTurnMedia(messages), []);
   });
 
+  it('treats a mid-turn assistant tool-call step as inside the turn', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'x' }, IMG_ITEM] },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }] }
+    ];
+    assert.deepEqual(harvestCurrentTurnMedia(messages), [IMG_ITEM]);
+  });
+
   it('preserves order across several carriers', () => {
     const A = { type: 'image_url', image_url: { url: 'https://example.invalid/a.png' } };
     const B = { type: 'image_url', image_url: { url: 'https://example.invalid/b.png' } };
@@ -504,6 +542,19 @@ describe('harvestCurrentTurnMedia', () => {
       { role: 'user', content: [{ type: 'text', text: 'meta' }] }
     ];
     assert.deepEqual(harvestCurrentTurnMedia(messages), [A, B]);
+  });
+
+  it('dedupes the same image across carriers and against the last message', () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: '1' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: '2' }, IMG_ITEM] },
+      { role: 'user', content: [{ type: 'text', text: 'meta' }, IMG_ITEM] }
+    ];
+    // The last message already carries it, so parserMessages will upload that copy;
+    // the two earlier carriers must be stripped but contribute nothing.
+    assert.deepEqual(harvestCurrentTurnMedia(messages), []);
+    assert.equal(messages[0].content, '1', 'carrier is still stripped');
+    assert.equal(messages[1].content, '2');
   });
 
   it('is a no-op on media-free and malformed input', () => {

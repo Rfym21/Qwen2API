@@ -691,10 +691,38 @@ const harvestCurrentTurnMedia = (messages) => {
         scanFrom -= 1
     }
 
+    // 同一个回合里同一张图会出现好几次：用户消息里一次，工具结果的搬运消息里又一次
+    // （OpenClaw 的 "Attached image(s) from tool result:"）。按 URL 去重，否则同一张图
+    // 会被送上去两遍。种子取自最后一条消息已有的媒体——那份 parserMessages 自己会传。
+    const seenUrls = new Set()
+    const rememberUrl = (item) => {
+        const url = getMediaDescriptor(item)?.url
+        if (typeof url !== 'string' || url.length === 0) return false
+        if (seenUrls.has(url)) return true
+        seenUrls.add(url)
+        return false
+    }
+    if (Array.isArray(messages[lastIndex]?.content)) {
+        messages[lastIndex].content.filter(isMediaContentItem).forEach(rememberUrl)
+    }
+
     const harvested = []
     for (let i = scanFrom; i >= 0; i--) {
         const candidate = messages[i]
         if (candidate?.role === 'assistant') {
+            // 回合边界是**最终答复**，不是任意一条 assistant。工具循环里同一个用户回合
+            // 会有好几条 assistant：每一条都带 tool_calls，是中间步骤。按「任意 assistant」
+            // 断（anthropic.js 那版的写法）会让图片在循环的第二步之后就掉出窗口。
+            //
+            // 2026-09-08 实测：模型在 18:54:37 明明看懂了图（它拿截图里的视频标题去
+            // web_search），可那次 web_search 因为 schema 不符被拒，于是多了一条带
+            // tool_calls 的 assistant；下一次请求的扫描停在它那里，图片没了，18:54:48
+            // 的最终答复变成了照着 system prompt 里的数据瞎编。
+            const midTurnCall = (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length > 0) ||
+                !!candidate.function_call?.name
+            if (midTurnCall) {
+                continue
+            }
             break
         }
         // 最后一条交给 parserMessages，这里必须跳过（scanFrom 可能就等于 lastIndex）
@@ -706,6 +734,9 @@ const harvestCurrentTurnMedia = (messages) => {
         if (carried.length === 0) {
             continue
         }
+        // 去重后没有新东西时也要照常把媒体项从正文里摘掉：留着它既进不了上游
+        // （历史正文只保留 text），又白白把 base64 塞进外置上下文文档里。
+        const fresh = carried.filter(item => !rememberUrl(item))
 
         // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
         // 又会和重新挂到最后一条的那份重复。
@@ -713,7 +744,7 @@ const harvestCurrentTurnMedia = (messages) => {
         candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
             ? rest[0].text
             : rest
-        harvested.unshift(...carried)
+        harvested.unshift(...fresh)
     }
 
     return harvested
