@@ -6,6 +6,7 @@ const {
     parseToolCallsFromText,
     createNativeToolCallAccumulator,
     looksLikeUnexecutedToolAction,
+    stripToolCallResidue,
     TOOL_CALL_OPEN,
     TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js')
@@ -242,12 +243,34 @@ const normalizeAgentUsage = (attempt, requestBody, completionText) => {
     return usage
 }
 
-const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false } = {}) => {
+/**
+ * Residuo de protocolo que TODAVÍA se puede pelar en la entrega.
+ *
+ * Lo que ya salió en vivo por el canal de contenido es irrecuperable, y borrarlo del buffer
+ * rompería el descuento de handleOpenAIAgentStream (`bufferedContent.startsWith(...)`) y lo
+ * duplicaría en el cliente: un residuo entregado una vez es mejor que la respuesta entera
+ * entregada dos. Hoy ninguna ronda aceptada llega aquí con texto ya emitido y residuo a la
+ * vez (el gate 422 corta antes), así que este filtro es defensa, no un camino vivo.
+ */
+const deliverableResidueSpans = (attempt, alreadyStreamed = 0) =>
+    (attempt?.residueSpans || []).filter(span =>
+        span && typeof span.text === 'string' && Number.isInteger(span.at) && span.at >= alreadyStreamed)
+
+const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false, residueSpans = null } = {}) => {
     let reasoning = String(attempt?.reasoning || '')
     // 工具调用旁的正文照常交付（OpenAI 允许 content 与 tool_calls 并存）：严格门禁下文本
     // 通道的调用到这里 visibleText 必为空白；原生晋升的回合带着调用前的正文过来 —— 除非
     // 门禁判定那段正文混着写坏的文本 [TOOL CALL]（suppressVisibleText），那就一个字节不发。
-    const visibleText = suppressVisibleText ? '' : String(attempt?.visibleText || '')
+    //
+    // 交付层剥残渣（与 anthropic.js:1501/:2164 同一层）：解析器**当场登记**的协议残渣按
+    // 位置剥掉，绝不搜索 —— 围栏里引用同一个标记的文档不带 span，原样交付。检测输入
+    // （attempt.visibleText）从未被碰过：malformed_protocol 重试仍照旧点火。
+    const visibleText = suppressVisibleText
+        ? ''
+        : stripToolCallResidue(
+            String(attempt?.visibleText || ''),
+            residueSpans || deliverableResidueSpans(attempt)
+        )
     let content = attempt?.toolCalls?.length > 0 && !visibleText.trim() ? '' : visibleText
 
     if (attempt?.webSearchInfo) {
@@ -346,7 +369,12 @@ const handleOpenAIAgentStream = async (
     }
 
     const { attempt, finishReason, suppressVisibleText } = runtime
-    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
+    const streamedVisibleText = String(attempt.streamedVisibleText || '')
+    // Un único juego de spans para el contenido y para el descuento de abajo: si se pelara
+    // el buffer contra un `acceptedVisibleText` sin pelar, el `startsWith` fallaría y el
+    // turno entero se reenviaría detrás de lo ya emitido.
+    const residueSpans = deliverableResidueSpans(attempt, streamedVisibleText.length)
+    const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText, residueSpans })
     let bufferedReasoning = output.reasoning
     const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
     const rawAcceptedReasoning = String(attempt.reasoning || '')
@@ -357,8 +385,7 @@ const handleOpenAIAgentStream = async (
     }
 
     let bufferedContent = output.content
-    const streamedVisibleText = String(attempt.streamedVisibleText || '')
-    const acceptedVisibleText = String(attempt.visibleText || '')
+    const acceptedVisibleText = stripToolCallResidue(String(attempt.visibleText || ''), residueSpans)
     if (
         streamedVisibleText &&
         acceptedVisibleText.startsWith(streamedVisibleText) &&

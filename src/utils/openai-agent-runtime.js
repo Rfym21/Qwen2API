@@ -30,6 +30,41 @@ const NON_RETRYABLE_FINISH_REASONS = new Set([
   'refusal'
 ])
 
+/**
+ * Rebasa los spans de residuo de coordenadas de `cleanedText` a las de `visibleText`.
+ *
+ * `stripToolCallResidue` pela por POSICIÓN, nunca por búsqueda: `at` es el punto que el
+ * parser anotó sobre `cleanedText`, y `parseAgentControlText` recorta y — en una ronda
+ * final/blocked — desenvuelve el `<agent_final>`, así que entre ambos hay un desplazamiento.
+ * Rebasar no es un detalle: envuelto es la ÚNICA forma en la que un residuo llega a
+ * entregarse en este camino (el gate rechaza la prosa desnuda con agentTurnAcceptBareFinal
+ * en false), o sea que sin esto el pelado no encontraría un solo span y no pelaría nada.
+ *
+ * Fail closed en las dos direcciones: se exige que el texto entregado sea un tramo contiguo
+ * y NO ambiguo de `cleanedText` (un `indexOf` a secas elegiría el primero de dos tramos
+ * idénticos y borraría en el sitio equivocado), y cada span se revalida contra el destino
+ * con la misma regla que aplicará stripToolCallResidue — coincidencia exacta, o cola
+ * recortada que sea prefijo del span. Lo que no cuadra se descarta: mejor entregar un
+ * residuo que morder la respuesta.
+ */
+const rebaseResidueSpans = (cleanedText, visibleText, spans) => {
+  if (!Array.isArray(spans) || spans.length === 0) return []
+  const source = String(cleanedText || '')
+  const target = String(visibleText || '')
+  if (!target) return []
+  const offset = source.indexOf(target)
+  if (offset === -1 || source.indexOf(target, offset + 1) !== -1) return []
+  return spans
+    .filter(span => span && typeof span.text === 'string' && span.text && Number.isInteger(span.at))
+    .map(span => ({ ...span, at: span.at - offset }))
+    .filter(span => {
+      if (span.at < 0 || span.at >= target.length) return false
+      const slice = target.slice(span.at, span.at + span.text.length)
+      if (slice === span.text) return true
+      return slice.length < span.text.length && span.text.startsWith(slice)
+    })
+}
+
 const normalizeCreatedMetadata = (payload) => {
   const created = payload?.['response.created'] || payload?.response?.created
   if (!created || typeof created !== 'object') return null
@@ -487,6 +522,14 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     ...(nativeTools?.getErrors?.() || [])
   ]
   const control = parseAgentControlText(textTools.cleanedText)
+  // Registro del residuo condenado, ya rebasado a coordenadas de `visibleText`: la capa de
+  // entrega (chat.js#prepareAgentOutput) lo pela por posición, gemela de anthropic.js:1501.
+  // La DETECCIÓN no se toca — `visibleText` sigue byte a byte como salió del parser, porque
+  // containsOrphanProtocolResidue decide malformed_protocol sobre él y pelarlo aquí apagaría
+  // el reintento que hoy recupera la ronda.
+  const residueSpans = hasTools
+    ? rebaseResidueSpans(textTools.cleanedText, control.text, textTools.residueSpans)
+    : []
   const metadata = (acceptedResponseId && createdByResponseId.get(acceptedResponseId)) || primaryCreated || lastCreated || {
     chatId: null,
     parentId: null,
@@ -498,6 +541,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     rawAnswer: answer,
     visibleText: control.text,
     controlKind: control.kind,
+    // Residuo de protocolo condenado por el parser, en coordenadas de `visibleText`.
+    // Hasta esta spec se calculaba y se tiraba al suelo: stripToolCallResidue tenía cuatro
+    // llamadores en anthropic.js y CERO aquí, y por eso un `[END TOOL CALL]` huérfano salía
+    // como texto del asistente (20 casos medidos sobre 192 sesiones reales).
+    residueSpans,
     streamedVisibleText,
     recoveredContent,
     recoveredReasoning,
