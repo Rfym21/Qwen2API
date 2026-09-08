@@ -2232,6 +2232,14 @@ const handleAnthropicMessages = async (req, res) => {
       });
     }
 
+    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+    if (upstreamResp.contextCompacted) {
+      res.set('X-Qwen2API-Context-Compacted', String(upstreamResp.contextSerializedBytes || 0));
+    }
+
     const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
     const ctx = {
       message_id,

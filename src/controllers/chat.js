@@ -1345,6 +1345,14 @@ const handleChatCompletion = async (req, res) => {
             return
         }
 
+    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+        if (response_data.contextCompacted) {
+            res.set('X-Qwen2API-Context-Compacted', String(response_data.contextSerializedBytes || 0))
+        }
+
         if (stream) {
             setResponseHeaders(res, true)
             await handleStreamResponse(res, response_data.response, enable_thinking, enable_web_search, req.body, {

@@ -145,17 +145,29 @@ const buildRecentAgentHistory = (
     }
 
     const latest = entries[entries.length - 1].raw
-    const previous = entries.slice(Math.max(0, entries.length - 4), -1)
-        .map(entry => entry.raw)
-        .join('\n')
-    if (!previous) return truncateUtf8HeadTail(latest, limit, 0.4, compactionSeparator)
 
-    const previousBudget = Math.floor(limit * 0.32)
-    const latestBudget = Math.max(0, limit - previousBudget - 1)
-    return [
-        truncateUtf8HeadTail(previous, previousBudget, 0.45, compactionSeparator),
-        truncateUtf8HeadTail(latest, latestBudget, 0.4, compactionSeparator)
-    ].filter(Boolean).join('\n')
+    // 从最新往回**填满**预算，而不是固定留 5 条。
+    //
+    // 旧写法写死 `slice(length - 4, -1)` + 最后一条 = 恒定 5 条，预算给多少都一样。
+    // 于是上面那套按权重分配的预算对这一段毫无作用：49152 字节的上限只用掉个位数百分比，
+    // 而模型丢掉的是它继续任务所需要的历史。整条保留，不做半截截断 —— JSONL 的一行被
+    // 拦腰砍断既不可解析，也比没有更容易误导。
+    const chosen = []
+    let used = 0
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const raw = entries[i].raw
+        const cost = byteLength(raw) + (chosen.length > 0 ? 1 : 0)
+        if (used + cost > limit) break
+        chosen.unshift(raw)
+        used += cost
+    }
+    // 连最新的一条都放不下时退回旧行为：把它头尾截断塞进整个预算，绝不返回空。
+    if (chosen.length === 0) return truncateUtf8HeadTail(latest, limit, 0.4, compactionSeparator)
+    // 有内容被丢掉时留个记号，模型才知道自己看到的不是全部。
+    const dropped = entries.length - chosen.length
+    return dropped > 0
+        ? `${compactionSeparator.trim()}\n${chosen.join('\n')}`
+        : chosen.join('\n')
 }
 
 const buildBudgetedAgentPrompt = (
@@ -194,18 +206,41 @@ const buildBudgetedAgentPrompt = (
         ), 0)
     if (fixedBytes >= max) return truncateUtf8(notice, max)
 
-    let remainingBytes = max - fixedBytes
-    let remainingWeight = sections.reduce((sum, section) => sum + section.weight, 0)
+    const pool = max - fixedBytes
     const compactionSeparator = attachmentAvailable
         ? '\n...[inline context compacted; complete copy is in the attachment]...\n'
         : '\n...[older inline context compacted after attachment recovery failed]...\n'
+
+    // 两趟分配。
+    //
+    // 旧写法是一趟：`remainingBytes -= budget` 减掉的是**配额**而不是实际用量，所以一个
+    // 内容很小的 section 会把自己没用完的额度一并吞掉；而剩下的字节最后落在**最后一个**
+    // section（current，不可伸缩、通常很短）上，直接死掉。真正能无限吸收历史的 recent
+    // 排在第三位，永远吃不到这些剩余。实测：49152 字节的上限只用掉 19.8%。
+    //
+    // 第一趟：每个 section 拿「按权重的配额」和「它实际需要的量」里更小的那个。
+    // 第二趟：把剩余按**弹性顺序**发出去 —— recent 先拿，它能把更多历史留在行内。
+    const naturalBytes = sections.map(section => byteLength(section.value))
+    const totalWeight = sections.reduce((sum, section) => sum + section.weight, 0)
+    const budgets = sections.map((section, index) => Math.min(
+        Math.floor(pool * section.weight / totalWeight),
+        naturalBytes[index]
+    ))
+    let surplus = pool - budgets.reduce((sum, value) => sum + value, 0)
+    const byElasticity = sections
+        .map((section, index) => index)
+        .sort((a, b) => (sections[b].kind === 'recent' ? 1 : 0) - (sections[a].kind === 'recent' ? 1 : 0))
+    for (const index of byElasticity) {
+        if (surplus <= 0) break
+        const want = naturalBytes[index] - budgets[index]
+        if (want <= 0) continue
+        const give = Math.min(want, surplus)
+        budgets[index] += give
+        surplus -= give
+    }
+
     const rendered = sections.map((section, index) => {
-        const isLast = index === sections.length - 1
-        const budget = isLast
-            ? remainingBytes
-            : Math.floor(remainingBytes * section.weight / remainingWeight)
-        remainingBytes -= budget
-        remainingWeight -= section.weight
+        const budget = budgets[index]
         const content = section.kind === 'recent'
             ? buildRecentAgentHistory(envelope, budget, compactionSeparator)
             : truncateUtf8HeadTail(
@@ -451,6 +486,12 @@ const sendChatRequest = async (body, options = {}) => {
                     // 返回真正提交给 Qwen 的请求体。严格 Agent 回合纠正可直接复用
                     // 已外置的上下文附件，避免每次纠正都重新上传同一份长历史。
                     requestBody: payload,
+                    // 上下文被静默削减时，调用方必须能告诉客户端。附件失败的回退把
+                    // ~1MB 的上下文压成几十 KB 却照样返回 200：没有这两个字段，
+                    // 客户端拿到的是一个「成功」的回答，而模型其实只看到了一小片。
+                    contextCompacted: contextResult.compacted === true,
+                    contextExternalized: contextResult.externalized === true,
+                    contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
                     response: response.data
                 }

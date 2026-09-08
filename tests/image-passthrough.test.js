@@ -288,6 +288,55 @@ describe('image passthrough: Claude Code paste shape', () => {
   });
 });
 
+describe('agent context budget', () => {
+  const { buildAgentContextLivePrompt } = require('../src/utils/request.js');
+  const CAP = 49152;
+
+  const envelope = (rounds) => {
+    const lines = [];
+    for (let i = 0; i < rounds; i++) {
+      lines.push(JSON.stringify({ role: i % 2 ? 'assistant' : 'user', content: `ROUND_${i} ` + 'x'.repeat(700) }));
+    }
+    return [
+      '# Tools', 'strict tool protocol',
+      '# Conversation history (JSONL)', lines.join('\n'),
+      '# Current message', JSON.stringify({ role: 'user', content: 'name the colour' })
+    ].join('\n');
+  };
+
+  it('actually spends the configured budget instead of a fixed five rounds', () => {
+    const out = buildAgentContextLivePrompt(envelope(60), CAP);
+    const bytes = Buffer.byteLength(out, 'utf8');
+    // Before: a hardcoded slice kept 5 entries regardless of budget -> 4559 bytes, 9.3% of cap.
+    assert.ok(bytes > CAP * 0.8, `expected to fill the budget, used ${bytes} of ${CAP}`);
+    assert.ok((out.match(/ROUND_/g) || []).length > 40, 'most history must survive inline');
+  });
+
+  it('never exceeds the cap', () => {
+    for (const rounds of [1, 5, 60, 400]) {
+      const out = buildAgentContextLivePrompt(envelope(rounds), CAP);
+      assert.ok(Buffer.byteLength(out, 'utf8') <= CAP, `rounds=${rounds} overflowed the cap`);
+    }
+  });
+
+  it('always keeps the newest round, even when a single one overflows the cap', () => {
+    const huge = [
+      '# Conversation history (JSONL)',
+      JSON.stringify({ role: 'user', content: 'OLD ' + 'y'.repeat(200000) }),
+      JSON.stringify({ role: 'assistant', content: 'NEWEST_ROUND ' + 'z'.repeat(200000) }),
+      '# Current message', JSON.stringify({ role: 'user', content: 'go on' })
+    ].join('\n');
+    const out = buildAgentContextLivePrompt(huge, CAP);
+    assert.ok(Buffer.byteLength(out, 'utf8') <= CAP);
+    assert.ok(out.includes('NEWEST_ROUND'), 'the newest round must always be represented');
+  });
+
+  it('marks the prompt when history was dropped', () => {
+    const out = buildAgentContextLivePrompt(envelope(400), CAP);
+    assert.match(out, /compacted/i, 'a dropped-history marker must be visible to the model');
+  });
+});
+
 describe('anthropic: unsupported content blocks are visible, never silent', () => {
   const pdfBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBER' } };
 
