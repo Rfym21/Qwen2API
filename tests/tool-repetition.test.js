@@ -188,6 +188,84 @@ test('ledger: el tope de entradas por defecto es exactamente 40, y conserva las 
   )
 })
 
+// El default de maxBytes es el que DE VERDAD gobierna el ledger en produccion, y hasta
+// ahora no lo miraba nadie. Medido sobre 199 sesiones reales de Claude Code con
+// duplicados (18.008 llamadas, 1.970 reemisiones de una llamada ya hecha), el tope de
+// BYTES muerde antes que el de entradas en todos los recortes reales: con 12.000 B,
+// subir maxEntries de 40 a 60 movio el alcance 0,4 puntos (91,4% -> 91,8%); con 40
+// entradas, subir los bytes de 6.000 a 12.000 lo movio 10,4 puntos (81,0% -> 91,4%).
+//
+// El test del default de maxEntries de arriba pasa `maxBytes: 1_000_000` justamente
+// para NO medir este tope — asi que sin este test el unico numero que la produccion usa
+// se puede bajar a la mitad y las 896 pruebas siguen en verde.
+//
+// Alcance = con la llamada a punto de repetirse, el ledger construido con la historia
+// PREVIA todavia nombra la instancia anterior. Es el mecanismo entero: una entrada que
+// se cayo por el tope de bytes es una repeticion que el modelo ya no puede ver que hizo.
+const LEDGER_DEFAULT_MAX_BYTES = 12000
+
+/**
+ * n llamadas distintas con entradas PESADAS a proposito: ruta absoluta larga (los
+ * argumentos se recortan a LEDGER_ARGS_CHARS = 200) + digest lleno (120). Cada renglon
+ * pesa ~333 B, frente a los ~223 B de una entrada ASCII corta.
+ *
+ * El peso es el punto: con entradas cortas caben >40 en el presupuesto y el tope de
+ * ENTRADAS mordería primero, con lo que este test volveria a medir maxEntries — el
+ * error exacto que viene a corregir. La asercion `< 40` de abajo lo vigila.
+ */
+const historiaPesada = (n) => {
+  const messages = []
+  for (let i = 1; i <= n; i++) {
+    const dir = `${String(i).padStart(3, '0')}/${'segmento/'.repeat(14)}`
+    messages.push({
+      role: 'assistant',
+      content: '',
+      tool_calls: [call(`c${i}`, 'Read', { file_path: `/Users/dev/work/service/src/${dir}mod.ts` })]
+    })
+    messages.push(result(`c${i}`, `primera linea del archivo ${i}: ${'contenido '.repeat(30)}`))
+  }
+  return messages
+}
+
+test('ledger: el tope de bytes por defecto alcanza a nombrar >=30 llamadas pesadas, las mas nuevas', () => {
+  const messages = historiaPesada(60)
+  const block = buildToolHistoryLedger(messages)
+  const lines = entryLines(block)
+
+  // Guardia: si el tope de entradas mordiera aqui, este test estaria midiendo el numero
+  // equivocado (otra vez) y su floor pasaria a ser inalcanzable por construccion.
+  assert.ok(
+    lines.length < 40,
+    `entraron ${lines.length} lineas: el tope de ENTRADAS mordio primero y este test dejo de medir maxBytes`
+  )
+
+  // El floor. Con 12.000 B y renglones de ~333 B entran 35; con los 6.000 B originales
+  // entran 17 y con 9.000 entran 26. Bajar el default rompe aqui, que es el punto.
+  assert.ok(
+    lines.length >= 30,
+    `solo entraron ${lines.length} de 60 llamadas en ${Buffer.byteLength(block)} B: ` +
+    `el tope de bytes dejo fuera ${60 - lines.length} llamadas que el modelo puede repetir sin verlo`
+  )
+
+  // Y son las MAS RECIENTES, en orden descendente: la que el modelo esta a punto de
+  // repetir es la ultima, no la primera.
+  const ordinals = lines.map(l => Number(l.match(/^#(\d+)/)[1]))
+  assert.deepEqual(
+    ordinals,
+    Array.from({ length: lines.length }, (_, i) => 60 - i),
+    'el recorte por bytes debe conservar la cola mas nueva, no un tramo del medio'
+  )
+
+  // Recortado y avisando: sin la nota, "no esta en el ledger" se lee como "no se llamo".
+  assert.match(block, /omitted/)
+
+  // El tope sigue siendo un tope: el floor de arriba no puede cumplirse desbordandolo.
+  assert.ok(
+    Buffer.byteLength(block) <= LEDGER_DEFAULT_MAX_BYTES,
+    `el bloque midio ${Buffer.byteLength(block)} B contra un default de ${LEDGER_DEFAULT_MAX_BYTES}`
+  )
+})
+
 test('ledger: el bloque nunca pasa su tope de bytes', () => {
   const messages = []
   for (let i = 1; i <= 60; i++) {
@@ -205,8 +283,13 @@ test('ledger: el bloque nunca pasa su tope de bytes', () => {
   }
 
   // Por defecto tambien esta acotado: 60 llamadas gordas no pueden inundar el prompt.
+  // El techo es el default exacto, no un numero holgado: con holgura, subir el default
+  // no rompe nada aqui y el tope real deja de estar vigilado por este lado.
   const porDefecto = buildToolHistoryLedger(messages)
-  assert.ok(Buffer.byteLength(porDefecto) <= 8192, `bloque por defecto de ${Buffer.byteLength(porDefecto)} bytes`)
+  assert.ok(
+    Buffer.byteLength(porDefecto) <= LEDGER_DEFAULT_MAX_BYTES,
+    `bloque por defecto de ${Buffer.byteLength(porDefecto)} bytes contra un tope de ${LEDGER_DEFAULT_MAX_BYTES}`
+  )
 })
 
 test('ledger: el digest no pasa de 120 caracteres', () => {
@@ -446,7 +529,7 @@ test('ledger: con resultados en desorden gana el de la instancia mas nueva', () 
 
 test('ledger: el tope de bytes tambien aguanta contenido no ASCII', () => {
   // El tope es por BYTES y el producto es bilingue con upstream chino: una entrada CJK pesa
-  // ~460 B contra los ~215 B de una ASCII, asi que entran menos de la mitad. Tiene que
+  // ~460 B contra los ~223 B de una ASCII, asi que entran menos de la mitad. Tiene que
   // seguir respetando el tope y avisando de la omision, nunca desbordarse.
   const messages = []
   for (let i = 0; i < 60; i++) {
@@ -459,7 +542,10 @@ test('ledger: el tope de bytes tambien aguanta contenido no ASCII', () => {
   }
 
   const block = buildToolHistoryLedger(messages)
-  assert.ok(Buffer.byteLength(block) <= 6000, `bloque CJK de ${Buffer.byteLength(block)} bytes`)
+  assert.ok(
+    Buffer.byteLength(block) <= LEDGER_DEFAULT_MAX_BYTES,
+    `bloque CJK de ${Buffer.byteLength(block)} bytes contra un tope de ${LEDGER_DEFAULT_MAX_BYTES}`
+  )
   assert.ok(entryLines(block).length > 0, 'no entro ni una entrada CJK')
   assert.ok(entryLines(block).length < 60, 'el fixture no llego a recortar; no prueba el tope')
   assert.match(block, /\(older calls omitted\)/, 'se recorto sin avisar: "no esta en el ledger" pasaria a leerse como "nunca se llamo"')

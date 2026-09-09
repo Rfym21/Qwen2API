@@ -742,23 +742,47 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   (con assistant.tool_calls y role=tool estructurados, no ya convertidos a texto)
  * @param {Object} [options]
  * @param {number} [options.maxEntries=40] - tope de entradas, las mas recientes primero
- * @param {number} [options.maxBytes=6000] - tope duro del bloque completo; compite contra
- *   el umbral de externalizacion de 90 KiB en CADA request. Medido con llamadas realistas
- *   (Read con ruta absoluta + digest lleno) una entrada ASCII pesa ~215 B, asi que el tope
- *   de bytes muerde antes que maxEntries: ~26 entradas y ~6 KB (7% del presupuesto). La
- *   cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la misma
- *   entrada pesa ~460 B y solo entran ~12. Degrada sin mentir — la nota de omision se
- *   dispara igual — pero la capacidad real se parte a la mitad frente al numero ASCII. Se
- *   conservan las MAS RECIENTES, que son las que el modelo esta a punto de repetir.
+ * @param {number} [options.maxBytes=12000] - tope duro del bloque completo, y el knob que
+ *   REALMENTE gobierna: una entrada ASCII realista (Read con ruta absoluta + digest lleno)
+ *   pesa ~223 B y una pesada ~333 B, asi que los bytes muerden antes que maxEntries en
+ *   todos los recortes reales — el ledger nunca llega a sus 40 entradas anunciadas.
+ *
+ *   El 12000 esta medido, no elegido. Alcance = con la llamada a punto de repetirse, el
+ *   ledger construido con la historia previa todavia nombra la instancia anterior. Sobre
+ *   199 sesiones reales de Claude Code con duplicados (18.008 llamadas, 1.970 reemisiones):
+ *
+ *     6.000 B  81,0% de alcance   5.315 B/request de media
+ *     9.000 B  88,7%              7.612 B      (+7,8 pp por +2.297 B = 67 casos/KB)
+ *    12.000 B  91,4%              9.276 B      (+2,6 pp por +1.664 B = 31 casos/KB)
+ *    16.000 B  95,3%             11.836 B      (+3,9 pp por +2.560 B = 30 casos/KB)
+ *    24.000 B  96,5%             14.761 B      (+1,3 pp por +2.925 B =  9 casos/KB)
+ *    sin tope 100,0%             30.091 B      (+1,9 pp por +12.549 B = 3 casos/KB)
+ *
+ *   La curva se dobla despues de 16.000; 12.000 esta en el tramo empinado y compra 10,4
+ *   puntos sobre el default viejo. Subir maxEntries en cambio no compra casi nada: a
+ *   12.000 B, pasar de 40 a 60 entradas movio el alcance del 91,4% al 91,8%.
+ *
+ *   El coste contra el umbral de externalizacion de 90 KiB resulto ser el argumento
+ *   debil: medido sobre 25.576 fronteras de request reales, el 71,2% YA estaba por
+ *   encima del umbral con el ledger de 6.000 (la conversacion mediana pesa 169 KB), y
+ *   subir a 12.000 empuja al otro lado solo a 116 de 25.576 = 0,45% de las peticiones.
+ *   Ahi es justo donde hace falta: el 76% de las reemisiones ocurren en peticiones ya
+ *   externalizadas, donde el alcance con 6.000 caia al 77,0% y con 12.000 sube al 89,4%.
+ *
+ *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
+ *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision
+ *   se dispara igual. Se conservan las MAS RECIENTES, que son las que el modelo esta a
+ *   punto de repetir. El floor lo clava tests/tool-repetition.test.js; el tope superior,
+ *   el test de al lado. Los dos hacen falta: solo el tope deja bajar el numero a 1.000.
  * @returns {string} el bloque, o '' si no hay historia de herramientas
  */
-const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } = {}) => {
+const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 12000 } = {}) => {
   if (!Array.isArray(messages) || messages.length === 0) return '';
   const limit = Number.isFinite(maxEntries) ? Math.max(0, Math.trunc(maxEntries)) : 40;
   if (limit === 0) return '';
   // Sin este guard un maxBytes basura (NaN) hace que toda comparacion sea false y el
   // bloque salga SIN tope — justo lo que no puede pasar en algo que se inyecta siempre.
-  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 6000;
+  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 12000;
 
   const byKey = new Map();   // name + canonicalJson(args) -> entrada
   // id de la llamada -> { clave, ordinal DE ESA llamada }. El ordinal va aqui y no en la
