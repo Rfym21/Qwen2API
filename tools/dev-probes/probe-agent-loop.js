@@ -158,7 +158,7 @@ const openai = {
         const raw = typeof c?.function?.arguments === 'string'
           ? c.function.arguments
           : JSON.stringify(c?.function?.arguments ?? {})
-        let args = null
+        let args
         try { args = JSON.parse(raw || '{}') } catch (_) { args = null }
         return { id: String(c?.id || ''), name: String(c?.function?.name || ''), args, raw }
       }),
