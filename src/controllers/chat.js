@@ -10,6 +10,7 @@ const {
     TOOL_CALL_OPEN,
     TOOL_CALL_CLOSE
 } = require('../utils/tool-prompt.js')
+const { stripAgentTags } = require('../utils/agent-turn.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
@@ -256,6 +257,28 @@ const deliverableResidueSpans = (attempt, alreadyStreamed = 0) =>
     (attempt?.residueSpans || []).filter(span =>
         span && typeof span.text === 'string' && Number.isInteger(span.at) && span.at >= alreadyStreamed)
 
+/**
+ * Pelado de ENTREGA, gemelo literal de anthropic.js:2278.
+ *
+ * Orden obligatorio: primero el residuo por POSICIÓN —sobre el texto crudo, que es el
+ * sistema de coordenadas en el que el parser registró los spans— y sólo después las
+ * etiquetas de control. Al revés, quitar las etiquetas desplazaría los offsets y el residuo
+ * sobreviviría (lo pinta el gemelo en anthropic-toolcall-salvage: "strip-before-tags keeps
+ * offsets honest").
+ *
+ * Va DENTRO de la guarda `spans.length > 0` por la misma razón que en el gemelo ("零残渣轮
+ * 逐字节保持今天的交付"): una ronda sin residuo se entrega byte a byte como hoy. Pelar
+ * etiquetas siempre además rompería el descuento de handleOpenAIAgentStream —
+ * `acceptedVisibleText.startsWith(streamedVisibleText)`— cuando una etiqueta anidada ya salió
+ * en vivo SIN pelar, y el turno entero se reenviaría detrás de ella. Por eso los dos únicos
+ * llamadores (el contenido y el descuento) comparten esta función: si divergen, se duplica.
+ */
+const peelDeliverableText = (rawText, spans) => {
+    const text = String(rawText || '')
+    if (!Array.isArray(spans) || spans.length === 0) return text
+    return stripAgentTags(stripToolCallResidue(text, spans))
+}
+
 const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { suppressVisibleText = false, residueSpans = null } = {}) => {
     let reasoning = String(attempt?.reasoning || '')
     // 工具调用旁的正文照常交付（OpenAI 允许 content 与 tool_calls 并存）：严格门禁下文本
@@ -265,12 +288,21 @@ const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { su
     // 交付层剥残渣（与 anthropic.js:1501/:2164 同一层）：解析器**当场登记**的协议残渣按
     // 位置剥掉，绝不搜索 —— 围栏里引用同一个标记的文档不带 span，原样交付。检测输入
     // （attempt.visibleText）从未被碰过：malformed_protocol 重试仍照旧点火。
-    const visibleText = suppressVisibleText
-        ? ''
-        : stripToolCallResidue(
-            String(attempt?.visibleText || ''),
-            residueSpans || deliverableResidueSpans(attempt)
-        )
+    const rawVisibleText = String(attempt?.visibleText || '')
+    const spans = residueSpans || deliverableResidueSpans(attempt)
+    const visibleText = suppressVisibleText ? '' : peelDeliverableText(rawVisibleText, spans)
+    // Juicio de pureza de residuo (gemelo de anthropic.js:2269 `residueOnlyTurn`). El pelado
+    // ya corrió, así que `visibleText` ES el texto que iría al cliente: si la ronda entera era
+    // residuo condenado, lo que queda es vacío y esta ronda pertenece a la misma clase de
+    // fallo que una con tool_errors → error, JAMÁS un 200 con `content: ""` (frozen matrix:
+    // never an empty-content message / raw protocol never reaches a client). Se exige que el
+    // texto PRE-pelado tuviera cuerpo: así el veredicto culpa al pelado y no se solapa con las
+    // rondas que ya estaban vacías por otras razones, que tienen su propio camino.
+    const residueOnly = !suppressVisibleText &&
+        spans.length > 0 &&
+        !(attempt?.toolCalls?.length > 0) &&
+        !!rawVisibleText.trim() &&
+        !visibleText.trim()
     let content = attempt?.toolCalls?.length > 0 && !visibleText.trim() ? '' : visibleText
 
     if (attempt?.webSearchInfo) {
@@ -285,7 +317,26 @@ const prepareAgentOutput = async (attempt, enableThinking, enableWebSearch, { su
         content = `<think>\n\n${reasoning}\n\n</think>${content ? `\n${content}` : ''}`
         reasoning = ''
     }
-    return { reasoning, content }
+    return { reasoning, content, residueOnly }
+}
+
+/**
+ * Error de entrega para la ronda 100% residuo. Misma clase de fallo que el gemelo
+ * (anthropic.js:2307 -> 502 `invalid_tool_call_error`), con la forma que este camino ya usa:
+ * `writeOpenAIHttpError` emite JSON si aun no salieron cabeceras y un evento de error SSE si
+ * ya salieron -- el mismo mecanismo por el que viaja el 422 del gate.
+ */
+const RESIDUE_ONLY_DETAIL = '整轮内容只有协议残渣，剥离后为空'
+const writeResidueOnlyError = (res, label) => {
+    logger.warn(
+        `OpenAI ${label} Agent 工具协议失败，放弃交付 (${RESIDUE_ONLY_DETAIL})`,
+        'AGENT'
+    )
+    writeOpenAIHttpError(res, {
+        status: 502,
+        message: `上游返回了残缺、非法或不存在的工具调用 (${RESIDUE_ONLY_DETAIL})`,
+        code: 'invalid_tool_call'
+    })
 }
 
 const handleOpenAIAgentStream = async (
@@ -375,6 +426,14 @@ const handleOpenAIAgentStream = async (
     // turno entero se reenviaría detrás de lo ya emitido.
     const residueSpans = deliverableResidueSpans(attempt, streamedVisibleText.length)
     const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText, residueSpans })
+    // Gemelo de la guarda no-streaming: la ronda entera era residuo condenado y el pelado la
+    // dejó vacía → falla, no un `finish_reason: stop` sin un solo delta de contenido. Sólo
+    // cuando NADA salió aún por el canal de contenido: si ya se emitió texto en vivo, el
+    // cliente tiene media respuesta y el 422 del gate es quien cubre ese caso.
+    if (output.residueOnly && !streamedVisibleText) {
+        writeResidueOnlyError(res, '流式')
+        return
+    }
     let bufferedReasoning = output.reasoning
     const acceptedReasoningWasStreamed = liveReasoningByAttempt.has(runtime.attempts)
     const rawAcceptedReasoning = String(attempt.reasoning || '')
@@ -385,7 +444,7 @@ const handleOpenAIAgentStream = async (
     }
 
     let bufferedContent = output.content
-    const acceptedVisibleText = stripToolCallResidue(String(attempt.visibleText || ''), residueSpans)
+    const acceptedVisibleText = peelDeliverableText(attempt.visibleText, residueSpans)
     if (
         streamedVisibleText &&
         acceptedVisibleText.startsWith(streamedVisibleText) &&
@@ -481,6 +540,12 @@ const handleOpenAIAgentNonStream = async (
     setResponseHeaders(res, false)
     const { attempt, finishReason, suppressVisibleText } = runtime
     const output = await prepareAgentOutput(attempt, enableThinking, enableWebSearch, { suppressVisibleText })
+    // Un turno cuyo cuerpo entero era residuo condenado no tiene nada que entregar: 502 de la
+    // misma clase que el gemelo (anthropic.js:2269), nunca un 200 con `content: ""`.
+    if (output.residueOnly) {
+        writeResidueOnlyError(res, '非流式')
+        return
+    }
     const assistantMessage = {
         role: 'assistant',
         content: output.content || (attempt.toolCalls.length > 0 ? null : '')

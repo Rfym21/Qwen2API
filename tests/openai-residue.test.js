@@ -316,3 +316,129 @@ describe('OpenAI: una mención del marcador en documentación no se toca', () =>
     assert.equal(content, plain);
   });
 });
+
+// ─────── la otra mitad del contrato gemelo: pelar sin juzgar deja un 200 vacío ───────
+//
+// Reparación de la verificación adversaria de T7. La primera entrega de esta spec portó el
+// PELADO de anthropic.js:2278 pero no la GUARDA que va inmediatamente después
+// (anthropic.js:2269 `residueOnlyTurn` → 502 invalid_tool_call_error), y el comentario del
+// gemelo dice que el orden es cargante: "剥离必须在下面的空判据之前 ... 绝不能交付
+// content: [] 的空消息 (frozen matrix: never an empty-content message)".
+//
+// Consecuencia medida sobre el árbol post-T7 y pre-reparación: un turno cuyo cuerpo visible
+// entero era residuo condenado se pelaba a vacío y salía como HTTP 200 con
+// `content: ""` y `finish_reason: "stop"` — un turno muerto silencioso para un cliente
+// agéntico. El mismo texto por /v1/messages devolvía 502. O sea que T7 cambió una violación
+// de la matriz congelada (protocolo crudo al cliente) por la otra (mensaje sin contenido).
+//
+// Estas pruebas fijan LAS DOS direcciones, igual que el gemelo hace en
+// tests/anthropic-toolcall-salvage.test.js:771 y :792:
+//   residuo puro          → error, jamás 200 vacío, y el cierre crudo nunca llega;
+//   prosa + cierre suelto → 200 con la prosa, jamás un 502.
+
+describe('OpenAI: un turno que es 100% residuo falla, no entrega un 200 vacío', () => {
+  // Forma alcanzable por la puerta normal: `<agent_final>` es el envoltorio que el gate
+  // exige (agentTurnAcceptBareFinal=false), el intento 1 dispara malformed_protocol y el
+  // intento 2 entrega "tal cual" — que tras el pelado de T7 es la nada.
+  const CLOSER_ONLY = '<agent_final>[END TOOL CALL]</agent_final>';
+  const CLOSER_ONLY_PADDED = '<agent_final>   [END TOOL CALL]   </agent_final>';
+
+  it('no-streaming: el cierre huérfano solitario da 502, nunca 200 con content vacío', async () => {
+    const sender = scriptedSender(CLOSER_ONLY);
+    const { res, body, content } = await runNonStream(CLOSER_ONLY, sender);
+
+    assert.equal(sender.calls.length, 1, 'un reintento de recuperación y se rinde');
+    assert.equal(res.statusCode, 502, 'un turno sin nada entregable no es un éxito');
+    assert.equal(body?.error?.code, 'invalid_tool_call',
+      'misma clase de fallo que el gemelo (invalid_tool_call_error)');
+    assert.notEqual(
+      res.statusCode === 200 && content === '',
+      true,
+      'un 200 con content vacío es un turno muerto silencioso para el cliente agéntico'
+    );
+    assert.ok(!JSON.stringify(body).includes('END TOOL CALL'),
+      'el protocolo crudo no llega al cliente por ninguna salida');
+  });
+
+  it('no-streaming: el mismo caso con espacios alrededor tampoco se cuela', async () => {
+    // `String.trim()` es quien decide "vacío": el relleno no debe abrir una puerta trasera.
+    const sender = scriptedSender(CLOSER_ONLY_PADDED);
+    const { res, body } = await runNonStream(CLOSER_ONLY_PADDED, sender);
+
+    assert.equal(res.statusCode, 502);
+    assert.equal(body?.error?.code, 'invalid_tool_call');
+  });
+
+  it('streaming (buffer): sale un evento de error, no un finish_reason stop mudo', async () => {
+    // Pre-reparación esto emitía delta de rol → finish_reason "stop" → usage → [DONE], sin un
+    // solo delta de contenido: indistinguible de un turno correcto que no dijo nada.
+    const sender = scriptedSender(CLOSER_ONLY);
+    const { res, content } = await runStreamBuffered(CLOSER_ONLY, sender);
+
+    assert.equal(content, '', 'no hay contenido que entregar');
+    assert.equal(streamFinishReason(res.output), null,
+      'no se corona como turno terminado con éxito');
+    assert.match(res.output, /"code":"invalid_tool_call"/,
+      'el cliente recibe un error accionable');
+    assert.ok(!res.output.includes('END TOOL CALL'),
+      'el cierre crudo tampoco viaja por el canal SSE');
+  });
+
+  it('prosa + cierre suelto sigue siendo 200 con la prosa — la línea que no se cruza', async () => {
+    // Dirección opuesta, explícita (gemelo :792). Una respuesta real con un cierre extraviado
+    // detrás NO puede ascender a 502: se pela el cierre y se entrega la respuesta.
+    const sender = scriptedSender(LEAK);
+    const { res, body, content } = await runNonStream(LEAK, sender);
+
+    assert.equal(res.statusCode, 200, 'una respuesta real jamás se convierte en error');
+    assert.equal(content, PROSE);
+    assert.equal(body.choices[0].finish_reason, 'stop');
+  });
+
+  it('una ronda con llamada de herramienta válida no la toca la guarda', async () => {
+    // La guarda exige `toolCalls.length === 0`: un turno que entrega llamadas puede llevar
+    // content vacío legítimamente (OpenAI lo permite) y no debe convertirse en 502.
+    const CALL = `[TOOL CALL]${JSON.stringify({ name: 'Read', arguments: { file_path: '/tmp/a' } })}[END TOOL CALL]`;
+    const sender = scriptedSender();
+    const { res, body } = await runNonStream(CALL, sender);
+
+    assert.equal(sender.calls.length, 0, 'una llamada válida se acepta a la primera');
+    assert.equal(res.statusCode, 200);
+    assert.equal(body.choices[0].finish_reason, 'tool_calls');
+    assert.equal(body.choices[0].message.tool_calls[0].function.name, 'Read');
+  });
+});
+
+// ─────── la etiqueta de control anidada tampoco llega al cliente ───────
+
+describe('OpenAI: el pelado de entrega quita las etiquetas de control, como el gemelo', () => {
+  // anthropic.js:2278 pela `stripAgentTags(stripToolCallResidue(...))`; T7 sólo portó la
+  // mitad de dentro. Medido: `<agent_final>` filtrado como texto visible en 3 de 29.352
+  // turnos reales. `unwrapExactTag` está anclado al final, así que sólo consume el
+  // envoltorio EXTERIOR — una etiqueta anidada sobrevive al desenvuelto y salía cruda.
+  it('el <agent_final> anidado se va junto con el residuo', async () => {
+    const NESTED = '<agent_final>x [END TOOL CALL] <agent_final>y</agent_final></agent_final>';
+    const sender = scriptedSender(NESTED);
+    const { res, content } = await runNonStream(NESTED, sender);
+
+    assert.equal(res.statusCode, 200);
+    assert.ok(!content.includes('agent_final'),
+      `la etiqueta de control llegó al cliente: ${JSON.stringify(content)}`);
+    assert.ok(!content.includes('END TOOL CALL'), 'y el residuo tampoco');
+    assert.ok(content.includes('x') && content.includes('y'), 'la prosa de ambos lados sobrevive');
+  });
+
+  it('sin residuo registrado no se toca un byte, ni siquiera una etiqueta', async () => {
+    // El pelado de etiquetas va DENTRO de la guarda `spans.length > 0`, igual que en el
+    // gemelo ("零残渣轮逐字节保持今天的交付"). No es cosmética: pelar siempre rompería el
+    // descuento del stream (`acceptedVisibleText.startsWith(streamedVisibleText)`) cuando una
+    // etiqueta anidada ya salió en vivo SIN pelar, y el turno entero se reenviaría detrás.
+    const NESTED_CLEAN = '<agent_final>x <agent_final>y</agent_final></agent_final>';
+    const sender = scriptedSender();
+    const { res, content } = await runNonStream(NESTED_CLEAN, sender);
+
+    assert.equal(sender.calls.length, 0, 'sin residuo no hay reintento');
+    assert.equal(res.statusCode, 200);
+    assert.equal(content, 'x <agent_final>y</agent_final>', 'ronda sin residuo: byte a byte');
+  });
+});
