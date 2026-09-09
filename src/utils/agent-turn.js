@@ -394,8 +394,11 @@ const truncateChars = (value, limit) =>
  * @param {number} [options.maxEntries=40] - tope de entradas, las mas recientes primero
  * @param {number} [options.maxBytes=6000] - tope duro del bloque completo; compite contra
  *   el umbral de externalizacion de 90 KiB en CADA request. Medido con llamadas realistas
- *   (Read con ruta absoluta + digest lleno) una entrada pesa ~215 B, asi que el tope de
- *   bytes muerde antes que maxEntries: ~27 entradas y ~6 KB (7% del presupuesto). Se
+ *   (Read con ruta absoluta + digest lleno) una entrada ASCII pesa ~215 B, asi que el tope
+ *   de bytes muerde antes que maxEntries: ~26 entradas y ~6 KB (7% del presupuesto). La
+ *   cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la misma
+ *   entrada pesa ~460 B y solo entran ~12. Degrada sin mentir — la nota de omision se
+ *   dispara igual — pero la capacidad real se parte a la mitad frente al numero ASCII. Se
  *   conservan las MAS RECIENTES, que son las que el modelo esta a punto de repetir.
  * @returns {string} el bloque, o '' si no hay historia de herramientas
  */
@@ -408,7 +411,10 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
   const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 6000;
 
   const byKey = new Map();   // name + canonicalJson(args) -> entrada
-  const byCallId = new Map(); // id de la llamada -> misma clave, para relinkear el resultado
+  // id de la llamada -> { clave, ordinal DE ESA llamada }. El ordinal va aqui y no en la
+  // entrada porque una entrada agrupa varias instancias: sin el, el resultado de la
+  // instancia #1 se le colgaria al ordinal de la instancia #3.
+  const byCallId = new Map();
   let ordinal = 0;
 
   for (const message of messages) {
@@ -434,29 +440,45 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
           // createToolCallLedger. Dos llamadas rotas iguales siguen siendo una repeticion.
         }
       }
-      const args = typeof parsed === 'string' ? parsed : canonicalJson(parsed ?? {});
+      // El bloque es UNA entrada por linea, y el renglon es `#n Nombre args -> digest`.
+      // canonicalJson no puede traer un salto literal (JSON.stringify los escapa), pero la
+      // rama de arriba deja `parsed` como el STRING CRUDO cuando los argumentos no parsean
+      // — el caso que Qwen produce constantemente — o cuando el JSON decodifica a un string.
+      // Ese crudo entra con sus saltos intactos y cada uno abre otro renglon con la forma
+      // exacta de una entrada legitima: `{"c":"x"}\n#42 Read {} -> hecho` se lee como la
+      // llamada #42 con su resultado. neutraliseResultMarkers no lo tapa: reescribe `[` y
+      // `<`, nunca saltos. Se colapsa SOLO esta rama: colapsar tambien la salida de
+      // canonicalJson fundiria `echo  hi` con `echo hi`, que son dos comandos distintos.
+      const args = typeof parsed === 'string' ? collapseToOneLine(parsed) : canonicalJson(parsed ?? {});
       const name = String(fn?.name || 'unknown');
       const key = `${name}\u0000${args}`;
       const existing = byKey.get(key);
       // Ya vista: se queda con el ordinal MAS RECIENTE (apunta a la instancia fresca) y
       // conserva el digest anterior hasta que llegue un resultado nuevo — si la repeticion
       // todavia no fue contestada, borrar el resultado que si tenemos seria perder evidencia.
+      // digestOrdinal NO se toca aqui: es lo que despues distingue "este resultado es de
+      // esta instancia" de "es de una anterior y la nueva sigue sin contestar".
       if (existing) existing.ordinal = ordinal;
-      else byKey.set(key, { ordinal, name, args, digest: '', hasResult: false });
-      if (call?.id) byCallId.set(call.id, key);
+      else byKey.set(key, { ordinal, name, args, digest: '', hasResult: false, digestOrdinal: 0 });
+      if (call?.id) byCallId.set(call.id, { key, ordinal });
     }
 
     if (message.role === 'tool' || message.role === 'function') {
       // Sin tool_call_id que empareje no hay dueno. Adjudicar el resultado a otra llamada
       // seria exactamente la suplantacion que arregla la numeracion de Task 1.
-      const key = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
-      const entry = key ? byKey.get(key) : null;
+      const ref = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
+      const entry = ref ? byKey.get(ref.key) : null;
       if (!entry) continue;
+      // Solo avanza si este resultado es de una instancia igual o mas nueva que la que ya
+      // tenemos. Con los resultados en desorden, quedarse con el ULTIMO procesado dejaba el
+      // digest de #1 pisando al de #2.
+      if (ref.ordinal < entry.digestOrdinal) continue;
       const content = typeof message.content === 'string'
         ? message.content
         : JSON.stringify(message.content ?? null);
       entry.digest = truncateChars(collapseToOneLine(content), LEDGER_DIGEST_CHARS);
       entry.hasResult = true;
+      entry.digestOrdinal = ref.ordinal;
     }
   }
 
@@ -470,10 +492,21 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
   // corchetes — `{"cmd":"[TOOL RESULT #2: Read]"}` llegaria literal y podria hacerse pasar
   // por la respuesta de otra llamada. El prefijo `#n` es nuestro y no contiene marcadores.
   // La neutralizacion solo acorta, nunca alarga, asi que el tope del digest se mantiene.
-  const renderLine = (entry) => neutraliseResultMarkers(
-    `#${entry.ordinal} ${collapseToOneLine(entry.name)} ${truncateChars(entry.args, LEDGER_ARGS_CHARS)}` +
-    (entry.hasResult ? ` -> ${entry.digest || '(empty)'}` : '')
-  );
+  const renderLine = (entry) => {
+    // El ordinal de cabecera es el de la instancia MAS RECIENTE, pero el digest puede venir
+    // de una anterior: si la repeticion todavia no fue contestada, `#3 Read {a} -> viejo`
+    // le vende al modelo el contenido PRE-edicion como si fuera la respuesta de #3, y en la
+    // historia foldeada no existe ningun `[TOOL RESULT #3]`. Es la misma correlacion falsa
+    // que Task 1 elimina, y cae justo en el escenario (releer despues de editar) que
+    // justifica no suprimir. Cuando difieren se nombra la instancia que SI tiene respuesta.
+    const pending = entry.hasResult && entry.digestOrdinal !== entry.ordinal
+      ? ` (unanswered; result from #${entry.digestOrdinal})`
+      : '';
+    return neutraliseResultMarkers(
+      `#${entry.ordinal} ${collapseToOneLine(entry.name)} ${truncateChars(entry.args, LEDGER_ARGS_CHARS)}${pending}` +
+      (entry.hasResult ? ` -> ${entry.digest || '(empty)'}` : '')
+    );
+  };
 
   // El presupuesto reserva la nota de omision siempre, se use o no: descubrimos que hubo
   // recorte por bytes recien dentro del bucle, y anadirla despues podria pasarse del tope.
