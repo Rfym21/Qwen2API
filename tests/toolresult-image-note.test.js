@@ -45,10 +45,11 @@ describe('tool_result media note: Anthropic flattening', () => {
     assert.equal(message.content, 'Read 1 image: magenta.png\n[1 image returned by this tool]');
   });
 
-  it('never claims the image is attached — the harvest may legitimately drop it', () => {
-    // Only the LAST turn's media is uploaded (twin scans), and even there a dedupe hit or
-    // HARVEST_MEDIA_CAP can drop an item. A note promising "attached" would make the model
-    // hallucinate an image it cannot see, which is worse than the "(empty)" it replaces.
+  it('never claims the image is attached — the note states what the TOOL returned', () => {
+    // Corrected 2026-09-08: the original rationale here ("a dedupe hit or HARVEST_MEDIA_CAP
+    // can drop it") was wrong on both counts — nothing slices the harvested array, and a
+    // dedupe hit means the identical URL is already on the last message. The real reason is
+    // position, and that is now expressed by the two note forms below, not by vagueness.
     assert.ok(!/attach/i.test(toolMsg(readTurn([aImage()])).content));
   });
 
@@ -73,15 +74,70 @@ describe('tool_result media note: assembled upstream body', () => {
       [{ type: 'image', url: IMG }], 'the image must still reach files[]');
   });
 
-  it('states the truth for a history result whose image is deliberately not re-attached', async () => {
+  // Measured live 2026-09-08 (two runs per cell, same account, minutes apart, the only
+  // difference in the outgoing body being this one string): with the POSITIVE note on a
+  // previous-turn result — where files[] is empty — qwen3.8-max invented a colour 2/2,
+  // while the `(empty)` the note replaced answered NO_IMAGE 2/2. An unconditional positive
+  // note swaps "I lie that it returned nothing" for "I lie that you can see it", on a shape
+  // ~94x more common in the user's real corpus (37 image tool_results vs 3,482 turns that
+  // come after one). Hence the second form.
+  it('says the image is NOT in this request when its turn is over', async () => {
     const { body } = await build([
       ...readTurn([aImage()]),
       { role: 'assistant', content: [{ type: 'text', text: 'that was magenta' }] },
       { role: 'user', content: [{ type: 'text', text: 'thanks' }] }
     ]);
-    assert.ok(body.messages[0].content.includes('[1 image returned by this tool]'));
+    const content = body.messages[0].content;
+    assert.ok(content.includes('[1 image returned by this tool, not included in this request]'),
+      `history result must not claim a deliverable image:\n${content.slice(-400)}`);
+    assert.ok(!content.includes('(empty)'), 'and it must still not say the tool returned nothing');
     assert.deepEqual((body.messages[0].files || []).filter(f => f.type === 'image'), [],
-      'the image-delivery invariant stands: only the last turn is uploaded');
+      'the image-delivery invariant stands: only the current turn is uploaded');
+  });
+
+  // The body note and the ledger digest are two statements about the same result. Fixing
+  // one and leaving the other saying `-> (1 image)` leaves the model believing the
+  // optimistic half.
+  it('the ledger digest agrees with the body on both sides of the turn boundary', async () => {
+    const current = (await build(readTurn([aImage()]))).body.messages[0].content;
+    assert.ok(/#1 Read \{"path":"magenta\.png"\} -> \(1 image\)/.test(current), current.slice(0, 600));
+    const past = (await build([
+      ...readTurn([aImage()]),
+      { role: 'assistant', content: [{ type: 'text', text: 'that was magenta' }] },
+      { role: 'user', content: [{ type: 'text', text: 'thanks' }] }
+    ])).body.messages[0].content;
+    assert.ok(/#1 Read \{"path":"magenta\.png"\} -> \(1 image, not included\)/.test(past), past.slice(0, 600));
+  });
+
+  // The guard that matters: the note form is computed in flattenAnthropicMessages, the
+  // delivery decision in buildInternalRequest's media scan. They are two expressions of the
+  // same turn-boundary rule, so this pins the pair end to end rather than either alone. It
+  // fails if the flatten rule drifts, and it is the reason `.media` is still set for every
+  // media result: a drift can only ever produce a wrong sentence, never a lost image.
+  it('a positive note appears exactly when the image reaches files[]', async () => {
+    const bashRound = [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_02', name: 'Read', input: { path: 'notes.txt' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_02', content: 'ok' }] }
+    ];
+    const answered = [
+      { role: 'assistant', content: [{ type: 'text', text: 'that was magenta' }] },
+      { role: 'user', content: [{ type: 'text', text: 'thanks' }] }
+    ];
+    const cases = [
+      ['image result is the last message', readTurn([aImage()]), true],
+      ['image result, then another tool round in the SAME turn', [...readTurn([aImage()]), ...bashRound], true],
+      ['image result before the last final answer', [...readTurn([aImage()]), ...answered], false],
+      ['image result two turns back', [...readTurn([aImage()]), ...answered, ...answered], false]
+    ];
+    for (const [label, messages, expectDelivered] of cases) {
+      const { body } = await build(messages);
+      const content = body.messages[0].content;
+      const files = (body.messages[0].files || []).filter(f => f.type === 'image');
+      assert.equal(files.length, expectDelivered ? 1 : 0, `${label}: files[]`);
+      assert.equal(content.includes('[1 image returned by this tool]'), expectDelivered, `${label}: positive note`);
+      assert.equal(content.includes('[1 image returned by this tool, not included in this request]'),
+        !expectDelivered, `${label}: negative note`);
+    }
   });
 
   it('survives marker neutralisation byte-for-byte', () => {

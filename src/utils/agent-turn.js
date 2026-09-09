@@ -525,8 +525,18 @@ const truncateChars = (value, limit) =>
  */
 const summariseToolResultContent = (message) => {
   const raw = message?.content;
+  // Lo que ESTE servidor escribio en el cuerpo, apuntado fuera del contenido por quien lo
+  // escribio (writeToolResultMediaNote). Es la unica fuente del contador: antes se sacaba
+  // de una regex sobre el cuerpo, que es salida de herramienta —— una pagina web o un
+  // fichero que contuviera la frase inflaba el contador a voluntad y ademas perdia esa
+  // linea del digest. Ahora un cuerpo no confiable que la imite se queda tal cual, visible
+  // y sin contar.
+  const written = message?.[MEDIA_NOTE_KEY];
   // El bypass de medios de la ruta Anthropic (anthropic.js#flattenAnthropicMessages).
-  let attachments = Array.isArray(message?.media) ? message.media.length : 0;
+  let attachments = written ? written.count : (Array.isArray(message?.media) ? message.media.length : 0);
+  // Sin nota nuestra no hay forma de saberlo: la ruta OpenAI arma el ledger ANTES de la
+  // cosecha, con el medio todavia como item del array, y ahi siempre viaja.
+  const delivered = written ? written.delivered !== false : true;
   let text = '';
   if (typeof raw === 'string') {
     text = raw;
@@ -542,21 +552,32 @@ const summariseToolResultContent = (message) => {
     // Un objeto de verdad (resultado estructurado) sigue siendo su JSON.
     text = JSON.stringify(raw);
   }
-  // La nota de medios se convierte en el contador, no en prosa del digest.
-  if (text) {
-    const kept = [];
-    for (const line of text.split('\n')) {
-      const noted = line.trim().match(TOOL_RESULT_MEDIA_NOTE_RE);
-      if (noted) attachments = Math.max(attachments, Number(noted[1]));
-      else kept.push(line);
+  // La nota de medios se convierte en el contador, no en prosa del digest —— pero SOLO la
+  // que escribimos nosotros, y por igualdad EXACTA de linea. Cualquier otra cosa que el
+  // cuerpo diga es contenido y se queda donde esta.
+  if (text && written?.line) {
+    // Solo la ULTIMA aparicion: writeToolResultMediaNote la anade al final, y si el cuerpo
+    // ya traia una linea identica esa es contenido de la herramienta y se queda.
+    const lines = text.split('\n');
+    const at = lines.lastIndexOf(written.line);
+    if (at !== -1) {
+      lines.splice(at, 1);
+      text = lines.join('\n');
     }
-    text = kept.join('\n');
   }
-  return { text, attachments };
+  return { text, attachments, delivered };
 };
 
-/** `(1 image)` / `(3 images)`: el digest DICE que hubo adjunto, sin poder cargarlo. */
-const attachmentNote = (count) => (count === 1 ? '(1 image)' : `(${count} images)`);
+/**
+ * `(1 image)` / `(3 images)`: el digest DICE que hubo adjunto, sin poder cargarlo.
+ * `(1 image, not included)` cuando el medio pertenece a un turno anterior y por tanto NO
+ * viaja en esta peticion: el cuerpo del resultado y el digest tienen que decir lo mismo,
+ * o el modelo cree la mitad optimista de las dos.
+ */
+const attachmentNote = (count, delivered = true) => {
+  const noun = count === 1 ? '1 image' : `${count} images`;
+  return delivered ? `(${noun})` : `(${noun}, not included)`;
+};
 
 /**
  * Lo que el CUERPO del resultado dice cuando la herramienta devolvio medios.
@@ -569,26 +590,62 @@ const attachmentNote = (count) => (count === 1 ? '(1 image)' : `(${count} images
  * contestaba NO_IMAGE. El prompt ademas se contradecia: el ledger de agent-turn ya decia
  * `-> (1 image)` para esa misma llamada.
  *
- * La nota NO dice «adjunta»: solo se sube el medio del ULTIMO turno (los dos escaneos
- * gemelos), y aun ahi la deduplicacion por URL o HARVEST_MEDIA_CAP pueden descartarlo.
- * Prometer un adjunto que el modelo no puede ver es peor que el `(empty)` que sustituye.
- * Se queda en el hecho comprobable —la herramienta devolvio N medios— y concuerda con el
- * digest del ledger.
+ * CORRECCION 2026-09-08: la version anterior de este comentario justificaba no decir
+ * «adjunta» diciendo que la deduplicacion por URL o HARVEST_MEDIA_CAP podian descartar el
+ * medio. Las dos razones son falsas: nadie recorta el array cosechado (chat-helpers.js:828
+ * y anthropic.js:667 adjuntan todo lo cosechado; el tope solo corta el RECORRIDO), y un
+ * acierto de deduplicacion significa que esa MISMA URL ya esta en el ultimo mensaje. La
+ * unica razon real y suficiente es la otra: los medios de turnos ANTERIORES no se suben, a
+ * proposito (los dos escaneos gemelos paran en la ultima respuesta final del asistente).
+ *
+ * Por eso la nota tiene dos formas, y la que se elige depende de la POSICION:
+ *   - turno en curso  -> `[1 image returned by this tool]`
+ *   - turno anterior  -> `[1 image returned by this tool, not included in this request]`
+ * Medido contra Qwen real (2026-09-08, dos ejecuciones por celda): con la forma positiva
+ * en un resultado de turno ANTERIOR —donde files[] va vacio— el modelo se inventaba un
+ * color 2/2, mientras que el `(empty)` que la nota sustituyo acertaba NO_IMAGE 2/2. Una
+ * nota positiva incondicional cambia «te miento diciendo que no devolvio nada» por «te
+ * miento diciendo que puedes verla», y esa forma es ~94x mas frecuente en el corpus real
+ * (37 tool_results con imagen contra 3.482 turnos que vienen despues de uno).
  *
  * @param {number} count - cuantos medios traia el resultado
  * @param {string} [noun] - 'image' salvo que el resultado traiga algo que no sea imagen
+ * @param {Object} [options]
+ * @param {boolean} [options.delivered=true] - si el medio viaja en ESTA peticion
  * @returns {string} la linea que sustituye/acompana al cuerpo del resultado
  */
-const toolResultMediaNote = (count, noun = 'image') =>
-  `[${count} ${noun}${count === 1 ? '' : 's'} returned by this tool]`;
+const toolResultMediaNote = (count, noun = 'image', { delivered = true } = {}) =>
+  `[${count} ${noun}${count === 1 ? '' : 's'} returned by this tool` +
+  `${delivered ? '' : ', not included in this request'}]`;
 
-// La MISMA nota, reconocida de vuelta. El digest del ledger tiene que contar el adjunto
-// una sola vez: segun el camino, la nota llega ya escrita en el cuerpo (Anthropic, y
-// OpenAI despues del harvest) o el medio sigue como item del array (OpenAI antes). Sin
-// esto la linea del ledger diverge entre rutas y ademas se lee `-> [1 image returned by
-// this tool] (1 image)`. Un cuerpo no confiable puede falsificar la linea, pero lo unico
-// que consigue es inflar un contador del ledger: no es un marcador de protocolo.
-const TOOL_RESULT_MEDIA_NOTE_RE = /^\[(\d+) (?:image|attachment)s? returned by this tool\]$/;
+/** Donde se apunta la nota que escribimos, fuera del contenido. No enumerable: nunca
+ *  aparece en Object.keys ni en JSON.stringify, asi que no puede viajar upstream. */
+const MEDIA_NOTE_KEY = '__qwen2apiToolResultMediaNote';
+
+/**
+ * Escribe la nota en el cuerpo del resultado y la deja apuntada fuera de el.
+ *
+ * Los DOS caminos pasan por aqui (controllers/anthropic.js#flattenAnthropicMessages y
+ * utils/chat-helpers.js#harvestCurrentTurnMedia). Antes cada uno componia la linea por su
+ * cuenta y el «escriben la MISMA nota» vivia solo en un comentario; ahora la igualdad es
+ * estructural. El apunte fuera del contenido es lo que permite al ledger distinguir su
+ * propia nota de una frase identica escrita por la herramienta.
+ *
+ * @param {Object} message - mensaje role=tool/function, **se modifica**
+ * @param {string} existingText - lo que ya decia el cuerpo (puede ser '')
+ * @param {number} count - cuantos medios traia el resultado
+ * @param {string} [noun] - 'image', o 'attachment' si no todo era imagen
+ * @param {boolean} [delivered] - si el medio viaja en ESTA peticion
+ * @returns {string} la linea escrita
+ */
+const writeToolResultMediaNote = (message, existingText, count, noun = 'image', delivered = true) => {
+  const line = toolResultMediaNote(count, noun, { delivered });
+  message.content = existingText ? `${existingText}\n${line}` : line;
+  Object.defineProperty(message, MEDIA_NOTE_KEY, {
+    value: { line, count, delivered }, enumerable: false, configurable: true, writable: true
+  });
+  return line;
+};
 
 /**
  * Las llamadas ya ejecutadas que viven en la historia, como bloque de texto.
@@ -717,9 +774,9 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
       // digest de #1 pisando al de #2.
       if (ref.ordinal < entry.digestOrdinal) continue;
       // El texto se recorta; los adjuntos se anuncian aparte y NUNCA se serializan.
-      const { text, attachments } = summariseToolResultContent(message);
+      const { text, attachments, delivered } = summariseToolResultContent(message);
       const digestText = truncateChars(collapseToOneLine(text), LEDGER_DIGEST_CHARS);
-      const note = attachments > 0 ? attachmentNote(attachments) : '';
+      const note = attachments > 0 ? attachmentNote(attachments, delivered) : '';
       entry.digest = [digestText, note].filter(Boolean).join(' ');
       entry.hasResult = true;
       entry.digestOrdinal = ref.ordinal;
@@ -1022,6 +1079,8 @@ module.exports = {
   // caminos (controllers/anthropic.js#flattenAnthropicMessages y
   // utils/chat-helpers.js#harvestCurrentTurnMedia) para no divergir en el texto.
   toolResultMediaNote,
+  writeToolResultMediaNote,
+  MEDIA_NOTE_KEY,
   extractHistoryToolCalls,
   createToolCallLedger,
   isRejectedTextCallWarning,

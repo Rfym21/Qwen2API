@@ -1,9 +1,11 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
 const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
-// Nota compartida con controllers/anthropic.js: los dos escaneos gemelos escriben el
-// MISMO texto cuando sacan medios del cuerpo de un resultado de herramienta.
-const { toolResultMediaNote } = require('./agent-turn.js')
+// Nota compartida con controllers/anthropic.js: los dos escaneos gemelos escriben la nota
+// con ESTA funcion cuando sacan medios del cuerpo de un resultado de herramienta, asi que
+// el texto no puede divergir. La FORMA si difiere y a proposito: esta cosecha solo visita
+// el turno en curso, el gemelo tambien ve los anteriores y usa la variante «not included».
+const { writeToolResultMediaNote } = require('./agent-turn.js')
 // Referencia al módulo, no desestructurada: un binding desestructurado no se puede
 // sustituir desde un test y la prueba acabaría pegando a la red de verdad.
 const uploadModule = require('./upload.js')
@@ -765,21 +767,28 @@ const harvestCurrentTurnMedia = (messages) => {
             ? rest[0].text
             : rest
         if (candidate.role === 'tool' || candidate.role === 'function') {
-            // Gemelo textual de controllers/anthropic.js#flattenAnthropicMessages: si el
-            // cuerpo del resultado se queda sin nada, foldToolMessages escribe el literal
-            // `[]` (o `(empty)` si era string) = «la herramienta no devolvio nada», con el
-            // medio viajando sin explicacion en files[]. La nota dice lo que si es cierto.
+            // Gemelo de controllers/anthropic.js#flattenAnthropicMessages: si el cuerpo
+            // del resultado se queda sin nada, foldToolMessages escribe el literal `[]` (o
+            // `(empty)` si era string) = «la herramienta no devolvio nada», con el medio
+            // viajando sin explicacion en files[]. La nota dice lo que si es cierto.
+            // La linea la compone writeToolResultMediaNote (agent-turn.js), la MISMA
+            // funcion que usa el gemelo: la igualdad del texto ya no depende de que los dos
+            // comentarios digan lo mismo.
             const noun = carried.every(item => getMediaDescriptor(item)?.mediaType === 'image')
                 ? 'image'
                 : 'attachment'
-            const note = toolResultMediaNote(carried.length, noun)
             // Se normaliza a string: el fold hace JSON.stringify de lo que no sea string,
             // asi que pre-serializar el resto rinde el MISMO texto y ademas deja sitio a
             // la nota. Un resultado de herramienta siempre se pliega (willBeFolded).
             const existing = typeof collapsed === 'string'
                 ? collapsed
                 : (collapsed.length === 0 ? '' : JSON.stringify(collapsed))
-            candidate.content = existing ? `${existing}\n${note}` : note
+            // `delivered` va en true sin condicion y eso es correcto AQUI: este bucle solo
+            // llega a los mensajes del turno en curso (para en la ultima respuesta final
+            // del asistente), y lo que visita se cosecha. El gemelo Anthropic si tiene que
+            // elegir la forma porque desvia el medio durante el aplanado, cuando todavia
+            // ve los turnos anteriores.
+            writeToolResultMediaNote(candidate, existing, carried.length, noun)
         } else {
             candidate.content = collapsed
         }

@@ -26,9 +26,13 @@ const {
   buildAgentTurnDirective,
   buildToolHistoryLedger,
   extractHistoryToolCalls,
-  // Gemelo textual de chat-helpers.js#harvestCurrentTurnMedia: los dos caminos escriben
-  // la MISMA nota cuando sacan medios del cuerpo de un tool_result.
-  toolResultMediaNote,
+  // Gemelo de chat-helpers.js#harvestCurrentTurnMedia. La igualdad de la nota ya no es una
+  // promesa de comentario: los dos caminos llaman a ESTE escritor, que compone la linea y
+  // la apunta fuera del contenido. Lo que si difiere es la forma que cada uno puede
+  // escribir —— la cosecha OpenAI solo visita el turno en curso, asi que nunca necesita la
+  // variante «not included»; este camino desvia el medio en el aplanado, ve tambien los
+  // turnos anteriores y por eso tiene que elegir.
+  writeToolResultMediaNote,
   // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
@@ -368,6 +372,42 @@ const attachRetainedThinking = (out, pending) => {
  */
 const UNSUPPORTED_BLOCK_NOTE = (type) => `[unsupported content block: ${type} — not forwarded]`;
 
+/**
+ * Indice del primer mensaje del turno EN CURSO.
+ *
+ * Misma regla que el barrido de medios de buildInternalRequest (y que su gemelo
+ * chat-helpers.js#harvestCurrentTurnMedia), expresada sobre la forma de ENTRADA: la
+ * frontera del turno es la ultima respuesta FINAL del asistente —— la que no lleva
+ * `tool_use`. Un assistant al final es prefill, pertenece al turno y no lo cierra.
+ *
+ * Se recalcula aqui en vez de leerse del barrido porque el aplanado corre antes; el
+ * barrido queda intacto, que es lo que exige el invariante de entrega de imagenes. Si las
+ * dos reglas se desincronizaran, lo unico que cambia es el TEXTO de la nota: `.media` se
+ * sigue poniendo siempre, asi que ninguna imagen puede perderse por este calculo. La
+ * concordancia esta clavada extremo a extremo (nota positiva <=> imagen en files[]) en
+ * tests/toolresult-image-note.test.js.
+ *
+ * Unico desacuerdo conocido: HARVEST_MEDIA_CAP corta el RECORRIDO del barrido a los 4
+ * primeros medios, asi que un turno con mas de 4 puede tener un resultado dentro de la
+ * ventana cuyo medio no llega a visitarse. Cuenta como conocido y no como silencioso.
+ *
+ * @param {Array<Object>} messages - mensajes en forma Anthropic
+ * @returns {number} indice del primer mensaje del turno en curso (0 si no hay frontera)
+ */
+const currentTurnStartIndex = (messages) => {
+  let scanFrom = messages.length - 1;
+  if (messages[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  for (let i = scanFrom; i >= 0; i--) {
+    const candidate = messages[i];
+    if (candidate?.role !== 'assistant') continue;
+    // Paso intermedio del bucle de herramientas, no frontera. Cortar en «cualquier
+    // assistant» dejaria fuera de la ventana la imagen de un Read seguido de un Bash.
+    if (Array.isArray(candidate.content) && candidate.content.some(b => b?.type === 'tool_use')) continue;
+    return i + 1;
+  }
+  return 0;
+};
+
 const flattenAnthropicMessages = (messages) => {
   // 本次调用里被丢弃的块类型，用于收尾时一条 WARN（不是每块一条）。
   const droppedBlockTypes = new Set();
@@ -375,8 +415,12 @@ const flattenAnthropicMessages = (messages) => {
   const out = [];
   // Razonamiento pendiente de colgar: {index en `out`, fragmento ya delimitado}.
   const pendingThinking = [];
+  // Todo lo que este en o despues de este indice pertenece al turno en curso: su medio SI
+  // se sube. Lo anterior no, y la nota tiene que decirlo.
+  const turnStart = currentTurnStartIndex(messages);
 
-  for (const msg of messages) {
+  for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+    const msg = messages[msgIndex];
     if (!msg || typeof msg !== 'object') continue;
     const role = msg.role;
 
@@ -433,30 +477,64 @@ const flattenAnthropicMessages = (messages) => {
     for (const block of msg.content) {
       if (block?.type === 'tool_result') {
         flushCollectedText();
-        const resultContent = typeof block.content === 'string'
-          ? block.content
-          : Array.isArray(block.content)
-            ? block.content.filter(b => b?.type === 'text').map(b => b.text || '').join('\n')
-            : JSON.stringify(block.content ?? '');
+        // Claude Code 的 Read 把图片放在 tool_result.content 里。图片走 media 旁路：
+        // role=tool 的 content 必须是字符串，foldToolMessages 会把非字符串 JSON.stringify
+        // 掉，图片项塞进去就废了。
+        //
+        // El resto del array NO es una lista blanca de dos tipos. Antes lo era —— se
+        // conservaba `text`, se desviaba `image` y TODO lo demas desaparecia sin nota, sin
+        // droppedBlockTypes y sin cabecera de compatibilidad, asi que un resultado con un
+        // solo bloque no-texto se plegaba a `(empty)`. Medido sobre 1.564 sesiones reales
+        // del usuario: 37 resultados eran solo-imagen y 326 eran solo `tool_reference`, o
+        // sea que la forma NO cubierta era 8,8x mas frecuente que la cubierta, y `(empty)`
+        // bajo una leyenda que pide reusar el resultado es el empujon mas fuerte hacia el
+        // duplicado. Ahora la rama es simetrica con la de `image` de nivel superior 20
+        // lineas mas abajo: lo que no sabemos representar se ANUNCIA.
+        const toolResultMedia = [];
+        let resultContent;
+        if (typeof block.content === 'string') {
+          resultContent = block.content;
+        } else if (Array.isArray(block.content)) {
+          const parts = [];
+          for (const b of block.content) {
+            // Mismo criterio literal que antes (`type === 'text'`, valor `b.text || ''`):
+            // un resultado de solo texto se rinde byte a byte igual que siempre.
+            if (b?.type === 'text') { parts.push(b.text || ''); continue; }
+            if (b?.type === 'image') {
+              const item = anthropicImageBlockToItem(b);
+              if (item) { toolResultMedia.push(item); continue; }
+              // source:{type:'file'} o un base64 sin datos. Caia en el `.filter(Boolean)` y
+              // desaparecia en silencio, justo lo que la rama gemela de abajo ya arregla.
+              droppedBlockTypes.add(`image(${b?.source?.type || 'unknown'})`);
+              parts.push(UNSUPPORTED_BLOCK_NOTE('image'));
+              continue;
+            }
+            droppedBlockTypes.add(b?.type || 'unknown');
+            parts.push(UNSUPPORTED_BLOCK_NOTE(b?.type || 'unknown'));
+          }
+          resultContent = parts.join('\n');
+        } else {
+          resultContent = JSON.stringify(block.content ?? '');
+        }
         const toolMessage = {
           role: 'tool',
           tool_call_id: block.tool_use_id || '',
           content: resultContent
         };
-        // Claude Code 的 Read 把图片放在 tool_result.content 里。resultContent 依旧只取
-        // text 块（保持逐字节不变），图片改走 media 旁路：role=tool 的 content 必须是
-        // 字符串，foldToolMessages 会把非字符串 JSON.stringify 掉，图片项塞进去就废了。
-        const toolResultMedia = Array.isArray(block.content)
-          ? block.content.filter(b => b?.type === 'image').map(anthropicImageBlockToItem).filter(Boolean)
-          : [];
         if (toolResultMedia.length > 0) {
+          // `.media` se pone SIEMPRE, este el resultado en el turno en curso o no: el
+          // barrido de medios de buildInternalRequest es quien decide subirlo, y no se
+          // toca. Lo unico que depende de la posicion es lo que dice el CUERPO.
           toolMessage.media = toolResultMedia;
-          // Y el cuerpo tiene que DECIRLO. Sin esto resultContent queda '' y
+          // Y el cuerpo tiene que DECIRLO. Sin nota resultContent queda '' y
           // foldToolMessages escribe `(empty)`: «el Read no devolvio nada», con la imagen
-          // viajando sin explicacion en files[]. Ver toolResultMediaNote (agent-turn.js)
-          // para la medicion y para por que la nota no promete que este adjunta.
-          const note = toolResultMediaNote(toolResultMedia.length);
-          toolMessage.content = resultContent ? `${resultContent}\n${note}` : note;
+          // viajando sin explicacion en files[]. Con la nota positiva en un resultado de
+          // turno ANTERIOR pasa lo contrario y es peor: el modelo se inventa el contenido
+          // de una imagen que no viaja. Ver toolResultMediaNote (agent-turn.js) para las
+          // dos mediciones contra Qwen real.
+          writeToolResultMediaNote(
+            toolMessage, resultContent, toolResultMedia.length, 'image', msgIndex >= turnStart
+          );
         }
         out.push(toolMessage);
       } else if (block?.type === 'text' && typeof block.text === 'string') {
