@@ -9,7 +9,11 @@ const {
   TOOL_CALL_CLOSE,
   // Vive en agent-turn.js (la hoja del grafo) porque el ledger de llamadas ejecutadas
   // reinyecta el mismo texto no confiable y las dos rutas necesitan una unica regla.
-  neutraliseResultMarkers
+  neutraliseResultMarkers,
+  // Cuerpos de los que nada es nuestro (fichero, pagina, salida de comando): misma
+  // regla mas el delimitador de razonamiento. Ver la nota en agent-turn.js sobre por
+  // que ese brazo no puede vivir en la regla general.
+  neutraliseUntrustedBody
 } = require('./agent-turn.js');
 
 // TOOL_CALL_OPEN / TOOL_CALL_CLOSE 从 agent-turn.js 引入：规范标记与重试提示必须锁步，
@@ -1706,7 +1710,7 @@ const foldToolMessages = (messages) => {
       const open = ref ? numberedResultOpen(ref.ordinal) : TOOL_RESULT_OPEN;
       return {
         role: 'user',
-        content: `${open}${sanitizeMarkerName(name)}]\n${neutraliseResultMarkers(content)}\n${TOOL_RESULT_CLOSE}`
+        content: `${open}${sanitizeMarkerName(name)}]\n${neutraliseUntrustedBody(content)}\n${TOOL_RESULT_CLOSE}`
       };
     }
 

@@ -325,6 +325,45 @@ const canonicalJson = (value) => {
   return JSON.stringify(value);
 };
 
+// `[THINKING]` / `[END THINKING]` es la tercera familia de delimitadores que el proxy
+// escribe en el prompt (controllers/anthropic.js). Vive AQUI, en la regla compartida, y
+// no en el sitio que lo emite, porque el texto no confiable entra al prompt por cuatro
+// puertas — el cuerpo del propio `thinking`, el texto hermano del mismo mensaje, el
+// cuerpo de un `tool_result` y el digest del ledger — y las cuatro tienen que fallar
+// igual. Con la neutralizacion solo en el emisor, un fichero leido que contuviera
+// `[END THINKING]` volvia crudo a la historia y cerraba un bloque que no era suyo.
+//
+// Se aceptan las variantes que un modelo escribiria de verdad (`[/THINKING]`,
+// `[END_THINKING]`, `[END\nTHINKING]`, `[THINKING: por que]`), pero se exige `]` o `:`
+// tras la palabra: sin ese ancla, prosa legitima como `[thinking about lunch]` quedaria
+// mutilada, y mutilar prosa por un delimitador que nadie estaba forjando es peor negocio.
+const THINKING_MARKER_RE = /\[(?=[ \t]{0,4}(?:END[ \t\r\n_-]{1,2}|\/[ \t]{0,4})?THINKING[ \t]*[\]:])/gi;
+
+/**
+ * Rompe el corchete de cualquier delimitador de razonamiento incrustado en el texto.
+ * Un caracter ASCII por otro: nunca alarga, asi que los topes de bytes siguen exactos.
+ * @param {string} value - texto no confiable
+ * @returns {string} texto con los delimitadores de thinking inertes
+ */
+const defuseThinkingMarkers = (value) => String(value).replace(THINKING_MARKER_RE, '(');
+
+/**
+ * Un corte por unidades UTF-16 (`slice`) puede partir un par subrogado por la mitad.
+ * `JSON.stringify` escapa la mitad huerfana sin quejarse, asi que no revienta aqui:
+ * revienta arriba, como U+FFFD o como error de parseo segun quien lo lea. Se tira la
+ * mitad suelta de cada punta. Solo acorta, asi que ningun tope se rompe.
+ * @param {string} value - texto ya recortado
+ * @returns {string} texto sin subrogados sueltos en los extremos
+ */
+const trimLoneSurrogates = (value) => {
+  let out = String(value);
+  const first = out.charCodeAt(0);
+  if (first >= 0xDC00 && first <= 0xDFFF) out = out.slice(1);
+  const last = out.charCodeAt(out.length - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) out = out.slice(0, -1);
+  return out;
+};
+
 /**
  * 结果正文必须对它自己封闭。工具结果是**不可信内容** —— 文件、网页、命令输出 —— 里面
  * 完全可能出现 `[END TOOL RESULT]`。原样写出去，块就在那里提前结束，后面的内容就变成了
@@ -362,6 +401,22 @@ const neutraliseResultMarkers = (value) => String(value)
   .replace(/#(?=[ \t]{0,4}Conversation[ \t]+history[ \t]*\(JSONL\))/gi, '(')
   .replace(/#(?=[ \t]{0,4}Current[ \t]+message\b)/gi, '(');
 
+/**
+ * Un cuerpo del que NADA es nuestro: un fichero, una pagina, la salida de un comando.
+ *
+ * Es `neutraliseResultMarkers` mas el brazo THINKING, y existe separado por una razon
+ * concreta: `neutraliseResultMarkers` tambien se aplica al contenido de un mensaje
+ * `assistant` (tool-prompt.js, la rama con tool_calls y `neutraliseMessageMarkers`), y
+ * ese contenido SI lleva delimitadores nuestros — el bloque `[THINKING]` que escribe
+ * controllers/anthropic.js. Meter el brazo en la regla general defusaba el delimitador
+ * REAL junto con los forjados y dejaba el razonamiento sin marcar.
+ *
+ * Regla: si el texto lo escribio integramente algo de fuera, pasa por aqui.
+ * @param {string} value - cuerpo no confiable
+ * @returns {string} cuerpo con todos los marcadores de protocolo inertes
+ */
+const neutraliseUntrustedBody = (value) => defuseThinkingMarkers(neutraliseResultMarkers(value));
+
 const LEDGER_HEADER = '# Already executed this task';
 // La leyenda es lo unico que hace el bloque legible por si solo: llega al modelo lejos
 // del prompt de herramientas y sin ella es una lista de numeros sin contrato.
@@ -379,7 +434,7 @@ const LEDGER_ARGS_CHARS = 200;
 const collapseToOneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
 
 const truncateChars = (value, limit) =>
-  value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+  value.length <= limit ? value : `${trimLoneSurrogates(value.slice(0, limit - 1))}…`;
 
 /**
  * El contenido de un mensaje de resultado, resumido para el digest del ledger.
@@ -582,7 +637,7 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
     const pending = entry.hasResult && entry.digestOrdinal !== entry.ordinal
       ? ` (unanswered; result from #${entry.digestOrdinal})`
       : '';
-    return neutraliseResultMarkers(
+    return neutraliseUntrustedBody(
       `#${entry.ordinal} ${collapseToOneLine(entry.name)} ${truncateChars(entry.args, LEDGER_ARGS_CHARS)}${pending}` +
       (entry.hasResult ? ` -> ${entry.digest || '(empty)'}` : '')
     );
@@ -845,6 +900,14 @@ module.exports = {
   // Neutralizacion de marcadores: fuente unica para foldToolMessages (tool-prompt.js) y
   // para el ledger de aqui. Todo texto no confiable que vuelve al prompt pasa por ella.
   neutraliseResultMarkers,
+  // El brazo THINKING de la regla de arriba, suelto: el emisor del delimitador
+  // (controllers/anthropic.js) tiene que poder defusar el texto HERMANO del mismo
+  // mensaje sin pasarlo por el resto de la neutralizacion, que es para otro canal.
+  defuseThinkingMarkers,
+  neutraliseUntrustedBody,
+  // Cortar por unidades UTF-16 parte pares subrogados. Exportado porque el tope de
+  // razonamiento de anthropic.js corta igual que el digest del ledger de aqui.
+  trimLoneSurrogates,
   buildToolHistoryLedger,
   extractHistoryToolCalls,
   createToolCallLedger,

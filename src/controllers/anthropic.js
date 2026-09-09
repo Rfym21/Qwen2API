@@ -31,9 +31,12 @@ const {
   createToolCallLedger,
   resolveTextToolCallCap,
   createTextChannelRunawayGuard,
-  // Misma regla de neutralizacion que usan el fold y el ledger: el texto de un bloque
-  // `thinking` es contenido del modelo que vuelve al prompt, y puede citar marcadores.
-  neutraliseResultMarkers
+  // Misma regla de neutralizacion que usan el fold y el ledger para un cuerpo de
+  // resultado: el texto de un bloque `thinking` es contenido que vuelve al prompt y
+  // puede citar marcadores, incluido el delimitador que lo envuelve.
+  neutraliseUntrustedBody,
+  defuseThinkingMarkers,
+  trimLoneSurrogates
 } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { mapIncomingModel } = require('../utils/model-map.js');
@@ -212,11 +215,33 @@ const THINKING_CLOSE = '[END THINKING]';
 // `redacted_thinking` trae bytes opacos cifrados: no le dicen nada a Qwen y pueden ser
 // enormes. Se marca que hubo razonamiento y se tira el payload.
 const REDACTED_THINKING_NOTE = '(redacted thinking omitted)';
-// Tope de razonamiento retenido POR MENSAJE. Un bloque de extended thinking pasa de
-// diez mil caracteres con facilidad y la historia entera tiene que caber en
-// AGENT_CONTEXT_FILE_THRESHOLD_BYTES (92160 por defecto): 1200 x 40 turnos ~ 48 KB deja
-// sitio a la conversacion real y sigue conservando el tramo de decision.
+// Tope de razonamiento retenido POR MENSAJE. Medido sobre 6.249 bloques `thinking`
+// reales de 1.544 sesiones de Claude Code: p50 = 235, p90 = 755, p99 = 3.076, max =
+// 19.502 caracteres. Con 1.200 se recorta el 4,8% de los bloques y se conserva entero
+// el resto. Es un tope de forma, no de presupuesto: el coste agregado lo acota
+// THINKING_BUDGET_* de abajo, porque 1.200 por mensaje x 120 turnos son 144 KB.
 const THINKING_CHARS_PER_MESSAGE = 1200;
+// Presupuesto de razonamiento POR PETICION. El tope por mensaje NO acota el agregado, y
+// el cuerpo entero tiene que caber en AGENT_CONTEXT_FILE_THRESHOLD_BYTES (92160 por
+// defecto) o `externalizeOversizedAgentContext` (utils/request.js) sube la historia como
+// documento y deja inline un digest recortado — y si la subida falla, trunca la
+// conversacion de verdad. Medido sobre la peor sesion del plan: reteniendo sin acotar,
+// el prefijo de 76 mensajes pasaba de 78.025 a 94.443 bytes y CRUZABA el umbral. Un
+// cambio hecho para reducir llamadas duplicadas provocaba el truncado que las produce.
+//
+// Por eso el presupuesto no es una fraccion fija del umbral sino el HUECO que de verdad
+// queda: si la conversacion ya lo llena, no se retiene nada y el comportamiento vuelve
+// exactamente al de antes de esta tarea.
+//
+// Reserva para lo que no esta en la lista aplanada y si acaba en el cuerpo: prompt de
+// herramientas, ledger, cabeceras del sobre y escapado JSON. Medido con 8 herramientas
+// declaradas sobre esa misma sesion: 6,8 KB a 10 mensajes, 16,2 KB a 76. 24 KiB cubre
+// con margen.
+const THINKING_BUDGET_RESERVE_BYTES = 24 * 1024;
+// Techo absoluto aunque sobre hueco: con p90 = 755, 12 KiB son ~16 turnos recientes con
+// razonamiento. De sobra para el «por que» de la ultima llamada, sin triplicar una
+// peticion corta por retener razonamiento antiguo que ya no explica nada.
+const THINKING_BUDGET_MAX_BYTES = 12 * 1024;
 
 /**
  * Todos los bloques de razonamiento de UNA consulta, como un fragmento delimitado.
@@ -230,16 +255,18 @@ const renderThinkingParts = (parts) => {
   // Se recorta por la CABECERA, no por la cola: la decision que produjo la llamada
   // esta al final del razonamiento. Quedarse con el principio conserva el planteo
   // y tira exactamente el porque, que es lo unico que veniamos a rescatar.
+  // `trimLoneSurrogates` porque `slice` corta por unidades UTF-16 y parte emojis por
+  // la mitad: la mitad suelta sobrevive al JSON y revienta arriba, no aqui.
   const capped = joined.length <= THINKING_CHARS_PER_MESSAGE
     ? joined
-    : `…${joined.slice(joined.length - (THINKING_CHARS_PER_MESSAGE - 1))}`;
+    : `…${trimLoneSurrogates(joined.slice(joined.length - (THINKING_CHARS_PER_MESSAGE - 1)))}`;
   // Recortar primero y neutralizar despues: asi la neutralizacion tiene la ultima
   // palabra (un corte a mitad de marcador deja un fragmento inerte, no un marcador).
-  // Ninguna sustitucion cambia la longitud, el tope se respeta igual.
-  const safe = neutraliseResultMarkers(capped)
-    // El cierre del propio delimitador tambien es forjable desde el cuerpo, y un
-    // delimitador que el contenido puede escribir no delimita nada.
-    .replace(/\[(?=[ \t]*(?:END[ \t]+)?THINKING[ \t]*\])/gi, '(');
+  // `neutraliseUntrustedBody` y no la regla general: el cuerpo del razonamiento tambien
+  // puede escribir el cierre del delimitador que lo envuelve, y un delimitador que el
+  // cuerpo puede escribir no delimita nada. Ninguna sustitucion ALARGA (un caracter por
+  // otro, o mas corta), asi que el tope de arriba se sigue respetando exacto.
+  const safe = neutraliseUntrustedBody(capped);
   return `${THINKING_OPEN}\n${safe}\n${THINKING_CLOSE}`;
 };
 
@@ -256,6 +283,80 @@ const thinkingBlockText = (block) => {
 };
 
 /**
+ * Bytes de texto que esta lista aplanada va a aportar al cuerpo, aproximados.
+ *
+ * Se cuenta solo TEXTO: las imagenes viajan como fichero subido (extractMediaToFiles),
+ * no dentro del prompt, y contar su data URI en base64 mataria la retencion de
+ * razonamiento en cuanto hubiera una captura en la conversacion. Los 24 bytes fijos por
+ * mensaje son el envoltorio JSONL (`{"role":"assistant","content":""}` mas el salto).
+ * @param {Array<Object>} messages - mensajes ya aplanados, aun sin razonamiento
+ * @returns {number} bytes estimados
+ */
+const historyBytesEstimate = (messages) => {
+  let total = 0;
+  for (const msg of messages) {
+    total += 24 + Buffer.byteLength(String(msg?.role || ''));
+    const content = msg?.content;
+    if (typeof content === 'string') {
+      total += Buffer.byteLength(content);
+    } else if (Array.isArray(content)) {
+      for (const item of content) {
+        if (item?.type === 'text' && typeof item.text === 'string') total += Buffer.byteLength(item.text);
+      }
+    }
+    if (Array.isArray(msg?.tool_calls)) total += Buffer.byteLength(JSON.stringify(msg.tool_calls));
+  }
+  return total;
+};
+
+/**
+ * Cuelga el razonamiento retenido en los mensajes que lo produjeron, de lo NUEVO a lo
+ * VIEJO y hasta agotar el hueco que queda bajo el umbral de externalizacion.
+ *
+ * Newest-first no es un detalle de implementacion: el razonamiento que explica la
+ * llamada que el modelo esta a punto de repetir es el reciente, y es el unico que esta
+ * tarea existe para rescatar. Cuando el presupuesto se agota simplemente no se cuelga —
+ * y no se cuelga NOTA de que falta, porque la ausencia de razonamiento es exactamente lo
+ * que el cliente veia antes de esta tarea: omitirlo no miente, a diferencia de un ledger
+ * recortado, donde «no esta» si significaria «nunca se llamo».
+ * @param {Array<Object>} out - mensajes aplanados, mutados en sitio
+ * @param {Array<{index: number, text: string}>} pending - razonamiento por mensaje, en orden
+ * @returns {void}
+ */
+const attachRetainedThinking = (out, pending) => {
+  if (pending.length === 0) return;
+  const config = require('../config/index.js');
+  const budget = Math.max(0, Math.min(
+    THINKING_BUDGET_MAX_BYTES,
+    config.agentContextFileThresholdBytes - THINKING_BUDGET_RESERVE_BYTES - historyBytesEstimate(out)
+  ));
+  let spent = 0;
+  let dropped = 0;
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const { index, text } = pending[i];
+    const cost = Buffer.byteLength(text) + 1;   // + el salto que lo separa del texto
+    if (spent + cost > budget) { dropped += 1; continue; }
+    spent += cost;
+    const msg = out[index];
+    const body = typeof msg.content === 'string' ? msg.content : '';
+    // El texto HERMANO del mismo mensaje puede escribir `[END THINKING]` igual que el
+    // cuerpo del razonamiento — el modelo cita ficheros en sus respuestas — y ahi
+    // cerraria el bloque que acabamos de abrir, dejando fuera de el todo lo que viniera
+    // detras. Solo el brazo THINKING: los otros marcadores de este texto ya los defusa
+    // foldToolMessages (tool-prompt.js, rama assistant y neutraliseMessageMarkers).
+    // Se defusa solo cuando de verdad hay delimitador que proteger: sin razonamiento
+    // colgado el texto sigue byte a byte igual que antes de esta tarea.
+    msg.content = [text, defuseThinkingMarkers(body)].filter(Boolean).join('\n');
+  }
+  if (dropped > 0) {
+    logger.debug(
+      `Anthropic thinking retention: ${pending.length - dropped}/${pending.length} bloques dentro del presupuesto (${spent}/${budget} B)`,
+      'ANTHROPIC'
+    );
+  }
+};
+
+/**
  * 把 Anthropic 风格的消息（含 content blocks 与 tool_use/tool_result）展开为
  * OpenAI 风格消息列表。tool_use 转为 assistant.tool_calls；tool_result 转为
  * role=tool 消息（保留 tool_call_id），后续由 foldToolMessages 折叠。
@@ -269,6 +370,8 @@ const flattenAnthropicMessages = (messages) => {
   const droppedBlockTypes = new Set();
   if (!Array.isArray(messages)) return [];
   const out = [];
+  // Razonamiento pendiente de colgar: {index en `out`, fragmento ya delimitado}.
+  const pendingThinking = [];
 
   for (const msg of messages) {
     if (!msg || typeof msg !== 'object') continue;
@@ -302,15 +405,17 @@ const flattenAnthropicMessages = (messages) => {
           });
         }
       }
-      // El razonamiento va DELANTE del texto y, tras foldToolMessages, delante de los
-      // bloques de llamada: se lee en orden cronologico penso -> dijo -> llamo.
-      // Sin bloques thinking `content` queda byte a byte como antes.
-      const out_msg = {
-        role: 'assistant',
-        content: [renderThinkingParts(thinkingParts), textParts.join('')].filter(Boolean).join('\n')
-      };
+      // El razonamiento NO se cuelga aqui: se apunta y se resuelve al final, cuando ya
+      // se sabe cuanto ocupa el resto de la conversacion y cuanto hueco queda bajo el
+      // umbral de externalizacion (attachRetainedThinking). Colgado va DELANTE del texto
+      // y, tras foldToolMessages, delante de los bloques de llamada: se lee en orden
+      // cronologico penso -> dijo -> llamo. Sin bloques thinking `content` queda byte a
+      // byte como antes.
+      const out_msg = { role: 'assistant', content: textParts.join('') };
       if (toolCalls.length > 0) out_msg.tool_calls = toolCalls;
       out.push(out_msg);
+      const renderedThinking = renderThinkingParts(thinkingParts);
+      if (renderedThinking) pendingThinking.push({ index: out.length - 1, text: renderedThinking });
       continue;
     }
 
@@ -388,6 +493,8 @@ const flattenAnthropicMessages = (messages) => {
       out.push({ role: 'user', content: '' });
     }
   }
+
+  attachRetainedThinking(out, pendingThinking);
 
   if (droppedBlockTypes.size > 0) {
     logger.warn(
