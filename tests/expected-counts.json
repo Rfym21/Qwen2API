@@ -1,0 +1,6 @@
+{
+  "tests": 986,
+  "suites": 122,
+  "note": "Authoritative count. Verify with: for f in tests/*.test.js; do node --test --test-force-exit \"$f\"; done | grep \"tests \" | awk '{s+=$3}END{print s}'",
+  "updated": "2026-09-09"
+}
