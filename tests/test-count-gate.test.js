@@ -1,7 +1,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { parseSummary, evaluate, formatVerdict } = require('../tools/test-gate.js')
+const { parseSummary, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM } = require('../tools/test-gate.js')
 
 const SPEC_TAIL = [
   '✔ some passing test (1.2ms)',
@@ -26,6 +26,15 @@ const TAP_TAIL = [
 ].join('\n')
 
 const EXPECTED = { tests: 972, suites: 122 }
+
+// Rewrite summary counters on the fixture. Keep runs PHYSICALLY POSSIBLE:
+// node reports tests = pass + fail + skipped + todo + cancelled, so a truncated
+// run loses `tests` and `pass` together — the parent simply never received
+// those results. A fixture with more passes than tests describes no real run.
+const skewed = (over) => parseSummary(
+  Object.entries(over).reduce(
+    (text, [k, v]) => text.replace(new RegExp(`ℹ ${k} \\d+`), `ℹ ${k} ${v}`),
+    SPEC_TAIL))
 
 test('parseSummary reads the spec reporter summary block', () => {
   const s = parseSummary(SPEC_TAIL)
@@ -66,7 +75,7 @@ test('a full clean run passes the gate', () => {
 // test processes; a child's process.exit() drops unflushed stdout, so a tail of
 // its reporter output is silently lost. The runner still exits 0 with fail 0.
 test('THE BUG: a short run with fail 0 and exit 0 FAILS the gate', () => {
-  const short = parseSummary(SPEC_TAIL.replace('ℹ tests 972', 'ℹ tests 944'))
+  const short = skewed({ tests: 944, pass: 944 })
   const v = evaluate({ summary: short, exitCode: 0, expected: EXPECTED })
   assert.equal(v.ok, false)
   assert.equal(v.reason, 'SHORT_RUN')
@@ -77,7 +86,7 @@ test('THE BUG: a short run with fail 0 and exit 0 FAILS the gate', () => {
 })
 
 test('a run missing only suites also fails the gate', () => {
-  const short = parseSummary(SPEC_TAIL.replace('ℹ suites 122', 'ℹ suites 121'))
+  const short = skewed({ suites: 121 })
   const v = evaluate({ summary: short, exitCode: 0, expected: EXPECTED })
   assert.equal(v.ok, false)
   assert.equal(v.reason, 'SHORT_SUITES')
@@ -85,7 +94,7 @@ test('a run missing only suites also fails the gate', () => {
 })
 
 test('real test failures beat a short count and are never retryable', () => {
-  const failing = parseSummary(SPEC_TAIL.replace('ℹ fail 0', 'ℹ fail 3').replace('ℹ tests 972', 'ℹ tests 900'))
+  const failing = skewed({ tests: 900, pass: 897, fail: 3 })
   const v = evaluate({ summary: failing, exitCode: 1, expected: EXPECTED })
   assert.equal(v.ok, false)
   assert.equal(v.reason, 'TEST_FAILURES')
@@ -108,7 +117,7 @@ test('a nonzero runner exit with a clean summary still fails', () => {
 })
 
 test('MORE tests than expected fails too, so the baseline cannot rot', () => {
-  const more = parseSummary(SPEC_TAIL.replace('ℹ tests 972', 'ℹ tests 980'))
+  const more = skewed({ tests: 980, pass: 980 })
   const v = evaluate({ summary: more, exitCode: 0, expected: EXPECTED })
   assert.equal(v.ok, false)
   assert.equal(v.reason, 'BASELINE_STALE')
@@ -124,8 +133,160 @@ test('a timed-out runner reports the watchdog, never a pass', () => {
 })
 
 test('formatVerdict never prints a pass banner for a failing verdict', () => {
-  const bad = evaluate({ summary: parseSummary(SPEC_TAIL.replace('ℹ tests 972', 'ℹ tests 1')), exitCode: 0, expected: EXPECTED })
+  const bad = evaluate({ summary: skewed({ tests: 1, pass: 1 }), exitCode: 0, expected: EXPECTED })
   const text = formatVerdict(bad)
   assert.match(text, /FAIL/)
   assert.doesNotMatch(text, /\bPASS\b/)
+})
+
+/* ---------------------------------------------------------------------------
+ * DEFECT 1 — a disabled test keeps its place in `tests` and is invisible to a
+ * pure count gate. `it.skip` on all six tests of a file left the total at the
+ * blessed number, `fail 0`, and the gate printed a PASS banner byte-identical
+ * to an honest run's. Unlike the truncation race this is deterministic: it
+ * survives every retry and gets committed.
+ *
+ * Node's own arithmetic (verified on v24.15.0): tests = pass + fail + skipped
+ * + todo + cancelled. Suites are NOT in `pass`, and a `todo` test is NOT in
+ * `pass` either, despite the reporter printing a check mark for it.
+ * ------------------------------------------------------------------------- */
+
+test('DEFECT 1: six it.skip tests keep the count and must NOT pass the gate', () => {
+  const s = skewed({ pass: 966, skipped: 6 })
+  assert.equal(s.tests, 972)
+  assert.equal(s.fail, 0)
+  const v = evaluate({ summary: s, exitCode: 0, expected: EXPECTED })
+  assert.equal(v.ok, false, 'a run with six disabled tests must not be a pass')
+  assert.equal(v.reason, 'NOT_ALL_RAN')
+  assert.notEqual(v.code, 0)
+  assert.match(v.message, /6 test/)
+  assert.match(v.message, /skipped 6/)
+})
+
+test('DEFECT 1: a skip is deterministic, so NOT_ALL_RAN is never retryable', () => {
+  const v = evaluate({ summary: skewed({ pass: 966, skipped: 6 }), exitCode: 0, expected: EXPECTED })
+  assert.equal(v.reason, 'NOT_ALL_RAN')
+  assert.equal(v.retryable, false, 'retrying a skip three times only wastes three runs')
+})
+
+test('DEFECT 1: todo tests are caught too (node does not count them as pass)', () => {
+  const v = evaluate({ summary: skewed({ pass: 970, todo: 2 }), exitCode: 0, expected: EXPECTED })
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'NOT_ALL_RAN')
+  assert.match(v.message, /todo 2/)
+})
+
+test('DEFECT 1: cancelled tests are caught too', () => {
+  const v = evaluate({ summary: skewed({ pass: 971, cancelled: 1 }), exitCode: 0, expected: EXPECTED })
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'NOT_ALL_RAN')
+  assert.match(v.message, /cancelled 1/)
+})
+
+test('DEFECT 1: a real failure still outranks NOT_ALL_RAN', () => {
+  const v = evaluate({ summary: skewed({ pass: 965, fail: 1, skipped: 6 }), exitCode: 1, expected: EXPECTED })
+  assert.equal(v.reason, 'TEST_FAILURES')
+})
+
+test('DEFECT 1: a deterministic skip outranks the retryable SHORT_RUN', () => {
+  // Short AND skipped: report the cause that will not go away, and do not burn
+  // three retries on it.
+  const v = evaluate({ summary: skewed({ tests: 950, pass: 944, skipped: 6 }), exitCode: 0, expected: EXPECTED })
+  assert.equal(v.reason, 'NOT_ALL_RAN')
+  assert.equal(v.retryable, false)
+})
+
+test('DEFECT 1: an honest full run is still a pass (no false positive)', () => {
+  const v = evaluate({ summary: parseSummary(SPEC_TAIL), exitCode: 0, expected: EXPECTED })
+  assert.equal(v.ok, true)
+  assert.equal(v.reason, 'OK')
+})
+
+/* ---------------------------------------------------------------------------
+ * DEFECT 2 — `test:bless` seeded its running maximum from the baseline ON DISK,
+ * so Math.max() could only ever go up. Deleting a test file made bless print
+ * "BLESSED: <the old, higher number>" and exit 0 without writing anything,
+ * leaving `npm test` permanently red with no documented way out.
+ *
+ * The fix is structural: the blessed value is computed from the attempt
+ * summaries ALONE. computeBlessed() takes no baseline argument, so it cannot be
+ * floored by one.
+ * ------------------------------------------------------------------------- */
+
+test('DEFECT 2: bless takes the max over ATTEMPTS, defeating truncation', () => {
+  const blessed = computeBlessed([
+    { tests: 1013, suites: 127 },
+    { tests: 998, suites: 126 },
+    { tests: 1013, suites: 127 }
+  ])
+  assert.deepEqual(blessed, { tests: 1013, suites: 127 })
+})
+
+test('DEFECT 2: bless can go DOWN — a genuine removal re-records the smaller count', () => {
+  // Three clean attempts of a suite that really did lose 15 tests and 3 suites.
+  // The old baseline (1013/127) must not floor the result.
+  const blessed = computeBlessed([
+    { tests: 998, suites: 124 },
+    { tests: 998, suites: 124 },
+    { tests: 998, suites: 124 }
+  ])
+  assert.deepEqual(blessed, { tests: 998, suites: 124 })
+})
+
+test('DEFECT 2: computeBlessed cannot be handed a baseline to be floored by', () => {
+  // Arity is the guarantee: one argument, the attempt summaries. If someone
+  // reintroduces a baseline parameter this fails and they re-read the comment.
+  assert.equal(computeBlessed.length, 1)
+})
+
+test('DEFECT 2: blessing zero attempts is refused rather than writing garbage', () => {
+  assert.throws(() => computeBlessed([]), /attempt/i)
+})
+
+/* ---------------------------------------------------------------------------
+ * DEFECT 3 (minor) — the CI job's timeout-minutes must be able to contain the
+ * gate's own worst case (TEST_GATE_TIMEOUT_MS x TEST_GATE_ATTEMPTS) plus the
+ * npm ci / lint steps. As shipped the watchdog was 10 min x 3 attempts = 30 min
+ * inside a 10-minute job, so the job died first and the watchdog could never
+ * act — the gate's "it can never hang" property did not hold in CI.
+ * ------------------------------------------------------------------------- */
+
+test('DEFECT 3: the CI job budget can contain the gate watchdog x attempts', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8')
+
+  assert.match(ci, /npm test/, 'ci.yml no longer runs npm test — this guard is stale')
+
+  const jobMinutes = Number(/^\s*timeout-minutes:\s*(\d+)\s*$/m.exec(ci)?.[1])
+  assert.ok(Number.isInteger(jobMinutes), 'ci.yml has no timeout-minutes to check against')
+
+  const gateMs = Number(/^\s*TEST_GATE_TIMEOUT_MS:\s*(\d+)\s*$/m.exec(ci)?.[1])
+  assert.ok(Number.isInteger(gateMs),
+    'ci.yml must pin TEST_GATE_TIMEOUT_MS; the 10-minute default x 3 attempts outlives any sane job budget')
+
+  const attempts = Number(/^\s*TEST_GATE_ATTEMPTS:\s*(\d+)\s*$/m.exec(ci)?.[1] ?? 3)
+  const worstCaseMs = gateMs * attempts
+  assert.ok(worstCaseMs < jobMinutes * 60000,
+    `gate worst case ${worstCaseMs}ms >= job budget ${jobMinutes * 60000}ms: ` +
+    'the job dies before the watchdog can report, so a hung runner looks like a CI infra failure')
+})
+
+/* ---------------------------------------------------------------------------
+ * DEFECT 4 — the escape hatch lied too. Every place that tells you to confirm
+ * the real count (this tool's SHORT_RUN advice, the baseline's note, AGENTS.md,
+ * CLAUDE.md) shipped a per-file sum whose grep had no `-a`. tool-prompt.test.js
+ * emits bytes that make grep declare the stream binary and print
+ * "Binary file (standard input) matches" INSTEAD of the summary line, so that
+ * file's whole contribution disappears. Measured: the sum came back 892 instead
+ * of 1025 — off by exactly the 133 tests in that one file, silently, from the
+ * command whose entire job is to be the trustworthy second opinion.
+ * ------------------------------------------------------------------------- */
+
+test('DEFECT 4: the per-file sum the gate hands you keeps grep -a', () => {
+  assert.match(PER_FILE_SUM, /grep\s+-[a-zA-Z]*a/,
+    'without -a, grep suppresses tool-prompt.test.js\'s summary line and the sum ' +
+    'silently loses 133 tests — the exact class of quiet under-count this gate exists to stop')
+  assert.match(PER_FILE_SUM, /--test-force-exit/)
+  assert.match(PER_FILE_SUM, /s\+=\$3/, 'it must still sum the third column')
 })

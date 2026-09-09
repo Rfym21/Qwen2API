@@ -17,7 +17,12 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Must exceed the gate's own worst case (TEST_GATE_TIMEOUT_MS x
+    # TEST_GATE_ATTEMPTS, pinned below to 3 x 150s = 7.5 min) plus npm ci and
+    # lint. With the old 10 here and the gate's 10-minute default watchdog, the
+    # job died at 10 min and the watchdog — the thing that makes the gate unable
+    # to hang — could never fire.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,3 +39,8 @@ jobs:
           # unset, killing the five suites that load controllers. The value
           # itself is never read by any test.
           API_KEY: ci-test-key
+          # The whole suite runs in ~5s locally. 150s per attempt is ~30x
+          # headroom for a cold shared runner, and 3 attempts still fit inside
+          # timeout-minutes above, so a hung runner is reported by the gate as
+          # TIMEOUT instead of looking like CI infrastructure flake.
+          TEST_GATE_TIMEOUT_MS: 150000

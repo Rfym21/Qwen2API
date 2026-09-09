@@ -1,6 +1,6 @@
 {
-  "tests": 1013,
+  "tests": 1026,
   "suites": 127,
-  "note": "Authoritative count. Verify with: for f in tests/*.test.js; do node --test --test-force-exit \"$f\"; done | grep \"tests \" | awk '{s+=$3}END{print s}'",
+  "note": "Authoritative count. Verify with the per-file sum in AGENTS.md (\"The test gate\"). The -a on that grep is load-bearing: tool-prompt.test.js emits bytes that make grep call the stream binary, and without -a its whole summary line — 133 tests — is silently dropped from the sum.",
   "updated": "2026-09-09"
 }

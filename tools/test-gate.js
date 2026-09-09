@@ -41,6 +41,14 @@ const BASELINE_FILE = path.join(TESTS_DIR, 'expected-counts.json')
 
 const SUMMARY_KEYS = ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo']
 
+// The independent check on this gate: it never goes through the parent runner,
+// so the truncation race cannot touch it. `-a` is load-bearing — some test files
+// emit bytes that make grep declare the stream binary and suppress the summary
+// line, silently subtracting that whole file from the sum.
+const PER_FILE_SUM =
+  'for f in tests/*.test.js; do node --test --test-force-exit "$f"; done | ' +
+  'grep -aE \'^. tests [0-9]+$\' | awk \'{s+=$3}END{print s}\''
+
 // Matches both reporters: spec ("ℹ tests 972") and tap ("# tests 972").
 const summaryLine = (key) => new RegExp(`^(?:\\u2139|#)\\s+${key}\\s+(\\d+)\\s*$`)
 
@@ -91,6 +99,24 @@ function evaluate ({ summary, exitCode, expected, timedOut = false }) {
     return verdict(false, 'RUNNER_EXIT', 2, false,
       `the test runner exited ${exitCode} despite reporting fail 0`, summary)
   }
+  // A disabled test still occupies a slot in `tests`, so a pure count gate sees
+  // nothing: `it.skip` on a whole file leaves the total at the blessed number
+  // with fail 0, and the PASS banner is byte-identical to an honest run's.
+  // Node's arithmetic (v24): tests = pass + fail + skipped + todo + cancelled,
+  // and a `todo` test is NOT counted as pass despite its check mark. So anything
+  // other than pass+fail === tests means some of the blessed tests did not run.
+  // Deterministic, therefore never retryable, and checked BEFORE the count
+  // checks so a skipped-and-truncated run reports the cause that will not go
+  // away. (`describe.skip` is different: it deregisters its children, so the
+  // total drops and SHORT_RUN catches it.)
+  const ran = summary.pass + summary.fail
+  if (ran !== summary.tests) {
+    return verdict(false, 'NOT_ALL_RAN', 9, false,
+      `${summary.tests - ran} test(s) of ${summary.tests} did not actually run ` +
+      `(skipped ${summary.skipped}, todo ${summary.todo}, cancelled ${summary.cancelled}). ` +
+      'A disabled test keeps its place in the count and is invisible to a count gate. ' +
+      'This is not a pass: re-enable them, or delete them and re-bless.', summary)
+  }
   if (summary.tests < expected.tests) {
     return verdict(false, 'SHORT_RUN', 5, true,
       `only ${summary.tests} of ${expected.tests} expected tests were reported — ` +
@@ -108,6 +134,29 @@ function evaluate ({ summary, exitCode, expected, timedOut = false }) {
   }
   return verdict(true, 'OK', 0, false,
     `${summary.tests} tests / ${summary.suites} suites / 0 fail`, summary)
+}
+
+/**
+ * The counts to record as the new baseline, given one summary per bless attempt.
+ *
+ * Takes the maximum over the ATTEMPTS and nothing else. It deliberately accepts
+ * no baseline argument: seeding the maximum from the value already on disk made
+ * `test:bless` a one-way ratchet — deleting a test file printed
+ * "BLESSED: <the old, higher number>", exited 0, wrote nothing, and left
+ * `npm test` permanently red with no documented escape. Max-over-attempts is all
+ * that is needed to defeat the truncation race; anything more only defeats you.
+ *
+ * @param {{tests:number,suites:number}[]} attempts
+ * @returns {{tests:number,suites:number}}
+ */
+function computeBlessed (attempts) {
+  if (!Array.isArray(attempts) || attempts.length === 0) {
+    throw new Error('computeBlessed: refusing to bless with no clean attempt to bless from')
+  }
+  return {
+    tests: Math.max(...attempts.map((a) => a.tests)),
+    suites: Math.max(...attempts.map((a) => a.suites))
+  }
 }
 
 const BAR = '='.repeat(72)
@@ -181,42 +230,54 @@ async function main () {
   }
 
   const files = listTestFiles()
-  let expected = readBaseline()
+  const expected = readBaseline()
 
   if (!expected && !bless) {
     console.error(`${BAR}\nTEST GATE: FAIL [NO_BASELINE]\n` +
       `${BASELINE_FILE} is missing or malformed. Create it with: npm run test:bless\n${BAR}`)
     process.exit(7)
   }
-  if (bless && !expected) expected = { tests: -1, suites: -1 }
+
+  // Bless mode never reads the old baseline — see computeBlessed. A -1 baseline
+  // makes `evaluate` report only genuine health problems; BASELINE_STALE is what
+  // a healthy bless run looks like, since every real count exceeds -1.
+  const NO_BASELINE = { tests: -1, suites: -1 }
+  const blessAttempts = []
 
   let last = null
   for (let attempt = 1; attempt <= attemptsAllowed; attempt++) {
     const { output, exitCode, timedOut } = await runOnce(files, watchdogMs)
     const summary = parseSummary(output)
-    last = evaluate({ summary, exitCode, expected, timedOut })
 
     if (bless) {
-      if (!summary || summary.fail > 0 || exitCode !== 0) {
-        console.error(`${BAR}\nREFUSING TO BLESS: the run was not clean.\n${BAR}`)
+      const health = evaluate({ summary, exitCode, expected: NO_BASELINE, timedOut })
+      if (!health.ok && health.reason !== 'BASELINE_STALE') {
+        console.error(`${BAR}\nREFUSING TO BLESS [${health.reason}]: the run was not clean.\n` +
+          `${health.message}\n${BAR}`)
         process.exit(1)
       }
-      // Bless the highest counts seen, never a truncated one.
+      blessAttempts.push({ tests: summary.tests, suites: summary.suites })
       if (attempt < attemptsAllowed) {
-        expected = { tests: Math.max(expected.tests, summary.tests), suites: Math.max(expected.suites, summary.suites) }
         console.error(`[bless] attempt ${attempt}/${attemptsAllowed}: ${summary.tests} tests / ${summary.suites} suites (running again to defeat truncation)`)
         continue
       }
-      expected = { tests: Math.max(expected.tests, summary.tests), suites: Math.max(expected.suites, summary.suites) }
+      const blessed = computeBlessed(blessAttempts)
+      const before = expected ? `${expected.tests}/${expected.suites}` : 'none'
       fs.writeFileSync(BASELINE_FILE, `${JSON.stringify({
-        tests: expected.tests,
-        suites: expected.suites,
-        note: 'Authoritative count. Verify with: for f in tests/*.test.js; do node --test --test-force-exit "$f"; done | grep "tests " | awk \'{s+=$3}END{print s}\'',
+        tests: blessed.tests,
+        suites: blessed.suites,
+        note: 'Authoritative count. Verify with the per-file sum in AGENTS.md ' +
+          '("The test gate"). The -a on that grep is load-bearing: tool-prompt.test.js ' +
+          'emits bytes that make grep call the stream binary, and without -a its whole ' +
+          'summary line — 133 tests — is silently dropped from the sum.',
         updated: new Date().toISOString().slice(0, 10)
       }, null, 2)}\n`)
-      console.error(`${BAR}\nBLESSED: ${expected.tests} tests / ${expected.suites} suites -> ${path.relative(ROOT, BASELINE_FILE)}\n${BAR}`)
+      console.error(`${BAR}\nBLESSED: ${blessed.tests} tests / ${blessed.suites} suites ` +
+        `(was ${before}) -> ${path.relative(ROOT, BASELINE_FILE)}\n${BAR}`)
       process.exit(0)
     }
+
+    last = evaluate({ summary, exitCode, expected, timedOut })
 
     if (last.ok) {
       if (attempt > 1) {
@@ -240,12 +301,14 @@ async function main () {
     console.error(`Short on all ${attemptsAllowed} attempts. A truncation flake does not survive that many\n` +
       'retries, so treat this as real: a test file threw at load, was deleted, or stopped registering tests.\n' +
       'Confirm with the per-file sum, which does not go through the parent runner:\n' +
-      '  for f in tests/*.test.js; do node --test --test-force-exit "$f"; done | grep -E "^. tests [0-9]" | awk \'{s+=$3}END{print s}\'')
+      `  ${PER_FILE_SUM}\n` +
+      'Keep the -a: without it grep calls tool-prompt.test.js\'s output binary and drops its\n' +
+      'summary line, quietly subtracting 133 tests from the number you are trusting.')
   }
   process.exit(last.code)
 }
 
-module.exports = { parseSummary, evaluate, formatVerdict }
+module.exports = { parseSummary, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM }
 
 if (require.main === module) {
   main().catch((err) => {
