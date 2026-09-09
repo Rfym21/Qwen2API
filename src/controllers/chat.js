@@ -19,6 +19,7 @@ const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require
 const {
     assertNoUpstreamFailure,
     describeUpstreamFailure,
+    noteRateLimitedAccount,
     RATE_LIMIT_OPENAI_TYPE
 } = require('../utils/upstream-error.js')
 const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
@@ -38,14 +39,14 @@ const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompl
     return upstreamCompleted ? 'stop' : null
 }
 
-const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete', type = 'upstream_stream_error') => {
-    res.write(`data: ${JSON.stringify({
-        error: {
-            message,
-            type,
-            code
-        }
-    })}\n\n`)
+const writeOpenAIStreamError = (res, message, code = 'upstream_incomplete', type = 'upstream_stream_error', retryAfterSeconds = null) => {
+    const error = { message, type, code }
+    // Gemelo de anthropic.js#writeAnthropicError: con las cabeceras ya enviadas no hay
+    // Retry-After que poner, asi que la espera real viaja dentro del frame o se pierde.
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+        error.retry_after = retryAfterSeconds
+    }
+    res.write(`data: ${JSON.stringify({ error })}\n\n`)
     res.write('data: [DONE]\n\n')
     if (typeof res.flush === 'function') res.flush()
     res.end()
@@ -187,7 +188,11 @@ const writeOpenAIHttpError = (res, error = {}) => {
         // conserva su etiqueta de siempre (`upstream_stream_error`, pinchada en
         // tests/agent-protocol.test.js:210 por su `code`).
         if (!res.writableEnded) {
-            writeOpenAIStreamError(res, message, code, error.type || 'upstream_stream_error')
+            // La espera baja al frame por la misma razon que el `type`: la cabecera
+            // Retry-After ya no existe en esta fase.
+            writeOpenAIStreamError(
+                res, message, code, error.type || 'upstream_stream_error', Number(error.retry_after) || null
+            )
         }
         return
     }
@@ -443,6 +448,7 @@ const handleOpenAIAgentStream = async (
         )
     } catch (error) {
         logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
+        noteRateLimitedAccount(error, options.currentAccount)
         writeOpenAIHttpError(res, upstreamErrorShape(
             error, '上游 Agent 回合处理失败', 'upstream_stream_error'
         ))
@@ -559,6 +565,7 @@ const handleOpenAIAgentNonStream = async (
         )
     } catch (error) {
         logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
+        noteRateLimitedAccount(error, options.currentAccount)
         writeOpenAIHttpError(res, upstreamErrorShape(error, '上游 Agent 回合处理失败'))
         return
     }
@@ -1080,6 +1087,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         // Cuota agotada -> 429 `insufficient_quota`; cualquier otro fallo conserva su
         // etiqueta de siempre. Deteccion unica en utils/upstream-error.js.
         const failure = describeUpstreamFailure(error, 502)
+        noteRateLimitedAccount(error, options.currentAccount)
         if (res.headersSent) {
             if (!res.writableEnded) {
                 writeOpenAIStreamError(
@@ -1088,7 +1096,8 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     failure.rateLimited
                         ? RATE_LIMIT_OPENAI_TYPE
                         : (error.publicMessage ? error.code : 'upstream_stream_error'),
-                    failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error'
+                    failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error',
+                    failure.retryAfter
                 )
             }
         } else {
@@ -1441,8 +1450,9 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         res.json(bodyTemplate)
     } catch (error) {
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
+        const failure = describeUpstreamFailure(error, 502)
+        noteRateLimitedAccount(error, options.currentAccount)
         if (!res.headersSent) {
-            const failure = describeUpstreamFailure(error, 502)
             if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
             res.status(failure.status).json({
                 error: {

@@ -58,6 +58,31 @@ const rateLimitRetryAfterSeconds = (error) => {
 };
 
 /**
+ * MATRIZ DE ALCANZABILIDAD — que recibe el cliente de verdad, por camino y por fase.
+ *
+ * El 429 solo es alcanzable mientras las cabeceras siguen libres. En streaming los dos
+ * controladores comprometen el 200 ANTES de leer un byte del upstream, asi que un
+ * paquete de cuota —que llega como PRIMER frame— nunca puede cambiar el status:
+ *
+ *   camino                          fase             status  senal para el cliente
+ *   /v1/messages        stream:false  libre           429     body.error.type
+ *   /v1/messages        stream:true   comprometida    200     evento error.type (+retry_after)
+ *   /v1/chat/... llano  stream:false  libre           429     body.error.type
+ *   /v1/chat/... llano  stream:true   libre 1er byte  429     body.error.type
+ *   /v1/chat/... agente stream:true   comprometida    200     frame error.type (+retry_after)
+ *
+ * La fila que importa es la segunda: Claude Code habla /v1/messages con stream:true, y
+ * las 149 negativas de cuota de los logs del usuario salen todas de ahi. Decir que este
+ * cambio "mapea la cuota a 429 en los dos caminos" es falso justo para el modo que el
+ * usuario ejecuta; lo que hace es que la negativa sea RECONOCIBLE en los dos caminos y
+ * en las dos fases. anthropic.js:1203/1211 y chat.js:407 son las lineas que comprometen
+ * la respuesta, y adelantarlas es deliberado: sin cabeceras enviadas no se pueden mandar
+ * `ping` dentro del protocolo (anthropic.js:1156-1160), que es como se elimino el falso
+ * "stream muerto" del puente. Por eso la espera viaja DENTRO del evento/frame: es el
+ * unico canal que queda cuando la cabecera Retry-After ya no se puede poner.
+ */
+
+/**
  * Forma de entrega de un fallo de upstream. Los controladores consultan esto en vez de
  * repetir la deteccion; el `type` de cable lo pone cada uno con su constante de arriba.
  * @param {unknown} error - Error capturado
@@ -69,6 +94,34 @@ const describeUpstreamFailure = (error, fallbackStatus = 502) => {
     return { rateLimited: false, status: fallbackStatus, retryAfter: null };
   }
   return { rateLimited: true, status: 429, retryAfter: rateLimitRetryAfterSeconds(error) };
+};
+
+/**
+ * Denuncia la cuenta que se quedo sin cuota, para que la rotacion deje de elegirla.
+ *
+ * Existe aqui, junto al clasificador, porque los dos controladores son gemelos y esto
+ * tiene que pasar igual en ambos. El status correcto solo arregla la mitad del problema
+ * que motivo el cambio: si el servidor sigue devolviendo la misma cuenta muerta al
+ * sorteo, cada vuelta la vuelve a quemar. account-rotator#recordError (por donde van los
+ * HTTP 4xx/5xx) no enfria a proposito, y ese es justo el hueco.
+ *
+ * El require es perezoso: account.js arranca temporizadores al cargarse y no debe
+ * entrar en la cadena de carga de este modulo, que es puro.
+ * @param {unknown} error - Error capturado en el controlador
+ * @param {{email?: string}|null} [account] - Cuenta que sirvio la peticion
+ * @returns {boolean} true si se marco la cuenta
+ */
+const noteRateLimitedAccount = (error, account) => {
+  if (!isRateLimitError(error)) return false;
+  const email = account?.email;
+  if (!email) return false;
+  try {
+    require('./account.js').recordAccountQuotaExhausted(email, rateLimitRetryAfterSeconds(error));
+    return true;
+  } catch (_) {
+    // Marcar la cuenta es contabilidad interna: no puede tumbar la respuesta al cliente.
+    return false;
+  }
 };
 
 /**
@@ -123,6 +176,7 @@ module.exports = {
   isRateLimitError,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
+  noteRateLimitedAccount,
   RATE_LIMIT_CODE,
   RATE_LIMIT_ANTHROPIC_TYPE,
   RATE_LIMIT_OPENAI_TYPE

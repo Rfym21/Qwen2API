@@ -56,6 +56,7 @@ const { logger } = require('../utils/logger');
 const {
   assertNoUpstreamFailure,
   describeUpstreamFailure,
+  noteRateLimitedAccount,
   RATE_LIMIT_ANTHROPIC_TYPE
 } = require('../utils/upstream-error.js');
 const {
@@ -116,11 +117,15 @@ const toAnthropicToolUseId = (id) => {
   return newAnthropicToolUseId();
 };
 
-const writeAnthropicError = (res, message, errorType = 'api_error') => {
-  writeAnthropicEvent(res, 'error', {
-    type: 'error',
-    error: { type: errorType, message }
-  });
+const writeAnthropicError = (res, message, errorType = 'api_error', retryAfterSeconds = null) => {
+  const error = { type: errorType, message };
+  // A media transmision la cabecera Retry-After ya no se puede poner: el evento es el
+  // unico canal que le queda al cliente, asi que la espera tiene que viajar dentro.
+  // Solo si el upstream la dio de verdad (utils/upstream-error#rateLimitRetryAfterSeconds).
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    error.retry_after = retryAfterSeconds;
+  }
+  writeAnthropicEvent(res, 'error', { type: 'error', error });
   res.end();
 };
 
@@ -2601,6 +2606,9 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
  * @param {object} res - Express 响应
  */
 const handleAnthropicMessages = async (req, res) => {
+  // Fuera del try a proposito: el catch necesita saber QUE cuenta sirvio la peticion para
+  // poder sacarla de la rotacion cuando el fallo es "sin cuota". Dentro del bloque no la ve.
+  let currentAccount = null;
   try {
     const compatibility = analyzeAnthropicCompatibility(req.body || {});
     const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
@@ -2616,6 +2624,7 @@ const handleAnthropicMessages = async (req, res) => {
     const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
 
     const upstreamResp = await sendChatRequest(body);
+    currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
       return res.status(500).json({
         type: 'error',
@@ -2641,7 +2650,7 @@ const handleAnthropicMessages = async (req, res) => {
       allowedToolNames,
       toolSchemas,
       requestBody: body,
-      currentAccount: upstreamResp.currentAccount
+      currentAccount
     };
 
     if (req.body?.stream) {
@@ -2656,6 +2665,9 @@ const handleAnthropicMessages = async (req, res) => {
     // (utils/upstream-error.js#describeUpstreamFailure); aqui solo se traduce al cable.
     const failure = describeUpstreamFailure(error, 500);
     const errorType = failure.rateLimited ? RATE_LIMIT_ANTHROPIC_TYPE : 'api_error';
+    // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
+    // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
+    noteRateLimitedAccount(error, currentAccount);
     if (!res.headersSent) {
       // Retry-After solo con una espera que mando el upstream de verdad.
       if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
@@ -2667,7 +2679,9 @@ const handleAnthropicMessages = async (req, res) => {
       // A media transmision el status ya no se puede cambiar: el `type` del evento es el
       // unico canal que le queda al cliente para distinguir cuota de averia.
       if (!res.writableEnded) {
-        try { writeAnthropicError(res, error.publicMessage || '上游响应处理失败', errorType); } catch (_) { /* ignore */ }
+        try {
+          writeAnthropicError(res, error.publicMessage || '上游响应处理失败', errorType, failure.retryAfter);
+        } catch (_) { /* ignore */ }
       }
     }
   }

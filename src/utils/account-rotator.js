@@ -13,8 +13,14 @@ class AccountRotator {
     this.lastErrorAt = new Map() // 最近一次错误的时间戳（用于 UI warn 指示，含 HTTP 4xx/5xx）
     this.lastErrorCode = new Map() // 最近一次错误码（HTTP status 或 transport err.code）
     this.cooldownStartedAt = new Map() // 进入 cooldown 的起始时间戳（failureCounts 达阈值时刻）
+    this.quotaCooldownUntil = new Map() // 日额度耗尽的账户 -> 解禁时间戳（见 recordQuotaExhausted）
     this.maxFailures = 3 // 最大失败次数
     this.cooldownPeriod = 5 * 60 * 1000 // 5分钟冷却期
+    // 额度耗尽的默认静默期。上游给了 `data.num`（小时）时用那个，这是没给时的回退。
+    // 1 小时是刻意保守：额度按天重置，所以更久也“正确”，但分类若误判（文本回退可能
+    // 命中别的东西），一天的流放会白白扔掉一个好账户；1 小时足以掐断热循环，
+    // 又能自己愈合。
+    this.quotaCooldownPeriod = 60 * 60 * 1000
   }
 
   /**
@@ -135,8 +141,41 @@ class AccountRotator {
   }
 
   /**
+   * 记录“日额度已耗尽”（RateLimited），把账户暂时移出轮询。
+   *
+   * 这是 recordError / recordFailure 之外的第三类，因为两者都不对：
+   * - recordError（HTTP 4xx/5xx 走的那条）刻意不冷却——上游主动拒绝、账户本身有效。
+   *   额度耗尽的账户**不是**有效的：在 Qwen 那边重置之前，它对每个请求都会再拒一次。
+   * - recordFailure 是传输层故障的计数器，要攒够 maxFailures 才冷却；额度耗尽不需要
+   *   证据积累，一次就是确定的。
+   *
+   * 不做这件事时的代价正是这次改动的理由：客户端看到 429 不再重试了，可服务端还在
+   * 把同一个死账户发回轮询，每一轮再烧一次。
+   * @param {string} email - 邮箱地址
+   * @param {number|null} [retryAfterSeconds] - 上游给的真实等待（秒），没有则用默认静默期
+   */
+  recordQuotaExhausted(email, retryAfterSeconds = null) {
+    if (!email) return
+    const seconds = Number(retryAfterSeconds)
+    const waitMs = Number.isFinite(seconds) && seconds > 0
+      ? seconds * 1000
+      : this.quotaCooldownPeriod
+    this.quotaCooldownUntil.set(email, Date.now() + waitMs)
+    this.lastErrorAt.set(email, Date.now())
+    this.lastErrorCode.set(email, 'RateLimited')
+    logger.warn(
+      `账户 ${email} 日额度已耗尽，暂停轮询 ${Math.round(waitMs / 60000)} 分钟`,
+      'ACCOUNT'
+    )
+  }
+
+  /**
    * 重置账户失败计数（清除 cooldown）
    * 注意：不清理 lastErrorAt/lastErrorCode——它们由 endpoint 的 15 分钟窗口管理
+   *
+   * 也**不**清理 quotaCooldownUntil：account.js:516 在每次令牌刷新成功后对所有账户
+   * 调用本方法，而刷新是定时器驱动的。若在这里解禁，额度流放只能活到下一个 tick，
+   * 烧账户的循环会自己回来。额度只由时间解除（_isAccountAvailable）。
    * @param {string} email - 邮箱地址
    */
   resetFailures(email) {
@@ -163,7 +202,8 @@ class AccountRotator {
         available: this._isAccountAvailable(account),
         lastErrorAt: this.lastErrorAt.get(email) || null,
         lastErrorCode: this.lastErrorCode.get(email) || null,
-        cooldownEndsAt: cooldownStart ? cooldownStart + this.cooldownPeriod : null
+        cooldownEndsAt: cooldownStart ? cooldownStart + this.cooldownPeriod : null,
+        quotaCooldownEndsAt: this.quotaCooldownUntil.get(email) || null
       }
     })
 
@@ -193,6 +233,15 @@ class AccountRotator {
   _isAccountAvailable(account) {
     if (!account.token) {
       return false
+    }
+
+    // 额度流放优先于一切：这个账户对上游来说今天已经没有配额，再选它就是白烧一轮。
+    const quotaUntil = this.quotaCooldownUntil.get(account.email)
+    if (quotaUntil) {
+      if (Date.now() < quotaUntil) {
+        return false
+      }
+      this.quotaCooldownUntil.delete(account.email)
     }
 
     // 基于 cooldownStartedAt（显式标记）而非 lastUsedTimes——
@@ -277,7 +326,8 @@ class AccountRotator {
       this.lastUsedTimes,
       this.lastErrorAt,
       this.lastErrorCode,
-      this.cooldownStartedAt
+      this.cooldownStartedAt,
+      this.quotaCooldownUntil
     ]
     for (const map of maps) {
       for (const email of map.keys()) {
@@ -298,6 +348,7 @@ class AccountRotator {
     this.lastErrorAt.clear()
     this.lastErrorCode.clear()
     this.cooldownStartedAt.clear()
+    this.quotaCooldownUntil.clear()
   }
 }
 

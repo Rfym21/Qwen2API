@@ -35,8 +35,10 @@ const modelsMap = require('../src/models/models-map.js');
 modelsMap.getLatestModels = async () => { throw new Error('offline test: no model fetch'); };
 const requestModule = require('../src/utils/request.js');
 let upstreamFactory = null;
+/** La cuenta que el upstream dice haber usado. Sin esto no hay a quien culpar del gasto. */
+let upstreamAccount = null;
 requestModule.sendChatRequest = async () => (upstreamFactory
-  ? { status: true, response: upstreamFactory(), currentAccount: null }
+  ? { status: true, response: upstreamFactory(), currentAccount: upstreamAccount }
   : { status: false });
 
 const {
@@ -47,6 +49,8 @@ const {
 } = require('../src/utils/upstream-error.js');
 const { handleAnthropicMessages } = require('../src/controllers/anthropic.js');
 const { handleStreamResponse, handleNonStreamResponse } = require('../src/controllers/chat.js');
+const accountManager = require('../src/utils/account.js');
+const AccountRotator = require('../src/utils/account-rotator.js');
 
 test.after(() => {
   require('../src/utils/account.js').destroy();
@@ -321,10 +325,13 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
     assert.equal(res.writableEnded, true);
   });
 
-  // El camino que USA Claude Code en esta API es el agentico (has_tools), no el llano:
-  // handleStreamResponse/handleNonStreamResponse desvian a handleOpenAIAgent* en cuanto
-  // `has_tools` esta puesto. runOpenAIAgentTurn no tiene un solo catch, asi que el throw
-  // de assertNoUpstreamFailure sube limpio hasta el catch del controlador.
+  // OJO CON LA ATRIBUCION: Claude Code NO usa esta API. Habla /v1/messages (Anthropic);
+  // las 149 negativas de cuota observadas en los logs del usuario salen todas de ahi.
+  // Lo agentico de aqui es el camino de CUALQUIER cliente con tools sobre /v1/chat/
+  // completions: handleStreamResponse/handleNonStreamResponse desvian a
+  // handleOpenAIAgent* en cuanto `has_tools` esta puesto. runOpenAIAgentTurn no tiene
+  // un solo catch, asi que el throw de assertNoUpstreamFailure sube limpio hasta el
+  // catch del controlador.
   const AGENT_OPTS = {
     has_tools: true,
     tool_choice: 'auto',
@@ -338,7 +345,7 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
       res, streamOf([quotaFrame({ num: 4 })]), false, false, 'qwen3-max',
       { messages: [{ role: 'user', content: 'hola' }] }, AGENT_OPTS
     );
-    assert.equal(res.statusCode, 429, 'el camino agentico es el que usa Claude Code');
+    assert.equal(res.statusCode, 429, 'sin cabeceras enviadas, el status SI se puede fijar');
     assert.equal(res.body?.error?.type, 'insufficient_quota');
     assert.match(String(res.body?.error?.message), /upper limit for today/i);
     assert.equal(String(res.headers['Retry-After']), '14400', '4 h == 14400 s');
@@ -347,10 +354,11 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
   it('agentico streaming: el 429 es INALCANZABLE, y por eso el frame carga la senal', async () => {
     // handleOpenAIAgentStream escribe el delta de apertura ({role:'assistant'}, chat.js:407)
     // ANTES de consumir el upstream, asi que cuando llega el paquete de cuota la respuesta
-    // ya esta comprometida con 200 y el status HTTP no se puede cambiar. En este camino
-    // —el que usa un cliente agentico con tools y stream— el `type` del frame es el UNICO
-    // canal que queda. De ahi que arreglar el frame sea la mitad que de verdad sostiene
-    // este camino, no un extra.
+    // ya esta comprometida con 200 y el status HTTP no se puede cambiar. Para un cliente
+    // agentico con tools y stream el `type` del frame es el UNICO canal que queda. De ahi
+    // que arreglar el frame sea la mitad que de verdad sostiene este camino, no un extra.
+    // El gemelo de /v1/messages tiene la misma inalcanzabilidad, y por la misma razon:
+    // ver 'MATRIZ DE ALCANZABILIDAD' mas abajo.
     const res = streamRes();
     await handleStreamResponse(
       res, streamOf([quotaFrame()]), false, false,
@@ -393,5 +401,373 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
     assert.equal(res.statusCode, 502);
     assert.equal(res.body?.error?.type, 'upstream_error');
     assert.equal(res.headers['Retry-After'], undefined);
+  });
+});
+
+// ===================================================================================
+// MATRIZ DE ALCANZABILIDAD — lo que el cliente recibe DE VERDAD, por camino y por fase.
+//
+// El commit original se titulaba "map ... to 429 on both API paths". Es falso para el
+// unico modo que el usuario ejecuta. Claude Code habla /v1/messages con `stream: true`,
+// y las 149 negativas de cuota de sus logs son TODAS "mid-stream". En ese modo el 429
+// no existe: handleAnthropicStream fija las cabeceras (anthropic.js:1203) y escribe
+// message_start (:1211) ANTES de leer un solo byte del upstream, asi que cuando el
+// paquete de cuota llega `res.headersSent` ya es true y el catch del controlador
+// (:2659) solo puede tomar la rama del evento.
+//
+//   camino                         fase                     status   senal
+//   /v1/messages       stream:false  cabeceras aun libres    429      body.error.type
+//   /v1/messages       stream:true   SIEMPRE comprometida    200      evento error.type
+//   /v1/chat/... llano stream:false  cabeceras aun libres    429      body.error.type
+//   /v1/chat/... llano stream:true   libre hasta el 1er byte 429      body.error.type
+//   /v1/chat/... agente stream:true  SIEMPRE comprometida    200      frame error.type
+//
+// Estos casos clavan la fila que la frase original negaba. Que el 429 sea inalcanzable
+// no es un defecto a tapar: adelantar las cabeceras es lo que permite mandar `ping`
+// dentro del protocolo (anthropic.js:1156-1160), que es como se elimino el falso
+// "stream muerto" del puente ccproxy. Lo que SI era un defecto es que, sin cabecera,
+// la espera se perdia — eso se arregla abajo.
+describe('/v1/messages en streaming: el 429 es inalcanzable y el evento es todo el canal', () => {
+  it('con tools y la cuota como PRIMER frame: 200 comprometido, evento rate_limit_error', async () => {
+    upstreamFactory = () => streamOf([quotaFrame()]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: {
+        model: 'qwen3-max',
+        max_tokens: 64,
+        stream: true,
+        messages: [{ role: 'user', content: 'hola' }],
+        tools: [{ name: 'get_time', description: 't', input_schema: { type: 'object', properties: {} } }]
+      }
+    }, res);
+
+    assert.equal(res.headersSent, true, 'message_start ya comprometio la respuesta');
+    assert.equal(res.statusCode, 200, 'el 429 NO es alcanzable en el modo que usa Claude Code');
+
+    const events = sseEvents(res.output);
+    assert.equal(events[0]?.event, 'message_start', 'las cabeceras salen antes que el upstream');
+    const err = events.filter(e => e.event === 'error');
+    assert.equal(err.length, 1);
+    assert.equal(err[0].data?.error?.type, 'rate_limit_error', 'el type es el unico canal que queda');
+    assert.equal(res.headers['Retry-After'], undefined, 'ya no hay cabecera que poner');
+  });
+
+  it('la espera del upstream viaja DENTRO del evento, que es donde el cliente puede verla', async () => {
+    // Si el evento es el unico canal, tiene que cargar todo lo que la cabecera ya no
+    // puede llevar. `data.num` viene en HORAS (misma lectura que chat.image.video.js:88).
+    upstreamFactory = () => streamOf([quotaFrame({ num: 3 })]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+
+    const err = sseEvents(res.output).filter(e => e.event === 'error');
+    assert.equal(err.length, 1);
+    assert.equal(err[0].data?.error?.retry_after, 10800, '3 h == 10800 s, dentro del evento');
+  });
+
+  it('sin espera real el evento no se inventa ninguna', async () => {
+    upstreamFactory = () => streamOf([quotaFrame()]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+
+    const err = sseEvents(res.output).filter(e => e.event === 'error');
+    assert.equal(err.length, 1);
+    assert.equal('retry_after' in (err[0].data?.error || {}), false, 'sin dato real, sin campo');
+  });
+
+  it('un fallo que NO es de cuota jamas lleva retry_after en el evento', async () => {
+    upstreamFactory = () => streamOf([
+      answerFrame('Voy a mirar'),
+      frame({ success: false, data: { code: 'Bad_Request', details: 'algo se rompio', num: 9 } })
+    ]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+
+    const err = sseEvents(res.output).filter(e => e.event === 'error');
+    assert.equal(err.length, 1);
+    assert.equal(err[0].data?.error?.type, 'api_error');
+    assert.equal('retry_after' in (err[0].data?.error || {}), false, 'una averia no se espera, se reintenta');
+  });
+});
+
+// ===================================================================================
+describe('/v1/chat/completions en streaming: el frame carga la misma espera (gemelo)', () => {
+  it('llano: el frame de error lleva retry_after cuando el upstream dio la espera', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([answerFrame('Voy a mirar'), quotaFrame({ num: 2 })]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] }, {}
+    );
+    const errs = sseFrames(res.output).filter(f => f && f.error);
+    assert.equal(errs.length, 1);
+    assert.equal(errs[0].error.retry_after, 7200, '2 h == 7200 s, dentro del frame');
+  });
+
+  it('agentico: el frame de error lleva retry_after — aqui el 429 no existe', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([quotaFrame({ num: 5 })]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] },
+      { has_tools: true, tool_choice: 'auto', allowed_tool_names: ['get_time'], agent_turn_max_attempts: 2 }
+    );
+    assert.equal(res.statusCode, 200, 'el delta de apertura ya comprometio la respuesta');
+    const errs = sseFrames(res.output).filter(f => f && f.error);
+    assert.equal(errs.length, 1);
+    assert.equal(errs[0].error.retry_after, 18000, '5 h == 18000 s');
+  });
+
+  it('un fallo que NO es de cuota no lleva retry_after en el frame', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([answerFrame('Voy a mirar'), frame({ success: false, data: { code: 'Bad_Request', details: 'roto', num: 9 } })]),
+      false, false, { messages: [{ role: 'user', content: 'hola' }] }, {}
+    );
+    const errs = sseFrames(res.output).filter(f => f && f.error);
+    assert.equal(errs.length, 1);
+    assert.equal(errs[0].error.type, 'upstream_stream_error');
+    assert.equal('retry_after' in errs[0].error, false);
+  });
+});
+
+// ===================================================================================
+// EL BUCLE QUE QUEMA EL POOL. El commit original se justificaba diciendo que sin 429
+// "el cliente reintenta contra un muro y quema otra cuenta del pool en cada vuelta",
+// y despues no tocaba nada del lado del servidor: los HTTP 4xx/5xx van a recordError
+// (account-rotator.js:125-128), que por diseno NO enfria. La cuota agotada no es un
+// fallo de transporte ni un rechazo puntual: esa cuenta esta muerta hasta que Qwen
+// reinicie el dia, y volver a elegirla es gastar una vuelta entera para nada.
+describe('el pool: una cuenta sin cuota sale del sorteo', () => {
+  const accounts = [
+    { email: 'a@x.io', token: 'ta' },
+    { email: 'b@x.io', token: 'tb' }
+  ];
+
+  it('recordQuotaExhausted saca la cuenta del sorteo; recordError no lo hacia', () => {
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+
+    rot.recordError('a@x.io', 429);
+    assert.equal(rot.getStats().available, 2, 'recordError no enfria — politica deliberada, sin cambios');
+
+    rot.recordQuotaExhausted('a@x.io', null);
+    assert.equal(rot.getStats().available, 1, 'la cuenta sin cuota ya no cuenta como disponible');
+    for (let i = 0; i < 6; i++) {
+      assert.equal(rot.getNextAccount().email, 'b@x.io', 'el sorteo no vuelve a la cuenta muerta');
+    }
+  });
+
+  it('la espera real del upstream fija el final del enfriamiento', () => {
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+    const before = Date.now();
+    rot.recordQuotaExhausted('a@x.io', 3600);
+    const ends = rot.getStats().usageStats['a@x.io'].quotaCooldownEndsAt;
+    assert.ok(ends >= before + 3600 * 1000, 'una hora de espera == una hora fuera');
+    assert.ok(ends <= Date.now() + 3600 * 1000 + 5000);
+  });
+
+  it('sin espera del upstream se usa el enfriamiento por defecto, no cero', () => {
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+    rot.recordQuotaExhausted('a@x.io', null);
+    const ends = rot.getStats().usageStats['a@x.io'].quotaCooldownEndsAt;
+    assert.ok(ends > Date.now() + 60 * 1000, 'un defecto de segundos volveria al bucle enseguida');
+  });
+
+  it('el enfriamiento caduca solo: pasada la espera la cuenta vuelve', () => {
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+    rot.quotaCooldownPeriod = 5;
+    rot.recordQuotaExhausted('a@x.io', null);
+    assert.equal(rot.getStats().available, 1);
+    return new Promise(resolve => setTimeout(() => {
+      assert.equal(rot.getStats().available, 2, 'la cuota vuelve; el destierro no es permanente');
+      resolve();
+    }, 25));
+  });
+
+  it('el refresco periodico de token NO revive una cuenta sin cuota', () => {
+    // account.js:516 llama resetFailures en CADA refresco exitoso, para todas las cuentas
+    // y por temporizador. Si eso limpiara el enfriamiento de cuota, el destierro duraria
+    // hasta el siguiente tic y el bucle volveria solo.
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+    rot.recordQuotaExhausted('a@x.io', null);
+    rot.resetFailures('a@x.io');
+    assert.equal(rot.getStats().available, 1, 'la cuota no se arregla reseteando contadores');
+  });
+
+  it('el dashboard no puede pintar como activa una cuenta que el sorteo esta ignorando', () => {
+    // getAccountCliState deriva `kind` de cooldownEndsAt, que solo lo pone el contador de
+    // fallos. Sin esto una cuenta desterrada por cuota sale como `warn` 15 minutos y
+    // `active` despues, mientras la rotacion lleva una hora saltandosela: el operador ve
+    // un pool sano y una capacidad que no existe.
+    const { getAccountCliState } = require('../src/utils/cli-support.js');
+    const now = Date.now();
+    const state = getAccountCliState(
+      { email: 'a@x.io' },
+      { quotaCooldownEndsAt: now + 3600 * 1000, lastErrorAt: now, lastErrorCode: 'RateLimited' },
+      now
+    );
+    assert.equal(state.status.kind, 'cooldown', 'esta fuera del sorteo: dilo');
+    assert.equal(state.status.cooldownEndsAt, now + 3600 * 1000, 'y con la cuenta atras de verdad');
+
+    // El enfriamiento por fallos manda si termina mas tarde que el de cuota.
+    const later = getAccountCliState(
+      { email: 'a@x.io' },
+      { quotaCooldownEndsAt: now + 1000, cooldownEndsAt: now + 60000 },
+      now
+    );
+    assert.equal(later.status.cooldownEndsAt, now + 60000, 'gana el que libera mas tarde');
+  });
+
+  it('reset() y el borrado de cuentas limpian tambien el estado de cuota', () => {
+    const rot = new AccountRotator();
+    rot.setAccounts(accounts);
+    rot.recordQuotaExhausted('a@x.io', null);
+    rot.reset();
+    assert.equal(rot.getStats().available, 2);
+
+    rot.recordQuotaExhausted('a@x.io', null);
+    rot.setAccounts([{ email: 'b@x.io', token: 'tb' }]);
+    rot.setAccounts(accounts);
+    assert.equal(rot.getStats().available, 2, 'el registro de una cuenta que se fue no puede sobrevivir');
+  });
+});
+
+// ===================================================================================
+describe('el pool: los dos controladores denuncian la cuenta que se quedo sin cuota', () => {
+  let seen = [];
+  const original = accountManager.recordAccountQuotaExhausted;
+
+  test.beforeEach(() => {
+    seen = [];
+    accountManager.recordAccountQuotaExhausted = (email, secs) => { seen.push({ email, secs }); };
+  });
+  test.afterEach(() => {
+    accountManager.recordAccountQuotaExhausted = original;
+    upstreamAccount = null;
+  });
+
+  it('/v1/messages en streaming: la cuenta gastada queda marcada', async () => {
+    upstreamAccount = { email: 'burned@x.io', token: 't' };
+    upstreamFactory = () => streamOf([quotaFrame({ num: 2 })]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+    assert.deepEqual(seen, [{ email: 'burned@x.io', secs: 7200 }]);
+  });
+
+  it('/v1/messages sin streaming: mismo aviso', async () => {
+    upstreamAccount = { email: 'burned@x.io', token: 't' };
+    upstreamFactory = () => streamOf([quotaFrame()]);
+    const res = jsonRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+    assert.deepEqual(seen, [{ email: 'burned@x.io', secs: null }]);
+  });
+
+  it('/v1/chat/completions en streaming: gemelo', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([quotaFrame({ num: 1 })]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] },
+      { currentAccount: { email: 'burned@x.io', token: 't' } }
+    );
+    assert.deepEqual(seen, [{ email: 'burned@x.io', secs: 3600 }]);
+  });
+
+  it('/v1/chat/completions agentico en streaming: gemelo', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([quotaFrame()]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] },
+      {
+        currentAccount: { email: 'burned@x.io', token: 't' },
+        has_tools: true, tool_choice: 'auto', allowed_tool_names: ['get_time'], agent_turn_max_attempts: 2
+      }
+    );
+    assert.deepEqual(seen, [{ email: 'burned@x.io', secs: null }]);
+  });
+
+  it('/v1/chat/completions sin streaming: gemelo', async () => {
+    const res = jsonRes();
+    await handleNonStreamResponse(
+      res, streamOf([quotaFrame()]), false, false, 'qwen3-max',
+      { messages: [{ role: 'user', content: 'hola' }] },
+      { currentAccount: { email: 'burned@x.io', token: 't' } }
+    );
+    assert.deepEqual(seen, [{ email: 'burned@x.io', secs: null }]);
+  });
+
+  it('un fallo que NO es de cuota no marca a nadie', async () => {
+    upstreamAccount = { email: 'innocent@x.io', token: 't' };
+    upstreamFactory = () => streamOf([frame({ success: false, data: { code: 'Bad_Request', details: 'roto' } })]);
+    const res = jsonRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+    assert.equal(res.statusCode, 500);
+    assert.deepEqual(seen, [], 'una averia del upstream no deja sin cuota a la cuenta');
+  });
+
+  it('sin cuenta conocida no se marca nada, y no se rompe nada', async () => {
+    upstreamAccount = null;
+    upstreamFactory = () => streamOf([quotaFrame()]);
+    const res = jsonRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+    assert.equal(res.statusCode, 429, 'la respuesta al cliente no depende de conocer la cuenta');
+    assert.deepEqual(seen, []);
+  });
+});
+
+// ===================================================================================
+// MATERIAL REAL. Las cuatro cadenas de abajo son las unicas cuatro clases de
+// "Upstream error" que aparecen en los transcripts del usuario, contadas asi:
+//   grep -rhon "Upstream error" ~/.claude/projects | ... | sort | uniq -c
+//     149  Upstream error mid-stream: N You've reached the upper limit for today's usage.
+//      53  ... 上游连续返回残缺、非法或不存在的工具调用
+//      32  ... Qwen 网页上游触发 WAF/captcha
+//      28  ... 上游连续返回未声明完成状态的文本
+// Una sola es cuota. Si el clasificador se ensancha y se traga otra, el cliente
+// dejaria de reintentar un fallo que SI se arregla reintentando.
+describe('material real: las 4 clases de fallo de los logs del usuario', () => {
+  const REAL = {
+    quota: "You've reached the upper limit for today's usage.",
+    tools: '上游连续返回残缺、非法或不存在的工具调用，已阻止交付',
+    waf: 'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
+    unfinished: '上游连续返回未声明完成状态的文本，已阻止 Agent 将其当成答案交付'
+  };
+
+  it('solo la linea de cuota clasifica como cuota', () => {
+    assert.equal(isRateLimitError(new UpstreamResponseError(REAL.quota, 'upstream_business_error')), true);
+    for (const [name, text] of Object.entries(REAL)) {
+      if (name === 'quota') continue;
+      assert.equal(
+        isRateLimitError(new UpstreamResponseError(text, 'upstream_agent_turn_incomplete')),
+        false,
+        `${name} no es cuota: reintentar SI lo arregla`
+      );
+    }
+  });
+
+  it('los dos canales del paquete real llevan a la misma clasificacion', () => {
+    // Canal A: `data.code`. Canal B: solo el texto (el code no siempre viene).
+    let byCode = null;
+    try { assertNoUpstreamFailure({ success: false, data: { code: 'RateLimited', details: 'otro texto' } }); } catch (e) { byCode = e; }
+    assert.equal(isRateLimitError(byCode), true, 'canal A: data.code');
+
+    let byText = null;
+    try { assertNoUpstreamFailure({ success: false, data: { details: REAL.quota } }); } catch (e) { byText = e; }
+    assert.equal(isRateLimitError(byText), true, 'canal B: el texto que vio el usuario');
   });
 });
