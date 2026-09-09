@@ -675,6 +675,12 @@ const createUpstreamDeltaNormalizer = (options = {}) => {
 }
 
 // 一个回合最多重新安置几张媒体。deferred-work.md:91。
+//
+// Fuente unica: el gemelo anthropic.js#buildInternalRequest lo IMPORTA de aqui. Antes eran
+// dos literales `= 4` que nada relacionaba, y bajar el de anthropic.js a 2 —— media entrega
+// de imagenes menos en la ruta que corre Claude Code —— dejaba las 889 pruebas en verde.
+// La divergencia la vigila ahora tests/harvest-media-cap.test.js metiendo una sola entrada
+// por los dos barridos.
 const HARVEST_MEDIA_CAP = 4
 
 /**
@@ -881,5 +887,9 @@ module.exports = {
     // Exportado para anthropic.js#buildInternalRequest: alli decide si la historia
     // trae bloques de herramienta y hay que plegarla aunque la peticion no declare
     // `tools`. Una tercera copia del criterio se desincronizaria de foldToolMessages.
-    willBeFolded
+    willBeFolded,
+    // Exportado por la misma razon que willBeFolded: el barrido gemelo de
+    // anthropic.js#buildInternalRequest lo necesita, y una segunda copia del literal se
+    // desincroniza en silencio. Ver el comentario de la declaracion.
+    HARVEST_MEDIA_CAP
 }

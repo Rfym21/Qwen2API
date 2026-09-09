@@ -4,7 +4,11 @@ const { sendChatRequest } = require('../utils/request.js');
 const accountManager = require('../utils/account.js');
 const {
   isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
-  createUpstreamDeltaNormalizer, createClientToolNamePredicate, willBeFolded
+  createUpstreamDeltaNormalizer, createClientToolNamePredicate, willBeFolded,
+  // Fuente unica del tope por turno. Antes esto era un literal `= 4` propio dentro de
+  // buildInternalRequest: dos numeros que nada relacionaba, y bajar ESTE a 2 no rompia
+  // ninguna de las 889 pruebas. Ver chat-helpers.js#HARVEST_MEDIA_CAP.
+  HARVEST_MEDIA_CAP
 } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
@@ -389,7 +393,10 @@ const UNSUPPORTED_BLOCK_NOTE = (type) => `[unsupported content block: ${type} �
  *
  * Unico desacuerdo conocido: HARVEST_MEDIA_CAP corta el RECORRIDO del barrido a los 4
  * primeros medios, asi que un turno con mas de 4 puede tener un resultado dentro de la
- * ventana cuyo medio no llega a visitarse. Cuenta como conocido y no como silencioso.
+ * ventana cuyo medio no llega a visitarse. Cuenta como conocido y no como silencioso: ya
+ * no vive solo en este comentario, esta clavado en tests/harvest-media-cap.test.js —— un
+ * turno de 6 resultados con imagen produce 6 notas positivas y 4 imagenes en files[]. Si
+ * alguien lo arregla, esa prueba falla y hay que reescribirla; es lo que se busca.
  *
  * @param {Array<Object>} messages - mensajes en forma Anthropic
  * @returns {number} indice del primer mensaje del turno en curso (0 si no hay frontera)
@@ -632,7 +639,6 @@ const buildInternalRequest = async (anthropicReq) => {
   // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
   // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
   // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
-  const HARVEST_MEDIA_CAP = 4;
   const currentTurnMedia = [];
   let scanFrom = flat.length - 1;
   // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
