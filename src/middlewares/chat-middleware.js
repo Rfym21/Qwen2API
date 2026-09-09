@@ -1,5 +1,5 @@
 const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage, willBeFolded } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
 const { buildAgentTurnDirective, buildToolHistoryLedger, extractHistoryToolCalls } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
@@ -158,7 +158,6 @@ const processRequestBody = async (req, res, next) => {
       // marca la llamada como ya ejecutada para poder registrarla. Gemelo de
       // anthropic.js#buildInternalRequest -> built.historyToolCalls.
       req.tool_history_calls = extractHistoryToolCalls(messages || [])
-      preparedMessages = foldToolMessages(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
       req.allowed_tool_names = tools
@@ -201,6 +200,28 @@ const processRequestBody = async (req, res, next) => {
       req.allowed_tool_names = []
       req.tool_schemas = null
       req.tool_history_calls = []
+    }
+
+    // La historia se pliega segun lo que CONTIENE, no segun lo que esta peticion declara.
+    // Gemelo exacto de anthropic.js#buildInternalRequest. Con el fold dentro de
+    // `if (hasTools)`, una peticion sin `tools` (o con `tool_choice: 'none'`) dejaba
+    // intacto al assistant que solo lleva `tool_calls`: su `content` es null/'' y
+    // formatSingleMessage (chat-helpers.js) descarta todo mensaje cuyo texto queda
+    // vacio, asi que EL TURNO ENTERO desaparecia de la historia mientras su resultado
+    // sobrevivia como una linea JSONL con el rol inexistente "tool" — el modelo veia
+    // una respuesta sin la pregunta. La compactacion y el resumen de Claude Code tienen
+    // justo esa forma y llegan sin `tools`.
+    //
+    // Es RENDERIZADO, no protocolo: toolSystemPrompt, el ledger y req.has_tools siguen
+    // atados a `hasTools` (arriba), asi que una peticion sin herramientas recupera su
+    // historia legible sin aprender a llamarlas.
+    //
+    // Posicion obligatoria: DESPUES de harvestCurrentTurnMedia (el fold convierte el
+    // array de contenido en texto y se llevaria la imagen por delante) y ANTES de
+    // attachMediaToLastMessage (el fold devuelve objetos nuevos; colgar antes seria
+    // colgar sobre el objeto que se descarta).
+    if (hasTools || (Array.isArray(messages) && messages.some(willBeFolded))) {
+      preparedMessages = foldToolMessages(messages || [])
     }
 
     // 必须在 foldToolMessages 之后再挂：折叠会把 role=tool/assistant 的消息换成新对象，

@@ -668,7 +668,13 @@ const HARVEST_MEDIA_CAP = 4
  * 散文塞进 `[TOOL RESULT]` 块里，files[] 空着，一行日志都没有。所以这类消息即便是最后
  * 一条，也必须先把媒体收走。
  *
- * 判据必须和 tool-prompt.js#foldToolMessages 的两个分支逐字对齐。
+ * 判据必须和 tool-prompt.js#foldToolMessages 里**会把正文变成字符串的两个分支**逐字对齐。
+ * 折叠还会给其它消息做标记失效（neutraliseMessageMarkers），但那条路只改 text，数组结构
+ * 和媒体项原样返回，所以不属于这个判据。
+ *
+ * 第二个调用点：两条路径的折叠门（anthropic.js#buildInternalRequest、
+ * chat-middleware.js#processRequestBody）用 `some(willBeFolded)` 判断「这段历史里有没有
+ * 工具块」，据此决定不带 tools 时也要折叠。同一个判据，同一个契约。
  * @param {object} message
  * @returns {boolean}
  */

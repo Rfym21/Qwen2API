@@ -1597,6 +1597,47 @@ const buildToolSystemPrompt = (tools, options = {}) => {
 };
 
 /**
+ * Defusar los marcadores de protocolo del texto que NO escribe el propio fold.
+ *
+ * Invariante que sostiene la correlacion de la Tarea 1: **dentro de la historia plegada,
+ * todo marcador de protocolo lo escribio foldToolMessages**. Sin esto, cualquier mensaje
+ * de texto plano puede traer un `[TOOL RESULT #1: Read]` inventado y colisionar con el
+ * ordinal #1 real — dos bloques reclamando la misma llamada, uno falso, indistinguibles
+ * para el modelo. Es exactamente la colision que la Tarea 1 existe para eliminar.
+ *
+ * El texto plano llega envenenado por vias normales, no hipoteticas: desde que la
+ * historia se pliega tambien sin `tools` (peticiones de compactacion/resumen de Claude
+ * Code), el resumen que produce el modelo puede citar los marcadores que le enseñamos, y
+ * el cliente lo reenvia como un mensaje de usuario corriente en la siguiente peticion,
+ * esta vez CON herramientas. Tambien basta con que alguien pegue una transcripcion.
+ *
+ * Misma regla que ya se aplica al cuerpo de un resultado (contenido no confiable), y por
+ * la misma razon. Solo se toca texto: los items de imagen/media se devuelven intactos, y
+ * el mensaje solo se reemplaza cuando algo cambio de verdad — asi la inmensa mayoria de
+ * los mensajes (sin marcadores) conserva su identidad byte a byte.
+ * @param {object} message
+ * @returns {object} el mismo mensaje, o una copia con el texto defusado
+ */
+const neutraliseMessageMarkers = (message) => {
+  if (!message || typeof message !== 'object') return message;
+  const { content } = message;
+  if (typeof content === 'string') {
+    const safe = neutraliseResultMarkers(content);
+    return safe === content ? message : { ...message, content: safe };
+  }
+  if (!Array.isArray(content)) return message;
+  let changed = false;
+  const next = content.map((item) => {
+    if (!item || item.type !== 'text' || typeof item.text !== 'string') return item;
+    const safe = neutraliseResultMarkers(item.text);
+    if (safe === item.text) return item;
+    changed = true;
+    return { ...item, text: safe };
+  });
+  return changed ? { ...message, content: next } : message;
+};
+
+/**
  * 将历史中的 assistant tool_calls / tool 角色消息折叠成纯文本，
  * 以便上游网页接口（仅识别 user/assistant/system）能正确接收上下文。
  * 折叠时保留原始 tool_call_id，并将后续 role=tool 消息按 id 精确回链。
@@ -1640,7 +1681,11 @@ const foldToolMessages = (messages) => {
         const payload = { name, arguments: args ?? {} };
         return `${numberedCallMarker(callOrdinal)}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
       });
-      const original = typeof message.content === 'string' ? message.content : '';
+      // El texto libre que el assistant escribio antes de llamar no lo escribio el fold:
+      // pasa por la misma regla que un cuerpo de resultado (ver neutraliseMessageMarkers).
+      const original = typeof message.content === 'string'
+        ? neutraliseResultMarkers(message.content)
+        : '';
       return {
         role: 'assistant',
         content: [original, blocks.join('\n')].filter(Boolean).join('\n')
@@ -1651,8 +1696,11 @@ const foldToolMessages = (messages) => {
       const callId = message.tool_call_id || '';
       const ref = callId ? callIdToRef.get(callId) : null;
       const name = message.name || ref?.name || (message.role === 'function' ? 'function' : 'tool');
+      // Un resultado vacio NO es `null`: la herramienta corrio y devolvio nada. Escribir
+      // `null` le dice al modelo que devolvio JSON null, que es otra cosa — y ahora se ve,
+      // porque antes el mensaje entero desaparecia (ver el gate del fold en ambos caminos).
       const content = typeof message.content === 'string'
-        ? (message.content || 'null')
+        ? (message.content || '(empty)')
         : JSON.stringify(message.content ?? null);
       // 认领不到调用就不编号：随便派一个序号等于指向**别人**的调用，比没有地址更坏。
       const open = ref ? numberedResultOpen(ref.ordinal) : TOOL_RESULT_OPEN;
@@ -1662,7 +1710,7 @@ const foldToolMessages = (messages) => {
       };
     }
 
-    return message;
+    return neutraliseMessageMarkers(message);
   });
 };
 

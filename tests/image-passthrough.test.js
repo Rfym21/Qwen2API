@@ -703,9 +703,11 @@ describe('image passthrough: OpenClaw agent shape', () => {
   });
 
   it('attaches to a last assistant message whose content is null', async () => {
-    // Canonical OpenAI assistant-tool-call shape. With tool_choice none there is no
-    // folding, so this arrives verbatim; without the terminal else the harvest strips
-    // the image off its carrier and then silently drops it.
+    // Canonical OpenAI assistant-tool-call shape. El fold ahora SI corre con
+    // tool_choice none (la historia se pliega segun lo que contiene, no segun lo que
+    // la peticion declara), y la imagen sobrevive igual: la cosecha corre antes del
+    // fold y attachMediaToLastMessage despues. Sin el else terminal, la cosecha le
+    // quita la imagen a su portador y luego la pierde en silencio.
     const req = {
       body: {
         model: 'qwen3.8-max',

@@ -47,7 +47,10 @@ test('empty tool results remain visible in Agent history', () => {
     { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }] },
     { role: 'tool', tool_call_id: 'call_1', content: '' }
   ])
-  assert.match(folded[1].content, /^\[TOOL RESULT #1: read_file\]\nnull\n\[END TOOL RESULT\]$/)
+  // El bloque sigue visible (ese es el pin). El cuerpo dice `(empty)` y ya no `null`:
+  // la herramienta corrio y devolvio nada, no devolvio JSON null. La distincion
+  // empty-vs-null se pincha en anthropic-native-parity.test.js.
+  assert.match(folded[1].content, /^\[TOOL RESULT #1: read_file\]\n\(empty\)\n\[END TOOL RESULT\]$/)
 })
 
 test('legacy function_call and function result messages remain executable history', () => {
