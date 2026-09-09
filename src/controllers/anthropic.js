@@ -53,7 +53,11 @@ const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.j
 const { mapIncomingModel } = require('../utils/model-map.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
-const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
+const {
+  assertNoUpstreamFailure,
+  describeUpstreamFailure,
+  RATE_LIMIT_ANTHROPIC_TYPE
+} = require('../utils/upstream-error.js');
 const {
   analyzeAnthropicCompatibility,
   buildAnthropicCompatibilityHeaders
@@ -2647,14 +2651,23 @@ const handleAnthropicMessages = async (req, res) => {
     }
   } catch (error) {
     logger.error('Anthropic Messages 处理错误', 'ANTHROPIC', '', error);
+    // La cuota diaria agotada es 429 `rate_limit_error`, como la API nativa — no un 500
+    // `api_error`. Gemelo: chat.js#writeOpenAIHttpError. La deteccion es unica
+    // (utils/upstream-error.js#describeUpstreamFailure); aqui solo se traduce al cable.
+    const failure = describeUpstreamFailure(error, 500);
+    const errorType = failure.rateLimited ? RATE_LIMIT_ANTHROPIC_TYPE : 'api_error';
     if (!res.headersSent) {
-      res.status(500).json({
+      // Retry-After solo con una espera que mando el upstream de verdad.
+      if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
+      res.status(failure.status).json({
         type: 'error',
-        error: { type: 'api_error', message: error.publicMessage || 'Service error' }
+        error: { type: errorType, message: error.publicMessage || 'Service error' }
       });
     } else {
+      // A media transmision el status ya no se puede cambiar: el `type` del evento es el
+      // unico canal que le queda al cliente para distinguir cuota de averia.
       if (!res.writableEnded) {
-        try { writeAnthropicError(res, error.publicMessage || '上游响应处理失败', 'api_error'); } catch (_) { /* ignore */ }
+        try { writeAnthropicError(res, error.publicMessage || '上游响应处理失败', errorType); } catch (_) { /* ignore */ }
       }
     }
   }
