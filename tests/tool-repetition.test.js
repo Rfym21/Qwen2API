@@ -3,7 +3,11 @@ const assert = require('node:assert/strict')
 
 const {
   buildToolHistoryLedger,
-  buildAgentTurnDirective
+  buildAgentTurnDirective,
+  // La leyenda REAL, no una copia: si se escribiera aqui el literal, cambiarla dejaria la
+  // falsificacion del test sin parecerse al bloque y el test pasaria sin medir nada. La
+  // cabecera se pina aparte, con el literal de mas abajo que buscan los tests de wiring.
+  LEDGER_CAPTION
 } = require('../src/utils/agent-turn.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../src/utils/tool-prompt.js')
 
@@ -180,11 +184,17 @@ test('ledger: el tope de entradas por defecto es exactamente 40, y conserva las 
   assert.equal(entryLines(sinTopeDeBytes).length, N, 'el tope de entradas debe morder aunque sobren bytes')
   assert.match(sinTopeDeBytes, /omitted/)
 
-  // Y que el caso por defecto de arriba tampoco estuviera midiendo bytes: ~1,8 KB reales
-  // contra un tope de 6000 B.
-  assert.ok(
-    Buffer.byteLength(pasado) < 4000,
-    `el bloque midio ${Buffer.byteLength(pasado)} B: se acerco al tope de bytes y este test ya no mide el de entradas`
+  // Y que el caso por defecto de arriba tampoco estuviera midiendo bytes. El liston no es
+  // un numero: es que el bloque por defecto salga IDENTICO al de arriba, que ya lleva el
+  // tope de bytes desactivado. Cualquier constante escrita aqui envejece sola — este test
+  // decia `< 4000` cuando el default era 6000 y siguio verde al subirlo a 12000, con el
+  // margen ya sin vigilar. La igualdad no envejece: si algun dia los bytes muerden en el
+  // caso por defecto, los dos bloques dejan de coincidir y salta aqui.
+  assert.equal(
+    pasado,
+    sinTopeDeBytes,
+    `el bloque por defecto (${Buffer.byteLength(pasado)} B) difiere del mismo bloque sin tope de bytes: ` +
+    'el tope de BYTES mordio en el caso por defecto y este test ya no mide el de entradas'
   )
 })
 
@@ -289,6 +299,169 @@ test('ledger: el bloque nunca pasa su tope de bytes', () => {
   assert.ok(
     Buffer.byteLength(porDefecto) <= LEDGER_DEFAULT_MAX_BYTES,
     `bloque por defecto de ${Buffer.byteLength(porDefecto)} bytes contra un tope de ${LEDGER_DEFAULT_MAX_BYTES}`
+  )
+})
+
+// ---------------------------------------------------------------------------
+// El ledger contra el presupuesto inline.
+//
+// Los tests de arriba miden lo que el bloque CONTIENE. Ese numero no es el que el
+// modelo lee: en una peticion externalizada (>90 KiB, el 71% de las fronteras reales)
+// el contenido se sube como adjunto y lo que queda en el cuerpo HTTP lo arma
+// buildAgentContextLivePrompt, que reparte un presupuesto por secciones y recorta.
+//
+// Aqui vivia el fallo que costo la primera version de este commit: el ledger viajaba
+// pegado al FINAL de `envelope.prefix`, y el prefijo se recorta por cabeza y cola. Como
+// el bloque es del mas nuevo al mas viejo, la rebanada de cola conservaba sus entradas
+// MAS VIEJAS y el hueco compactado se comia las MAS NUEVAS — exactamente al reves de lo
+// que promete su docstring, y justo en las peticiones donde ocurre el 76% de las
+// reemisiones. Con el tope en 6.000 B el bloque cabia entero en la cola por casualidad
+// aritmetica; subirlo a 12.000 lo rompio.
+//
+// Ninguna prueba podia verlo: todas llamaban a buildToolHistoryLedger directamente y
+// ninguna pasaba el bloque por el presupuesto. Esta si.
+const { buildAgentContextLivePrompt } = requestModule
+
+const HERRAMIENTAS = [
+  'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'Task', 'WebFetch',
+  'WebSearch', 'TodoWrite', 'NotebookEdit', 'BashOutput', 'KillShell'
+].map(name => ({
+  name,
+  description: `Use the ${name} tool. `.repeat(20),
+  input_schema: { type: 'object', properties: { a: { type: 'string', description: 'x '.repeat(30) } } }
+}))
+
+/**
+ * El contenido tal y como lo arma buildInternalRequest antes de externalizar:
+ * prefijo (system + protocolo + LEDGER) y a continuacion el sobre con la historia.
+ * La historia lleva una entrada `system` y una tarea de usuario REAL — sin ellas la
+ * seccion `essential` sale vacia, el prefijo hereda su cuota y el recorte no muerde:
+ * es la forma normal de Claude Code y tambien el caso mas apretado.
+ */
+const peticionExternalizada = (ledger) => {
+  const systemText = 'You are Claude Code, Anthropic official CLI for Claude. '.repeat(200)
+  const lineas = [
+    JSON.stringify({ role: 'system', content: 'Session rules. '.repeat(40) }),
+    JSON.stringify({ role: 'user', content: 'Audita el paquete utils y reporta helpers duplicados.' })
+  ]
+  for (let i = 1; i <= 60; i++) {
+    lineas.push(JSON.stringify({ role: 'assistant', content: `[TOOL CALL #${i}]\n{"name":"Read"}\n[END TOOL CALL]` }))
+    lineas.push(JSON.stringify({ role: 'user', content: `[TOOL RESULT #${i}: Read]\n${'cuerpo del archivo. '.repeat(120)}\n[END TOOL RESULT]` }))
+  }
+  return [systemText, buildToolSystemPrompt(HERRAMIENTAS), ledger].join('\n\n') +
+    `\n\n# Conversation history (JSONL)\n${lineas.join('\n')}` +
+    '\n\n# Current message\nSigue con la auditoria.'
+}
+
+const ordinalesDe = (texto) =>
+  (texto.match(/^#(\d+) /gm) || []).map(l => Number(l.slice(1)))
+
+test('ledger: la entrada MAS NUEVA sobrevive al presupuesto inline de una peticion externalizada', () => {
+  const ledger = buildToolHistoryLedger(historiaPesada(60))
+  const original = peticionExternalizada(ledger)
+
+  // Guardias: sin ellas el test puede pasar por no estar en el regimen que dice medir.
+  assert.ok(
+    Buffer.byteLength(original) > 92160,
+    `la peticion midio ${Buffer.byteLength(original)} B: no llega al umbral de externalizacion y este test no mide nada`
+  )
+  const inline = buildAgentContextLivePrompt(original)
+  assert.match(inline, /compacted/, 'nada se recorto: el presupuesto no llego a morder')
+
+  const enBloque = ordinalesDe(ledger)
+  const enInline = ordinalesDe(inline)
+  assert.ok(enBloque.length >= 30, `el bloque solo trae ${enBloque.length} entradas`)
+
+  // EL PIN. La entrada mas nueva es la llamada que el modelo esta a punto de repetir:
+  // es la unica que el bloque no puede permitirse perder. Con el ledger dentro del
+  // prefijo esto fallaba dejando vivas #45..#22 de un bloque que llegaba hasta #60.
+  assert.ok(
+    enInline.includes(enBloque[0]),
+    `la entrada mas nueva (#${enBloque[0]}) desaparecio del prompt inline; sobrevivieron ` +
+    `${enInline.length} entradas ${enInline.length ? `#${enInline[0]}..#${enInline[enInline.length - 1]}` : '(ninguna)'}. ` +
+    'El recorte se llevo justo la llamada que el ledger existe para nombrar.'
+  )
+
+  // Y sobreviven las mas nuevas en bloque, no un tramo del medio.
+  assert.deepEqual(
+    enInline,
+    enBloque.slice(0, enInline.length),
+    'las entradas que quedan inline deben ser la cabecera mas nueva del bloque, no una ventana interior'
+  )
+
+  // Ninguna linea puede quedar partida: media entrada se lee como una llamada completa
+  // con otros argumentos, que es peor que no verla.
+  const lineasDelBloque = new Set(ledger.split('\n'))
+  for (const linea of inline.split('\n')) {
+    if (!/^#\d+ /.test(linea)) continue
+    assert.ok(lineasDelBloque.has(linea), `renglon del ledger cortado a la mitad: ${JSON.stringify(linea)}`)
+  }
+})
+
+test('ledger: con el presupuesto inline muy apretado se recorta por renglones y avisa', () => {
+  // El default de produccion (48 KiB) le deja sitio de sobra. Este es el otro extremo,
+  // alcanzable con AGENT_CONTEXT_LIVE_PROMPT_BYTES: el bloque tiene que degradar sin
+  // mentir — renglones enteros, los mas nuevos, y la nota de omision puesta.
+  const ledger = buildToolHistoryLedger(historiaPesada(60))
+  const inline = buildAgentContextLivePrompt(peticionExternalizada(ledger), 12000)
+
+  const enInline = ordinalesDe(inline)
+  assert.ok(enInline.length > 0, 'el ledger desaparecio entero de un presupuesto de 12 KB')
+  assert.equal(enInline[0], ordinalesDe(ledger)[0], 'lo que sobrevive tiene que empezar por la entrada mas nueva')
+
+  const lineasDelBloque = new Set(ledger.split('\n'))
+  for (const linea of inline.split('\n')) {
+    if (!/^#\d+ /.test(linea)) continue
+    assert.ok(lineasDelBloque.has(linea), `renglon del ledger cortado a la mitad: ${JSON.stringify(linea)}`)
+  }
+
+  assert.match(inline, /omitted/, 'lista recortada y sin avisar: "no esta" pasaria a leerse como "no se llamo"')
+})
+
+test('ledger: una frase del cliente que imite la cabecera no se lleva el trato del ledger', () => {
+  // La cabecera sola —`# Already executed this task`— es una frase corriente, y un system
+  // prompt puede empezar una linea con ella. Reconocer el bloque solo por ahi hacia que
+  // toda la cola del system prompt se tratara como ledger: se recorta por renglones, no
+  // tiene ninguno con forma `#n `, y desaparecia ENTERA. Medido: 11,8 KB de reglas del
+  // cliente borradas del prompt inline. Por eso el reconocimiento pide cabecera + leyenda.
+  const reglas = 'REGLA IMPORTANTE DEL CLIENTE. '.repeat(2000)
+  const lineas = []
+  for (let i = 1; i <= 300; i++) {
+    lineas.push(JSON.stringify({ role: i % 2 ? 'user' : 'assistant', content: `mensaje ${i} ${'cuerpo '.repeat(60)}` }))
+  }
+  const original = `You are an agent.\n# Already executed this task\n${reglas}` +
+    `\n\n# Conversation history (JSONL)\n${lineas.join('\n')}\n\n# Current message\nsigue`
+
+  assert.ok(Buffer.byteLength(original) > 92160, 'la peticion no llega al umbral y el test no mide nada')
+  const inline = buildAgentContextLivePrompt(original)
+  assert.match(
+    inline,
+    /REGLA IMPORTANTE DEL CLIENTE/,
+    'las reglas del cliente desaparecieron: una frase suya se confundio con el bloque del ledger'
+  )
+})
+
+test('ledger: un cliente que reproduzca cabecera Y leyenda tampoco se lleva el trato', () => {
+  // El caso de arriba con una vuelta mas de tuerca, y es el que rompio la primera version
+  // de este arreglo. Copiar el prompt del proxy dentro de las propias reglas no es raro,
+  // y con eso el cliente reproduce las DOS lineas. Reconocer el bloque solo por ahi hacia
+  // que toda la cola de sus reglas se tratara como ledger; el recorte del ledger es por
+  // renglones `#n `, sus reglas no tienen ninguno, y desaparecian ENTERAS. Medido: 11,9 KB
+  // borrados del prompt inline. Por eso hace falta la tercera condicion — el renglon
+  // siguiente tiene que ser una entrada — que un bloque de verdad cumple siempre.
+  const reglas = 'REGLA CRITICA DEL CLIENTE. '.repeat(2000)
+  const lineas = []
+  for (let i = 1; i <= 300; i++) {
+    lineas.push(JSON.stringify({ role: i % 2 ? 'user' : 'assistant', content: `mensaje ${i} ${'cuerpo '.repeat(60)}` }))
+  }
+  const original = `You are an agent.\n${LEDGER_HEADER}\n${LEDGER_CAPTION}\n${reglas}` +
+    `\n\n# Conversation history (JSONL)\n${lineas.join('\n')}\n\n# Current message\nsigue`
+
+  assert.ok(Buffer.byteLength(original) > 92160, 'la peticion no llega al umbral y el test no mide nada')
+  assert.match(
+    buildAgentContextLivePrompt(original),
+    /REGLA CRITICA DEL CLIENTE/,
+    'las reglas del cliente desaparecieron: reproducir las dos lineas basto para robar el trato del ledger'
   )
 })
 

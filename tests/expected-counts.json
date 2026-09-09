@@ -1,5 +1,5 @@
 {
-  "tests": 1009,
+  "tests": 1013,
   "suites": 127,
   "note": "Authoritative count. Verify with: for f in tests/*.test.js; do node --test --test-force-exit \"$f\"; done | grep \"tests \" | awk '{s+=$3}END{print s}'",
   "updated": "2026-09-09"

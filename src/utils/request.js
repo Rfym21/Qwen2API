@@ -7,7 +7,7 @@ const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { TOOL_CALL_OPEN } = require('./agent-turn.js')
+const { TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger } = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -31,6 +31,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 const HISTORY_MARKER = '# Conversation history (JSONL)'
 const CURRENT_MESSAGE_MARKER = '# Current message'
+// Techo del ledger dentro del presupuesto inline. Ver buildBudgetedAgentPrompt.
+const LEDGER_POOL_SHARE = 0.25
 
 const byteLength = (value) => Buffer.byteLength(String(value || ''), 'utf8')
 
@@ -64,6 +66,58 @@ const truncateUtf8HeadTail = (
     return `${truncateUtf8(text, headBytes)}${separator}${truncateUtf8(text, tailBytes, true)}`
 }
 
+// El ledger de llamadas ya ejecutadas (buildToolHistoryLedger) viaja pegado al FINAL del
+// prefijo: lo montan asi controllers/anthropic.js#buildInternalRequest y
+// middlewares/chat-middleware.js#processRequestBody, en ese orden fijo.
+//
+// Se separa del prefijo aqui, y no es cosmetico. El prefijo se recorta por CABEZA Y COLA
+// (headRatio 0.55) y el bloque va del mas NUEVO al mas VIEJO, asi que dentro del prefijo
+// la rebanada de cola conserva sus entradas mas viejas y el hueco compactado se lleva las
+// mas nuevas — justo la llamada que el modelo esta a punto de repetir, que es la unica
+// razon por la que el bloque existe. Con el tope en 6000 B el bloque cabia entero en esa
+// cola por casualidad aritmetica; a 12000 ya no. Medido sobre 48 sobres externalizados
+// (94-384 KB, 8-60 herramientas, 30-120 llamadas): dentro del prefijo sobrevivian 23-24
+// entradas de las 30-37 del bloque y en 44 de los 48 la MAS NUEVA no llegaba; en seccion
+// propia llegan los 48 de 48 enteros. tests/tool-repetition.test.js lo clava.
+//
+// Se reconocen las DOS primeras lineas del bloque, no solo la cabecera, y a principio de
+// linea. La cabecera sola es una frase corriente: un system prompt del cliente que
+// empezara una linea con ella se llevaba el trato del ledger y, si no cabia en su cuota,
+// desaparecia entero — 11,8 KB de reglas borradas del prompt inline, medido. La leyenda
+// es una frase fija y larga, y un renglon del propio bloque no puede forjar ninguna de
+// las dos: van colapsados a una linea y prefijados con `#n `. Se toma la ULTIMA aparicion
+// porque el bloque es la ultima parte del prefijo.
+const LEDGER_BLOCK_START = `${LEDGER_HEADER}\n${LEDGER_CAPTION}`
+
+// Tercer requisito, ademas de las dos lineas: el renglon siguiente tiene que ser una
+// ENTRADA (`#<n> `), que es lo que buildToolHistoryLedger emite siempre — devuelve ''
+// antes que un bloque sin ninguna. Sin esta comprobacion, un texto del cliente que
+// reprodujera cabecera + leyenda —copiar el prompt del proxy en las propias reglas no es
+// raro— se llevaba el trato del ledger, y como no tiene ningun renglon `#n ` el recorte
+// por renglones lo dejaba en ''. Medido: 11,9 KB de reglas del cliente BORRADAS del
+// prompt inline. Con las tres condiciones forjarlo pide la leyenda literal de 137 bytes y
+// ademas una linea con forma de entrada, y aun asi solo se auto-recorta.
+const startsLedgerBlock = (candidate) => (
+    candidate.startsWith(LEDGER_BLOCK_START) &&
+    /^#\d+ /.test(candidate.slice(LEDGER_BLOCK_START.length + 1).split('\n', 1)[0])
+)
+
+const splitAgentLedger = (prefix) => {
+    const text = String(prefix || '')
+    // Se toma la ULTIMA aparicion porque el bloque es la ultima parte del prefijo; si el
+    // cliente tuviera una copia mas arriba, la de verdad sigue ganando.
+    let at = -1
+    if (text.startsWith(LEDGER_BLOCK_START)) at = 0
+    else {
+        const found = text.lastIndexOf(`\n${LEDGER_BLOCK_START}`)
+        if (found >= 0) at = found + 1
+    }
+    if (at < 0) return { prefix: text, ledger: '' }
+    const candidate = text.slice(at).trim()
+    if (!startsLedgerBlock(candidate)) return { prefix: text, ledger: '' }
+    return { prefix: text.slice(0, at).trim(), ledger: candidate }
+}
+
 const parseAgentEnvelope = (value) => {
     const text = String(value || '')
     const historyIndex = text.indexOf(HISTORY_MARKER)
@@ -71,13 +125,13 @@ const parseAgentEnvelope = (value) => {
     if (historyIndex < 0) {
         if (currentIndex >= 0) {
             return {
-                prefix: text.slice(0, currentIndex).trim(),
+                ...splitAgentLedger(text.slice(0, currentIndex).trim()),
                 history: '',
                 current: text.slice(currentIndex).trim(),
                 entries: []
             }
         }
-        return { prefix: text, history: '', current: '', entries: [] }
+        return { ...splitAgentLedger(text), history: '', current: '', entries: [] }
     }
 
     const historyStart = historyIndex + HISTORY_MARKER.length
@@ -103,7 +157,7 @@ const parseAgentEnvelope = (value) => {
         }
     }
     return {
-        prefix: text.slice(0, historyIndex).trim(),
+        ...splitAgentLedger(text.slice(0, historyIndex).trim()),
         history,
         current: hasCurrent ? text.slice(currentIndex).trim() : '',
         entries
@@ -180,6 +234,8 @@ const buildBudgetedAgentPrompt = (
     const essential = buildEssentialAgentHistory(envelope.entries)
     const sections = [
         { header: '', value: envelope.prefix, weight: 34, headRatio: 0.55, kind: 'text' },
+        // Peso 0: no entra en el reparto por pesos, se reserva antes (ver abajo).
+        { header: '', value: envelope.ledger, weight: 0, headRatio: 1, kind: 'ledger' },
         {
             header: '# Essential Agent state retained inline',
             value: essential,
@@ -221,10 +277,33 @@ const buildBudgetedAgentPrompt = (
     // 第一趟：每个 section 拿「按权重的配额」和「它实际需要的量」里更小的那个。
     // 第二趟：把剩余按**弹性顺序**发出去 —— recent 先拿，它能把更多历史留在行内。
     const naturalBytes = sections.map(section => byteLength(section.value))
-    const totalWeight = sections.reduce((sum, section) => sum + section.weight, 0)
-    const budgets = sections.map((section, index) => Math.min(
-        Math.floor(pool * section.weight / totalWeight),
-        naturalBytes[index]
+
+    // El ledger se sirve ANTES del reparto por pesos, y por una razon distinta a las demas
+    // secciones: es pequeno, esta acotado en origen (12000 B) y ya sabe degradar solo, con
+    // renglones enteros y su nota de omision. Darle un peso lo dejaria a merced del reparto
+    // — con el pool tipico, un 8% son 3872 B y el bloque saldria recortado siempre — y
+    // meterlo en el prefijo es lo que rompio la version anterior de esto.
+    //
+    // El tope de un cuarto del pool no es para produccion: con los 48 KiB por defecto el
+    // pool son ~48400 B y el bloque entero (<=12000) cabe con holgura. Existe para que un
+    // AGENT_CONTEXT_LIVE_PROMPT_BYTES pequeno no deje al resto sin sitio; ahi el bloque se
+    // recorta por renglones, conservando los MAS NUEVOS, que es lo que se pedia.
+    const ledgerIndex = sections.findIndex(section => section.kind === 'ledger')
+    const ledgerBudget = ledgerIndex >= 0
+        ? Math.min(naturalBytes[ledgerIndex], Math.floor(pool * LEDGER_POOL_SHARE))
+        : 0
+    const weightedPool = pool - ledgerBudget
+
+    // `|| 1` solo para el caso degenerado en que el ledger sea la unica seccion viva: sin
+    // el, `x / 0` meteria un NaN en un presupuesto.
+    const totalWeight = sections.reduce((sum, section) => sum + section.weight, 0) || 1
+    const budgets = sections.map((section, index) => (
+        section.kind === 'ledger'
+            ? ledgerBudget
+            : Math.min(
+                Math.floor(weightedPool * section.weight / totalWeight),
+                naturalBytes[index]
+            )
     ))
     let surplus = pool - budgets.reduce((sum, value) => sum + value, 0)
     const byElasticity = sections
@@ -241,6 +320,7 @@ const buildBudgetedAgentPrompt = (
 
     const rendered = sections.map((section, index) => {
         const budget = budgets[index]
+        if (section.kind === 'ledger') return truncateToolHistoryLedger(section.value, budget)
         const content = section.kind === 'recent'
             ? buildRecentAgentHistory(envelope, budget, compactionSeparator)
             : truncateUtf8HeadTail(
@@ -252,7 +332,7 @@ const buildBudgetedAgentPrompt = (
         return section.header ? `${section.header}\n${content}` : content
     })
 
-    return [notice, ...rendered].join(joinSeparator)
+    return [notice, ...rendered].filter(Boolean).join(joinSeparator)
 }
 
 const getMessageTextContent = (message) => {

@@ -769,10 +769,31 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   Ahi es justo donde hace falta: el 76% de las reemisiones ocurren en peticiones ya
  *   externalizadas, donde el alcance con 6.000 caia al 77,0% y con 12.000 sube al 89,4%.
  *
+ *   Las cifras de arriba son de ALCANCE DEL BLOQUE: lo que el ledger contiene. No es lo
+ *   mismo que lo que el modelo lee. En una peticion externalizada el bloque pasa todavia
+ *   por el presupuesto inline de buildBudgetedAgentPrompt (utils/request.js), y ahi vivia
+ *   el fallo que costo la primera version de este cambio: el ledger viajaba al final de
+ *   `envelope.prefix`, que se recorta por cabeza y cola, asi que la rebanada de cola
+ *   conservaba las entradas VIEJAS y el hueco compactado se comia las NUEVAS. Con 6.000 B
+ *   el bloque cabia entero en esa cola por casualidad aritmetica; a 12.000 ya no.
+ *
+ *   Hoy el ledger es su propia seccion alli, con presupuesto reservado antes del reparto
+ *   por pesos y recorte propio (truncateToolHistoryLedger). Medido sobre una rejilla de 48
+ *   sobres externalizados (94-384 KB crudos, 8-60 herramientas, 30-120 llamadas, system
+ *   prompt de 3 a 50 KB): con el ledger dentro del prefijo sobrevivian 23-24 entradas de
+ *   30-37 y en 44 de las 48 formas la MAS NUEVA no llegaba; con la seccion propia llegan
+ *   las 48 de 48 completas. Con eso el alcance del bloque y lo que el modelo lee vuelven a
+ *   ser el mismo numero, que es lo que hace citables las cifras de arriba. Cuesta ~2,9
+ *   renglones de historia reciente inline (12,0 -> 9,1 de media en la misma rejilla): son
+ *   ~2,5 KB por renglon de resultado crudo a cambio de ~333 B por llamada nombrada.
+ *   Lo clava el test de supervivencia inline de tests/tool-repetition.test.js, que es el
+ *   unico que mide lo que el modelo ve.
+ *
  *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
  *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision
  *   se dispara igual. Se conservan las MAS RECIENTES, que son las que el modelo esta a
- *   punto de repetir. El floor lo clava tests/tool-repetition.test.js; el tope superior,
+ *   punto de repetir, y esa propiedad ahora sobrevive al presupuesto inline en vez de
+ *   invertirse en el. El floor lo clava tests/tool-repetition.test.js; el tope superior,
  *   el test de al lado. Los dos hacen falta: solo el tope deja bajar el numero a 1.000.
  * @returns {string} el bloque, o '' si no hay historia de herramientas
  */
@@ -928,6 +949,56 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 12000 } 
   if (lines.length === 2) return '';
   if (truncated) lines.push(LEDGER_TRUNCATED_NOTE);
   return lines.join('\n');
+};
+
+/**
+ * Recorta un bloque ya construido a `maxBytes` SIN partir un renglon.
+ *
+ * Existe porque el bloque no viaja intacto hasta el modelo. En una peticion externalizada
+ * (>90 KiB) lo que queda en el cuerpo HTTP lo arma buildBudgetedAgentPrompt
+ * (utils/request.js), que reparte un presupuesto entre secciones y recorta. El recorte
+ * generico es por CABEZA Y COLA, y aplicado a este bloque —que va del mas nuevo al mas
+ * viejo— conserva las entradas VIEJAS y se come las NUEVAS: exactamente al reves de para
+ * lo que existe. Por eso el ledger es su propia seccion alli y se recorta aqui.
+ *
+ * Dos reglas, las mismas que buildToolHistoryLedger:
+ *  - por renglones enteros: medio renglon se lee como una llamada completa con OTROS
+ *    argumentos, que informa peor que no verla;
+ *  - si se cayo alguna, la nota de omision va puesta — sin ella una lista recortada se
+ *    lee como exhaustiva y "no esta en el ledger" pasa a significar "no se llamo nunca".
+ *
+ * Cuando no cabe ni una entrada devuelve '' : una cabecera con una lista vacia solo gasta
+ * contexto y miente, igual que en el constructor.
+ * @param {string} block - salida de buildToolHistoryLedger
+ * @param {number} maxBytes - tope duro del resultado
+ * @returns {string} el bloque recortado, o '' si no cabe ninguna entrada
+ */
+const truncateToolHistoryLedger = (block, maxBytes) => {
+  const text = String(block || '');
+  if (!text) return '';
+  const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 0;
+  if (Buffer.byteLength(text) <= limit) return text;
+
+  const lines = text.split('\n');
+  const isEntry = (line) => /^#\d+ /.test(line);
+  // La cabecera y la leyenda son todo lo que precede al primer renglon de entrada. La nota
+  // de omision del final no se conserva: se vuelve a poner abajo, porque ahora sobra seguro.
+  const head = [];
+  let i = 0;
+  for (; i < lines.length && !isEntry(lines[i]); i++) head.push(lines[i]);
+  const entries = lines.slice(i).filter(isEntry);
+
+  const budget = limit - Buffer.byteLength(LEDGER_TRUNCATED_NOTE) - 1;
+  let bytes = Buffer.byteLength(head.join('\n'));
+  const kept = [];
+  for (const line of entries) {
+    const cost = Buffer.byteLength(line) + 1;
+    if (bytes + cost > budget) break;
+    kept.push(line);
+    bytes += cost;
+  }
+  if (kept.length === 0) return '';
+  return [...head, ...kept, LEDGER_TRUNCATED_NOTE].join('\n');
 };
 
 /**
@@ -1172,6 +1243,16 @@ module.exports = {
   // razonamiento de anthropic.js corta igual que el digest del ledger de aqui.
   trimLoneSurrogates,
   buildToolHistoryLedger,
+  // El bloque no llega intacto al modelo: en una peticion externalizada lo reparte
+  // buildBudgetedAgentPrompt (utils/request.js). Se exportan las DOS primeras lineas
+  // —con las que alli se separa el bloque del resto del prefijo— y su recorte propio,
+  // que conserva las entradas MAS NUEVAS donde el recorte generico por cabeza y cola se
+  // las comia. Hacen falta las dos: la cabecera sola es una frase corriente, y un system
+  // prompt que la tuviera a principio de linea se llevaba el corte del ledger — medido,
+  // borraba 11,8 KB de reglas del cliente del prompt inline. La leyenda es fija y larga.
+  LEDGER_HEADER,
+  LEDGER_CAPTION,
+  truncateToolHistoryLedger,
   // El cuerpo del resultado cuando la herramienta devolvio medios. Lo usan los DOS
   // caminos (controllers/anthropic.js#flattenAnthropicMessages y
   // utils/chat-helpers.js#harvestCurrentTurnMedia) para no divergir en el texto.

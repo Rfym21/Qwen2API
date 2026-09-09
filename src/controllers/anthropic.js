@@ -777,9 +777,16 @@ const buildInternalRequest = async (anthropicReq) => {
   // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El ledger
   // va pegado al protocolo porque es parte del contrato de herramientas (sin el protocolo
   // delante seria una lista de ordinales sueltos), y delante de la historia que documenta.
-  // Vive en el prefijo, que parseAgentEnvelope (utils/request.js) nunca externaliza: si
-  // cayera dentro del bloque de historia, el contrapeso desapareceria justo en las
-  // conversaciones largas, que son las que repiten llamadas.
+  // Vive en el prefijo, fuera del bloque de historia: ahi dentro el contrapeso se
+  // recortaria justo en las conversaciones largas, que son las que repiten llamadas.
+  //
+  // Estar en el prefijo NO lo pone a salvo, y creer que si costo una version entera de
+  // esto. En una peticion externalizada (>90 KiB) el prefijo se retiene inline RECORTADO
+  // por cabeza y cola, y el bloque —que va del mas nuevo al mas viejo— perdia sus entradas
+  // NUEVAS en el hueco compactado. Por eso buildBudgetedAgentPrompt (utils/request.js) lo
+  // separa del prefijo y lo recorta aparte, por renglones. Ese corte se hace reconociendo
+  // las dos primeras lineas del bloque mas un renglon de entrada: si esta linea deja de
+  // poner el ledger AL FINAL del prefijo, alli hay que mirar.
   //
   // El sobre de turno se aplica ANTES del prefijo, igual que en el gemelo OpenAI
   // (chat-middleware.js#processRequestBody). Al reves —que era como estaba— una peticion

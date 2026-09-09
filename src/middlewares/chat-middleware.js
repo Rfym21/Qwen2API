@@ -263,9 +263,13 @@ const processRequestBody = async (req, res, next) => {
       // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El
       // ledger va pegado al protocolo porque es parte del contrato de herramientas (sin el
       // protocolo delante seria una lista de ordinales sueltos), y delante de la historia
-      // que documenta. Vive en el prefijo, que parseAgentEnvelope (utils/request.js) nunca
-      // externaliza: dentro del bloque de historia el contrapeso desapareceria justo en las
-      // conversaciones largas, que son las que repiten llamadas.
+      // que documenta. Vive en el prefijo, fuera del bloque de historia, donde se recortaria
+      // justo en las conversaciones largas, que son las que repiten llamadas.
+      //
+      // Estar en el prefijo NO lo pone a salvo: en una peticion externalizada el prefijo se
+      // retiene inline recortado por cabeza y cola, y el bloque perdia ahi sus entradas mas
+      // NUEVAS. buildBudgetedAgentPrompt (utils/request.js) lo separa y lo recorta aparte,
+      // reconociendolo por sus dos primeras lineas; tiene que ir AL FINAL del prefijo.
       const toolPrefix = [toolSystemPrompt, toolHistoryLedger].filter(Boolean).join('\n\n')
       const msgContent = body.messages[0].content
       if (typeof msgContent === 'string') {
