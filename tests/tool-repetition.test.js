@@ -129,6 +129,65 @@ test('ledger: maxEntries acota la lista y avisa que hay omitidas', () => {
   assert.doesNotMatch(buildToolHistoryLedger(messages, { maxEntries: 40 }), /omitted/)
 })
 
+// El default de maxEntries es la CAPACIDAD del ledger: cuantas llamadas distintas
+// alcanza a nombrar antes de callarse, y por lo tanto el alcance real de la correccion
+// contra la repeticion. Los dos tests de arriba pasan maxEntries EXPLICITO (3 y 40), asi
+// que ninguno toca el default: bajarlo de 40 a 3 en agent-turn.js dejaba las 889 pruebas
+// en verde y el ledger dejaba de ver 37 de cada 40 llamadas sin que nada chillara. Este
+// test clava el default; si una tarea futura mueve el tope, este es el unico numero.
+const LEDGER_DEFAULT_MAX_ENTRIES = 40
+
+/** n llamadas DISTINTAS (rutas distintas), cada una con su resultado. */
+const historiaDistinta = (n) => {
+  const messages = []
+  for (let i = 1; i <= n; i++) {
+    messages.push({ role: 'assistant', content: '', tool_calls: [call(`c${i}`, 'Read', { file_path: `f${i}.txt` })] })
+    messages.push(result(`c${i}`, `contenido ${i}`))
+  }
+  return messages
+}
+
+test('ledger: el tope de entradas por defecto es exactamente 40, y conserva las mas nuevas', () => {
+  const N = LEDGER_DEFAULT_MAX_ENTRIES
+
+  // Justo en el tope: entran todas y no se avisa de nada. Avisar de omisiones cuando la
+  // lista SI es exhaustiva empuja al modelo a re-llamar "por si acaso" — el bug al reves.
+  const alRas = buildToolHistoryLedger(historiaDistinta(N))
+  assert.equal(entryLines(alRas).length, N, `con ${N} llamadas distintas deben listarse ${N}`)
+  assert.doesNotMatch(alRas, /omitted/, `con ${N} llamadas no falta ninguna`)
+
+  // N+1: se listan N y se avisa de la que falta.
+  const pasado = buildToolHistoryLedger(historiaDistinta(N + 1))
+  const lines = entryLines(pasado)
+  assert.equal(lines.length, N, `con ${N + 1} llamadas distintas deben listarse exactamente ${N}`)
+  assert.match(pasado, /omitted/, 'recortado y sin avisar: el modelo creeria que la lista es completa')
+
+  // Las que quedan son las MAS RECIENTES (#N+1 .. #2). Conservar las viejas seria el peor
+  // reparto posible: la llamada que el modelo esta a punto de repetir es la ultima.
+  const ordinals = lines.map(l => Number(l.match(/^#(\d+)/)[1]))
+  assert.deepEqual(
+    ordinals,
+    Array.from({ length: N }, (_, i) => N + 1 - i),
+    'debe conservar las mas recientes, en orden descendente'
+  )
+  assert.equal(ordinals.includes(1), false, 'la mas vieja es la que sale, no una del medio')
+
+  // El recorte tiene que ser por ENTRADAS, no por bytes. Con maxBytes practicamente
+  // infinito el tope sigue siendo 40: si alguien borrara el slice de maxEntries, aqui
+  // saldrian 41. Y sin esta separacion el test seguiria verde midiendo el tope equivocado
+  // el dia que una entrada engorde hasta que los 6000 B muerdan primero.
+  const sinTopeDeBytes = buildToolHistoryLedger(historiaDistinta(N + 1), { maxBytes: 1_000_000 })
+  assert.equal(entryLines(sinTopeDeBytes).length, N, 'el tope de entradas debe morder aunque sobren bytes')
+  assert.match(sinTopeDeBytes, /omitted/)
+
+  // Y que el caso por defecto de arriba tampoco estuviera midiendo bytes: ~1,8 KB reales
+  // contra un tope de 6000 B.
+  assert.ok(
+    Buffer.byteLength(pasado) < 4000,
+    `el bloque midio ${Buffer.byteLength(pasado)} B: se acerco al tope de bytes y este test ya no mide el de entradas`
+  )
+})
+
 test('ledger: el bloque nunca pasa su tope de bytes', () => {
   const messages = []
   for (let i = 1; i <= 60; i++) {
