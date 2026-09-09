@@ -160,8 +160,20 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
     const signature = sha256Encrypt(base64Content)
 
     try {
-        if (mediaType === 'image' && imgCacheManager.cacheIsExist(signature)) {
-            return buildNormalizedMediaItem(mediaType, imgCacheManager.getCache(signature).url)
+        if (mediaType === 'image') {
+            // UNA sola consulta, y se comprueba el status. `cacheIsExist` + `getCache` son
+            // dos comprobaciones independientes: desde que el modo file BORRA las entradas
+            // caducadas (img-caches.js#cacheIsExist) la entrada puede desaparecer entre las
+            // dos —— otro worker del cluster PM2 la caduca, o el propio TTL vence en medio
+            // —— y `getCache` devuelve `{status:404,url:null}`. Ese null se mandaba upstream
+            // como `{type:'image',image:null}`: una imagen que el modelo nunca ve, sin un
+            // solo error por nuestro lado. Antes del borrado perezoso la ventana no existia.
+            // De paso ahorra la segunda lectura de disco que el modo file pagaba en cada
+            // acierto (getCache ya llama a cacheIsExist por dentro).
+            const hit = imgCacheManager.getCache(signature)
+            if (hit && hit.status === 200 && typeof hit.url === 'string' && hit.url) {
+                return buildNormalizedMediaItem(mediaType, hit.url)
+            }
         }
 
         const buffer = Buffer.from(base64Content, 'base64')
