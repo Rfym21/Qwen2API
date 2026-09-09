@@ -32,6 +32,66 @@ const unwrapExactTag = (value, openTag, closeTag) => {
   return matched ? matched[1].trim() : null
 }
 
+const countOccurrences = (haystackLower, needle) => {
+  const needleLower = needle.toLowerCase()
+  let count = 0
+  let index = 0
+  while ((index = haystackLower.indexOf(needleLower, index)) !== -1) {
+    count += 1
+    index += needleLower.length
+  }
+  return count
+}
+
+/**
+ * Un único par bien formado con texto alrededor: se acepta y se conserva TODO, sin tags.
+ *
+ * Medido en vivo (2026-09-08, qwen3.8-max, celda F de probe-matrix con LOG_LEVEL=INFO):
+ * de 5 rechazos del gate en /v1/chat/completions, 3 fueron `invalid_control` y los 3
+ * tenían la misma forma — prosa de razonamiento filtrada al canal de respuesta y, detrás,
+ * un `<agent_final>Magenta</agent_final>` perfectamente bien formado. La respuesta era
+ * correcta y completa; el ancla `$` de unwrapExactTag la tiraba, y sin cupo de rendición
+ * esa familia quemaba los 3 intentos y salía como HTTP 429 (~1 de cada 4 peticiones).
+ *
+ * Se conservan las dos mitades en vez de quedarse sólo con el cuerpo por dos razones:
+ * es exactamente lo que el gemelo Anthropic ya entrega hoy (createAgentTagStripper, cuyo
+ * comentario dice que juzgar "prosa + envoltorio" como inválido sólo hace fallar el turno
+ * entero), y porque el propio proxy antepone markdown de imagen al `answer` antes de este
+ * parse (openai-agent-runtime.js#appendAnswer): quedarse con el cuerpo borraría la imagen.
+ *
+ * Lo que NO se tolera, porque es ambiguo de verdad y no un resbalón de formato: tags
+ * desbalanceados, más de un par, y las dos familias a la vez. Esas siguen en
+ * `invalid_control` — pero ya no son fatales: el gate tiene cupo de rendición.
+ */
+const unwrapSinglePairWithSurroundings = (trimmed) => {
+  const lower = trimmed.toLowerCase()
+  const families = [
+    { kind: 'final', open: AGENT_FINAL_OPEN, close: AGENT_FINAL_CLOSE },
+    { kind: 'blocked', open: AGENT_BLOCKED_OPEN, close: AGENT_BLOCKED_CLOSE }
+  ].map(family => ({
+    ...family,
+    opens: countOccurrences(lower, family.open),
+    closes: countOccurrences(lower, family.close)
+  }))
+
+  const present = families.filter(family => family.opens > 0 || family.closes > 0)
+  // Las dos familias a la vez: el turno declara "terminé" y "estoy bloqueado" en la misma
+  // respuesta. No hay lectura correcta, así que se regenera.
+  if (present.length !== 1) return null
+
+  const [family] = present
+  if (family.opens !== 1 || family.closes !== 1) return null
+
+  const openIndex = lower.indexOf(family.open.toLowerCase())
+  const closeIndex = lower.indexOf(family.close.toLowerCase())
+  if (openIndex > closeIndex) return null
+
+  const body = trimmed.slice(openIndex + family.open.length, closeIndex)
+  const before = trimmed.slice(0, openIndex)
+  const after = trimmed.slice(closeIndex + family.close.length)
+  return { kind: family.kind, text: `${before}${body}${after}`.trim() }
+}
+
 /**
  * Agent 请求的可见输出必须明确声明本回合是“已完成”还是“需要用户输入”。
  * 工具调用由 tool-prompt 解析器先行抽取，因此这里仅处理剩余文本。
@@ -46,6 +106,9 @@ const parseAgentControlText = (value) => {
 
   const blockedText = unwrapExactTag(trimmed, AGENT_BLOCKED_OPEN, AGENT_BLOCKED_CLOSE)
   if (blockedText !== null) return { kind: 'blocked', text: blockedText }
+
+  const tolerated = unwrapSinglePairWithSurroundings(trimmed)
+  if (tolerated) return tolerated
 
   if (/<\/?agent_(?:final|blocked)>/i.test(trimmed)) {
     return { kind: 'invalid_control', text: trimmed }
@@ -296,7 +359,11 @@ const buildAgentRetryHint = (reason = 'incomplete') => {
   const reasonText = {
     empty: 'The previous attempt ended without a visible answer or executable tool call.',
     bare: 'The previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.',
-    invalid_control: 'The previous attempt used a malformed or mixed Agent completion wrapper.',
+    // El desanclaje de unwrapSinglePairWithSurroundings dejó a invalid_control significando
+    // una sola cosa: tags desbalanceados, duplicados o de las dos familias a la vez. El hint
+    // tiene que nombrar ESA restricción — el texto anterior ("malformed or mixed wrapper") no
+    // le decía al modelo qué arreglar, y por eso los 3 intentos fallaban idénticos.
+    invalid_control: `The previous attempt left the completion wrapper unbalanced, or emitted more than one. Use exactly one ${AGENT_FINAL_OPEN}...${AGENT_FINAL_CLOSE} pair (or exactly one ${AGENT_BLOCKED_OPEN}...${AGENT_BLOCKED_CLOSE}), never both and never two of either — both tags of the pair must be present.`,
     invalid_tool_call: 'The previous attempt contained an invalid, truncated, or unknown tool call.',
     required_tool: 'The previous attempt violated tool_choice and did not call the required tool.',
     intercepted: `Your tool call did not reach the client. Re-emit it now using EXACTLY the \`${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}\` format as the first content of your answer — never any other format.`,

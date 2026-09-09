@@ -13,6 +13,7 @@ const {
   parseAgentControlText,
   createAgentControlStreamParser,
   createAgentTagStripper,
+  stripAgentTags,
   buildAgentRetryHint,
   // Guarda de fuga del canal de texto: una sola implementacion, compartida con
   // anthropic.js (spec agent-turn-cutoff-openai-parity). El `tag` de log es parametro.
@@ -700,7 +701,12 @@ const exhaustedError = (attempt, retryReason) => {
     malformed_protocol: '上游持续返回残缺的工具调用协议，未能恢复为可执行调用'
   }
   return {
-    status: 429,
+    // 502, no 429. Nada de esto fue un límite de tasa: es un desacuerdo de protocolo con el
+    // upstream. Con 429, chat.js#writeOpenAIHttpError lo etiquetaba `rate_limit_error`, y un
+    // cliente agéntico lee eso como "te están limitando, échate atrás y reintenta el turno
+    // entero" — multiplicando el gasto de cuota de la cuenta contra la que ya se falló.
+    // El 429 real (Qwen RateLimited) sigue saliendo por chat.image.video.js.
+    status: 502,
     message: messages[retryReason] || '上游未能生成有效的 Agent 回合',
     code: retryReason === 'invalid_tool_call' ? 'invalid_tool_call' : 'upstream_agent_turn_incomplete'
   }
@@ -852,6 +858,38 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       chatId: retryResponse.chatId,
       currentAccount: retryResponse.currentAccount
     })
+  }
+
+  // Cupo de rendición para invalid_control — la única familia de rechazo que no tenía uno.
+  // `intercepted`/`malformed_protocol` ya se entregan por las bravas tras gastar
+  // protocol_recovery_used; `bare` conserva a propósito su veto (no fabricar una conclusión
+  // que el modelo no declaró). invalid_control es distinto de los dos: el modelo SÍ declaró
+  // el cierre, sólo escribió mal el envoltorio, así que hay una respuesta real que entregar
+  // y matar el turno con un error HTTP es la peor de las salidas para un cliente agéntico.
+  // Se pelan los tags: un `<agent_final>` crudo en el texto del asistente es fuga medida.
+  //
+  // Sobre la regla de config/index.js:58 ("耗尽后必须显式失败，绝不能伪装成 finish_reason=stop"):
+  // no se la salta. Esa regla prohíbe fabricar una conclusión que el modelo NO declaró — que es
+  // exactamente lo que sigue vetado en `bare` y en `empty`. Aquí el modelo sí declaró el cierre
+  // (emitió el tag); sólo escribió mal el envoltorio. Entregar su conclusión no es disfrazar nada.
+  if (lastEvaluation?.retryReason === 'invalid_control') {
+    const salvaged = stripAgentTags(String(lastAttempt?.visibleText || '')).trim()
+    if (salvaged) {
+      logger.warn(
+        `Agent 回合门禁在 invalid_control 上耗尽 ${attemptsMade} 次尝试，剥离包装标签后按原样交付`,
+        'AGENT'
+      )
+      return {
+        ok: true,
+        // residueSpans quedan en coordenadas del visibleText VIEJO; tras pelar los tags ya no
+        // apuntan a donde creen. Pelar por offsets equivocados corrompe el texto, así que se
+        // descartan (un residuo huérfano habría dado malformed_protocol, no invalid_control).
+        attempt: { ...lastAttempt, visibleText: salvaged, controlKind: 'final', residueSpans: [] },
+        finishReason: 'stop',
+        attempts: attemptsMade,
+        suppressVisibleText: false
+      }
+    }
   }
 
   return {

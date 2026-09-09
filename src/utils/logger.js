@@ -101,7 +101,22 @@ class Logger {
    * @returns {boolean}
    */
   shouldLog(level) {
-    return this.levels[level] >= this.levels[this.options.level]
+    // El `.env` de este repo trae `LOG_LEVEL=info` en minúsculas. `levels['info']` es
+    // undefined y `undefined >= 1` es false, así que TODA la salida quedaba apagada —
+    // incluido el único rastro que deja en producción el gate de Agent
+    // (`Agent attempt N/M 被回合门禁拒绝 (...)`). Un nivel desconocido cae a INFO en vez
+    // de silenciar: un valor mal escrito no puede apagar la observabilidad entera.
+    return this.resolveLevel(level) >= this.resolveLevel(this.options.level)
+  }
+
+  /**
+   * Normaliza un nivel a su peso numérico. Acepta cualquier caja; desconocido → INFO.
+   * @param {string} level
+   * @returns {number}
+   */
+  resolveLevel(level) {
+    const key = String(level || '').toUpperCase()
+    return Object.hasOwn(this.levels, key) ? this.levels[key] : this.levels.INFO
   }
 
   /**

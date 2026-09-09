@@ -629,7 +629,11 @@ test('strict non-stream Agent gate returns an HTTP error instead of a fake compl
 
   assert.equal(retries, 1)
   assert.ok(processingHeartbeats > 0)
-  assert.equal(res.statusCode, 429)
+  // 502, no 429: sigue siendo un error HTTP (que es lo que este test defiende — nunca una
+  // conclusión fabricada), pero deja de anunciarse como límite de tasa. Con 429,
+  // writeOpenAIHttpError lo etiquetaba `rate_limit_error` y un cliente agéntico reintentaba
+  // el turno entero contra la cuenta con la que acababa de fallar.
+  assert.equal(res.statusCode, 502)
   const payload = JSON.parse(res.output)
   assert.equal(payload.error.code, 'upstream_agent_turn_incomplete')
   assert.equal(Object.hasOwn(payload, 'choices'), false)
@@ -1005,7 +1009,21 @@ test('externalized single-message Agent context keeps the original task outside 
 test('Agent completion control parser rejects bare and mixed completion claims', () => {
   assert.deepEqual(parseAgentControlText('<agent_final>done</agent_final>'), { kind: 'final', text: 'done' })
   assert.equal(parseAgentControlText('done').kind, 'bare')
-  assert.equal(parseAgentControlText('prefix <agent_final>done</agent_final>').kind, 'invalid_control')
+  // `prefix <agent_final>done</agent_final>` era invalid_control aquí, y ese veto es el que
+  // producía el HTTP 429 "1 de cada 4" de /v1/chat/completions con tools: medido en vivo el
+  // 2026-09-08 (3 de 3 invalid_control observados eran prosa de razonamiento filtrada + un
+  // par perfectamente bien formado, con la respuesta correcta dentro). Ahora se acepta y se
+  // conservan las dos mitades sin tags — paridad con el gemelo Anthropic. Detalle completo y
+  // los casos que SIGUEN rechazándose: tests/openai-agent-gate-429.test.js.
+  assert.deepEqual(
+    parseAgentControlText('prefix <agent_final>done</agent_final>'),
+    { kind: 'final', text: 'prefix done' }
+  )
+  // Lo genuinamente ambiguo sigue vetado: dos familias en el mismo turno.
+  assert.equal(
+    parseAgentControlText('x <agent_final>a</agent_final> <agent_blocked>b</agent_blocked>').kind,
+    'invalid_control'
+  )
 })
 
 test('Agent completion control stream parser handles split tags and trims only wrapper edges', () => {
