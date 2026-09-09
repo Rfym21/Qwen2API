@@ -1864,7 +1864,10 @@ const callShape = (calls) => calls.map(c => [c.function.name, JSON.parse(c.funct
 // tal cual: ninguna de las dos vias puede esconder un closer que la otra deja visible
 // (review loop 2: el strip incondicional enmascaraba closers doblados que solo streaming
 // dejaba en el wire).
-const ORPHAN_BRACKET_CLOSER_RE = /\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i
+// El brazo del ordinal (` #3`) es el mismo que TOOL_CALL_CLOSE_BRACKET_RE: la historia
+// foldeada ensena `[TOOL CALL #n]` y el modelo espeja `[END TOOL CALL #n]`. Si este
+// mirror no lo lleva, assertParity deja de reconocer ese closer como span pelado.
+const ORPHAN_BRACKET_CLOSER_RE = /\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}(?:[ \t]{0,4}#[ \t]{0,2}\d{1,6})?[ \t\r\n]{0,4}\]/i
 const BARE_CLOSER_SPAN_RE = new RegExp(`^${ORPHAN_BRACKET_CLOSER_RE.source}$`, 'i')
 
 /**
@@ -2314,13 +2317,26 @@ test('loop 2 (P6): closer DOBLADO tras un rechazo duro en primer contenido se co
   assert.equal(wholeCanonical.errors[0]?.type, 'unknown_tool')
   assert.equal(stripToolCallResidue(wholeCanonical.cleanedText, wholeCanonical.residueSpans).trim(), '')
   assert.doesNotMatch(streamChunked(canonical, NARRATED_OPTS, 9).visible, /\[END/)
+  // Mismo par, con el ordinal que la historia foldeada ensena (`[TOOL CALL #n]`): el
+  // modelo espeja el numero tambien en el cierre. Antes del brazo del ordinal el espacio
+  // previo al '#' hacia que el closer no se reconociera y llegara al cliente.
+  const numbered = '[TOOL CALL #2]{"name":"NotATool","arguments":{}}[END TOOL CALL #2]\n[END TOOL CALL #2]'
+  const wholeNumbered = assertParity(numbered, NARRATED_OPTS, 'loop2 hard reject doubled (numerado)')
+  assert.equal(wholeNumbered.errors[0]?.type, 'unknown_tool')
+  assert.equal(stripToolCallResidue(wholeNumbered.cleanedText, wholeNumbered.residueSpans).trim(), '')
+  assert.doesNotMatch(streamChunked(numbered, NARRATED_OPTS, 9).visible, /\[END/)
 })
 
 test('loop 2 (P8): closer doblado tras un trigger despues de prosa — filas 1/5/6 — se consume en ambas vias', () => {
   const rows = [
     ['fila 1', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', NARRATED_OPTS, 1],
     ['fila 5', 'Note:\n[TOOL CALL]{"name":"Bash","arguments":{}}[END TOOL CALL]\n[END TOOL CALL]', NARRATED_OPTS, 0],
-    ['fila 6', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', { allowedToolNames: NARRATED_ALLOWED }, 0]
+    ['fila 6', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', { allowedToolNames: NARRATED_ALLOWED }, 0],
+    // Las mismas tres filas con el ordinal espejado en AMBOS marcadores: es la forma que
+    // el modelo lee en cada vuelta desde que foldToolMessages numera la historia.
+    ['fila 1 #n', 'Let me check.\n[TOOL CALL #1]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL #1]\n[END TOOL CALL #1]', NARRATED_OPTS, 1],
+    ['fila 5 #n', 'Note:\n[TOOL CALL #4]{"name":"Bash","arguments":{}}[END TOOL CALL #4]\n[END TOOL CALL #4]', NARRATED_OPTS, 0],
+    ['fila 6 #n', 'Let me check.\n[TOOL CALL #9]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL #9]\n[END TOOL CALL #9]', { allowedToolNames: NARRATED_ALLOWED }, 0]
   ]
   for (const [row, text, options, calls] of rows) {
     const whole = assertParity(text, options, `loop2 doubled ${row}`)

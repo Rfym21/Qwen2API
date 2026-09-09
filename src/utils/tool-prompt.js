@@ -113,10 +113,31 @@ const TOOL_CALL_CLOSE_BARE_RE = /^<[ \t]{0,4}\/[ \t]{0,4}tool_calls?/i;
 // 装饰段同时排除 '[' 和 ']'：consumeTrailingCloser 的 grow 判据把内部的 '['
 // 当成"这段永远成不了闭标记"的证据（`!slice.includes('[', 1)`），正则这一半也必须认同，
 // 否则 `[END TOOL CALL[[[]` 在正则里算闭标记、在 grow 判据里不算，两半自相矛盾。
-const TOOL_CALL_CLOSE_BRACKET_RE =
-  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i;
-const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
-  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?/i;
+//
+// **序号臂**（`#3`）。foldToolMessages 把历史里的调用块写成 `[TOOL CALL #n]`，模型每一轮
+// 都读得到它，而这个文件的开头就写着"模型几乎每次都把标签写坏"、以及当年它正是从读到的
+// 形状里学会了 `<tool_call_id_1>` 那一族。镜像回一个 `[END TOOL CALL #3]` 是最自然的模仿，
+// 而装饰段 `[^\s[\]]{0,16}` **排除空白**，跨不过 '#' 前面那个空格：实测 `[END TOOL CALL#7]`
+// 认得出来，`[END TOOL CALL #7]`（正是我们教出去的那个空格）认不出来 —— 闭标记原样交付给
+// 客户端，stripToolCallResidue 没有 span 可删（交付层绝无第二套扫描），
+// containsOrphanProtocolResidue 也返回 false，连 malformed_protocol 重试都不会触发。
+// 所以这里只放宽到**一段数字**：空白 + '#' + 一串数字，绝不认单词。放数字进来不会咬到
+// 回答（散文里不会出现 `[END TOOL CALL #12]`；`[END TOOL CALL #3 我的回答]` 里序号之后
+// 不是 ']'，整条仍然匹配不上，回答完好），放单词进来会（见 :103-105 的纪律：宁可漏出
+// 闭标记，也绝不吃掉模型的回答）。位数取 6 而不是 4：这个上界唯一的失效方式是
+// foldToolMessages 的序号涨过它 —— 那正是本次修的这个静默泄漏，宁可给足余量；而多几位
+// 数字对"吃掉回答"的风险恰好是零。序号里既没有 '[' 也没有 ']'，与上面 grow 判据的那条
+// 约定仍然一致。裸臂必须**同步**放宽：流尾停在 `[END TOOL CALL #3`（少一个 ']'）时，
+// 裸臂要求"匹配之后什么都不剩"，不带序号就永远剩下 `#3`，闭标记照样漏。
+const TOOL_CALL_CLOSE_ORDINAL = '(?:[ \\t]{0,4}#[ \\t]{0,2}\\d{1,6})?';
+const TOOL_CALL_CLOSE_BRACKET_RE = new RegExp(
+  `^\\[[ \\t]{0,4}(?:END[ \\t_-]{1,2}|\\/[ \\t]{0,4})TOOL[ \\t_-]{1,2}CALLs?[^\\s[\\]]{0,16}${TOOL_CALL_CLOSE_ORDINAL}[ \\t\\r\\n]{0,4}\\]`,
+  'i'
+);
+const TOOL_CALL_CLOSE_BRACKET_BARE_RE = new RegExp(
+  `^\\[[ \\t]{0,4}(?:END[ \\t_-]{1,2}|\\/[ \\t]{0,4})TOOL[ \\t_-]{1,2}CALLs?${TOOL_CALL_CLOSE_ORDINAL}`,
+  'i'
+);
 // 配平点之后、闭标记之前的**闭合残渣**：模型多写了一层 `}` / `]`。实测 2026-09-06
 // （Claude Code 经 /v1/messages）：`{"name":"Bash","arguments":{…}}}\n[END TOOL CALL]`
 // —— 多出的 '}' 让闭标记不再“紧邻”，调用按无闭标记收尾，'}' 作为正文放出，随后的
@@ -126,9 +147,10 @@ const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
 const TRAILING_DEBRIS_MAX = 8;
 // 上界是两种闭标记里更长的那个。两个都是手写的镜像字面量，必须和上面的正则**用眼睛**保持
 // 同步 —— 这是这种写法的固有风险。当前方括号臂（63）其实盖过尖括号臂（58），而方括号闭标记
-// 最长也就 42 个字符，本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，
-// 就算它写短了也咬不出 bug（除非有人把两个臂同时改短到 42 以下）。真要收紧成一个精确不变式，
-// 得把常量导出、在测试里断言"正则匹配长度 ≤ MAX"。
+// 最长 55 个字符（21 关键字 + 16 装饰 + 13 序号 + 4 空白 + 1 闭括号，序号臂加进来之后重算过），
+// 本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，就算它写短了也咬不出
+// bug（除非有人把两个臂同时改短到 55 以下）。这条不变式不再只靠眼睛：
+// tests/tool-correlation.test.js 钉了"最长的带序号闭标记仍然落在窗口里被吞掉"。
 const TOOL_CALL_CLOSE_MAX = Math.max(
   '</    tool_calls'.length + 42,
   '[    END  TOOL  CALLS'.length + 42
@@ -574,6 +596,12 @@ const consumeMandatoryBracketCloser = (text, from, canGrow) => {
  * flush 专用：closerSwallow 状态下，流死在半个**重复**闭标记上（`[END TOOL C` + EOF）。
  * 只认规范拼写的字面前缀（大小写不敏感，空格/下划线/连字符三种分隔，至少 1 个字符）；
  * 判不准宁可当正文放行 —— 吞掉真实回答比漏出半个标记更糟。
+ *
+ * 序号臂在这里是**第三面镜子**（正则臂、裸臂、字面量表）。流刚好断在 `[END TOOL CALL #`
+ * 上时：关键字写全了，裸臂却因为剩下一个 '#' 而不成立，字面量表也没有一条以 `#` 结尾 ——
+ * 于是半个闭标记漏进正文，而且因为缺 ']'，containsOrphanProtocolResidue 连重试都不点。
+ * 所以先把行尾的 `#<数字>`（数字可以还没到）摘掉再比字面量。摘除锚在行尾，
+ * `[END TOOL CALL and #3 items` 这类多词散文摘不掉也匹配不上，照旧当正文放行。
  * @param {string} value - flush 时 pendingText 从第一个非空白字符起的尾巴
  * @returns {boolean}
  */
@@ -581,10 +609,11 @@ const CLOSER_PREFIX_LITERALS = [
   'END TOOL CALLS', 'END_TOOL_CALLS', 'END-TOOL-CALLS',
   '/TOOL CALLS', '/TOOL_CALLS', '/TOOL-CALLS'
 ];
+const DANGLING_ORDINAL_TAIL_RE = /[ \t]{0,4}#[ \t]{0,2}\d{0,6}$/;
 const isDanglingCloserPrefix = (value) => {
   const match = value.match(/^([[<])[ \t]{0,4}([^\r\n]*)$/);
   if (!match) return false;
-  const rest = match[2].toUpperCase();
+  const rest = match[2].toUpperCase().replace(DANGLING_ORDINAL_TAIL_RE, '');
   if (rest.length === 0 || rest.length > TOOL_CALL_CLOSE_MAX) return false;
   return CLOSER_PREFIX_LITERALS.some(literal => literal.startsWith(rest));
 };

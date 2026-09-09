@@ -15,7 +15,13 @@
  *      re-issue the identical call
  *   D  stop_reason: tool_use on a tool turn, end_turn on a final answer
  *   E  every emitted tool_use id carries the path's native prefix
- *   F  no [TOOL CALL] / [END TOOL CALL] / <agent_final> leaks into visible text
+ *   F  no tool-protocol marker leaks into visible text — the BARE forms
+ *      ([TOOL CALL] / [END TOOL CALL] / <agent_final>) and the NUMBERED family
+ *      ([TOOL CALL #3] / [END TOOL CALL #3]). foldToolMessages writes the
+ *      numbered opener into every folded history block, so this cell is also
+ *      the acceptance gate for the open question: does Qwen imitate the
+ *      ordinal? The printed value is the exact text that leaked, so a PASS
+ *      means "not imitated or fully consumed" and a FAIL names the form.
  *   G  the same six cells against /v1/chat/completions (call_ prefix, tool_calls)
  *
  * D, E and F are read off the responses A/B/C already paid for — the probe
@@ -50,7 +56,22 @@ const FILES = [
 const BASH_CMD = 'git status --short'
 const BASH_OUT = '?? notes.txt'
 // </agent_final> is the same leak class as its opener, so it is in the list too.
-const LEAK_MARKERS = ['[TOOL CALL]', '[END TOOL CALL]', '<agent_final>', '</agent_final>']
+//
+// Patterns, not literals: the folded history teaches `[TOOL CALL #n]`, and the
+// natural imitation mirrors the ordinal onto the closer (`[END TOOL CALL #3]`).
+// A literal scan reports "clean" on exactly the form that leaked in production,
+// which is how the blind spot survived the unit suite in the first place. The
+// decoration class stops at ']' and at the end of the line so a marker mentioned
+// inside a sentence still gets named rather than swallowing the sentence.
+const LEAK_PATTERNS = [
+  // `(?!\()` drops `[tool calls](https://…)`, an ordinary markdown link. The parser
+  // deliberately refuses this lookahead (a stream can split before the '(' and the two
+  // parse paths would then disagree — tool-prompt.js:78-81); the probe sees whole
+  // responses, so here it is safe and it keeps the gate from failing on prose.
+  ['tool-call marker', /\[[ \t]{0,4}tool[ \t_-]{1,2}calls?[^\]\r\n]{0,24}\](?!\()/gi],
+  ['tool-call closer', /\[[ \t]{0,4}(?:end[ \t_-]{1,2}|\/[ \t]{0,4})tool[ \t_-]{1,2}calls?[^\]\r\n]{0,24}\]/gi],
+  ['agent_final', /<\/?[ \t]{0,4}agent_final[^>\r\n]{0,24}>/gi]
+]
 
 const READ_DESC = 'Read a file from disk'
 const BASH_DESC = 'Run a shell command'
@@ -253,15 +274,22 @@ async function runPath (adapter, prefix) {
     ids.length > 0 && badId === undefined,
     ids.length === 0 ? 'no tool ids observed' : `n=${ids.length} ${badId === undefined ? `sample=${ids[0]}` : `bad=${badId}`}`)
 
-  // F — protocol residue in delivered text.
+  // F — protocol residue in delivered text. The observed value carries the exact
+  // leaked text (not just the cell), because whether the ordinal shows up in it is
+  // the one question the unit suite cannot answer.
   const leaks = []
   for (const { cell, response } of seen) {
-    for (const marker of LEAK_MARKERS) {
-      if (response.text.includes(marker)) leaks.push(`${cell}:${marker}`)
+    for (const [, pattern] of LEAK_PATTERNS) {
+      for (const hit of String(response.text || '').match(pattern) || []) {
+        leaks.push(`${cell}:${JSON.stringify(hit)}`)
+      }
     }
   }
+  const numbered = leaks.filter(l => /#[ \t]{0,2}\d/.test(l))
   emit('F', 'no protocol markers in visible text', leaks.length === 0,
-    leaks.length === 0 ? `clean over ${seen.length} responses` : `leaks=${[...new Set(leaks)].join(' ')}`)
+    leaks.length === 0
+      ? `clean over ${seen.length} responses`
+      : `leaks=${[...new Set(leaks)].join(' ')}${numbered.length ? ' ORDINAL-IMITATED' : ''}`)
 
   return cells
 }
