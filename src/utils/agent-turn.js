@@ -349,7 +349,18 @@ const neutraliseResultMarkers = (value) => String(value)
   .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
   // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
   // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
-  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(');
+  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(')
+  // Las dos cabeceras del sobre (utils/request.js#parseAgentEnvelope) tambien son
+  // marcadores de protocolo, y desde que el ledger vive en el PREFIJO hay texto derivado
+  // de herramientas por DELANTE de la cabecera real. parseAgentEnvelope parte por
+  // `indexOf` en la historia (gana la PRIMERA) y por `lastIndexOf` en el mensaje actual
+  // (gana la ULTIMA), asi que un resultado que contenga la cadena literal mueve el corte:
+  // la cola del prefijo se reclasifica como historia y sus lineas se parsean como JSONL
+  // legitimo. Se rompe el `#` de cabecera, igual que arriba se rompe el `[` o el `<`.
+  // Un solo caracter ASCII por otro: la neutralizacion nunca alarga, asi que los topes
+  // de bytes del ledger se mantienen exactos.
+  .replace(/#(?=[ \t]{0,4}Conversation[ \t]+history[ \t]*\(JSONL\))/gi, '(')
+  .replace(/#(?=[ \t]{0,4}Current[ \t]+message\b)/gi, '(');
 
 const LEDGER_HEADER = '# Already executed this task';
 // La leyenda es lo unico que hace el bloque legible por si solo: llega al modelo lejos
@@ -369,6 +380,51 @@ const collapseToOneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').tr
 
 const truncateChars = (value, limit) =>
   value.length <= limit ? value : `${value.slice(0, limit - 1)}…`;
+
+/**
+ * El contenido de un mensaje de resultado, resumido para el digest del ledger.
+ *
+ * Existe porque el resultado de una herramienta **no siempre es texto**: el Read de
+ * Claude Code devuelve la imagen dentro de `tool_result.content`, y cada ruta la mueve a
+ * un sitio distinto antes de llegar aqui — la Anthropic la saca a `message.media` y deja
+ * `content: ''`; la OpenAI la deja como item dentro del array de `content`. Con
+ * `JSON.stringify(content)` como unica regla las dos rutas rendian textos DISTINTOS para
+ * la misma llamada (`(empty)` contra `[]`) y las dos mentian: decirle al modelo que un
+ * Read no devolvio nada, bajo una leyenda que le pide reusar el resultado en vez de
+ * repetir la llamada, es el empujon mas fuerte posible hacia el duplicado — y Read es la
+ * herramienta mas repetida de la medicion (802 de 1.451).
+ *
+ * Los items que no son texto se CUENTAN, nunca se serializan: un item de imagen lleva el
+ * data URI base64 completo y `JSON.stringify` lo metia crudo en el prompt (recortado a
+ * 120 caracteres, o sea base64 partido a la mitad haciendose pasar por el resultado).
+ *
+ * @param {Object} message - mensaje con role tool/function, en cualquiera de las dos formas
+ * @returns {{ text: string, attachments: number }}
+ */
+const summariseToolResultContent = (message) => {
+  const raw = message?.content;
+  // El bypass de medios de la ruta Anthropic (anthropic.js#flattenAnthropicMessages).
+  let attachments = Array.isArray(message?.media) ? message.media.length : 0;
+  let text = '';
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (Array.isArray(raw)) {
+    const texts = [];
+    for (const item of raw) {
+      if (typeof item === 'string') texts.push(item);
+      else if (item?.type === 'text' && typeof item.text === 'string') texts.push(item.text);
+      else if (item !== null && item !== undefined) attachments += 1;
+    }
+    text = texts.join('\n');
+  } else if (raw !== null && raw !== undefined) {
+    // Un objeto de verdad (resultado estructurado) sigue siendo su JSON.
+    text = JSON.stringify(raw);
+  }
+  return { text, attachments };
+};
+
+/** `(1 image)` / `(3 images)`: el digest DICE que hubo adjunto, sin poder cargarlo. */
+const attachmentNote = (count) => (count === 1 ? '(1 image)' : `(${count} images)`);
 
 /**
  * Las llamadas ya ejecutadas que viven en la historia, como bloque de texto.
@@ -415,6 +471,16 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
   // entrada porque una entrada agrupa varias instancias: sin el, el resultado de la
   // instancia #1 se le colgaria al ordinal de la instancia #3.
   const byCallId = new Map();
+  // nombre -> cola FIFO de instancias SIN id. La API legacy de funciones
+  // (`assistant.function_call` + `role:'function'`) no lleva id en ninguno de los dos
+  // lados, asi que el emparejamiento exacto por tool_call_id no puede existir: la rama
+  // `|| message.role === 'function'` de abajo estaba muerta y toda llamada legacy salia
+  // listada SIN resultado, bajo la leyenda que afirma que sus resultados ya estan arriba
+  // — mientras foldToolMessages si escribia su `[TOOL RESULT: Read]` dos lineas mas
+  // abajo. Solo entran aqui las instancias que no tienen NINGUN id: un id que no casa es
+  // un desajuste, no una ausencia, y sigue sin adjudicarse (eso seria la suplantacion que
+  // arregla la numeracion de Task 1).
+  const pendingByName = new Map();
   let ordinal = 0;
 
   for (const message of messages) {
@@ -460,23 +526,37 @@ const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } =
       // esta instancia" de "es de una anterior y la nueva sigue sin contestar".
       if (existing) existing.ordinal = ordinal;
       else byKey.set(key, { ordinal, name, args, digest: '', hasResult: false, digestOrdinal: 0 });
-      if (call?.id) byCallId.set(call.id, { key, ordinal });
+      if (call?.id) {
+        byCallId.set(call.id, { key, ordinal });
+      } else {
+        // Sin id: la unica correlacion posible es nombre + orden de llegada.
+        if (!pendingByName.has(name)) pendingByName.set(name, []);
+        pendingByName.get(name).push({ key, ordinal });
+      }
     }
 
     if (message.role === 'tool' || message.role === 'function') {
       // Sin tool_call_id que empareje no hay dueno. Adjudicar el resultado a otra llamada
       // seria exactamente la suplantacion que arregla la numeracion de Task 1.
-      const ref = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
+      let ref = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
+      // Solo cuando NO hay id que emparejar se cae al nombre, y solo contra las instancias
+      // que tampoco tenian id. FIFO: en el protocolo legacy cada llamada se contesta antes
+      // de emitir la siguiente, asi que la mas antigua sin contestar es la duena.
+      if (!ref && !message.tool_call_id && message.name) {
+        const queue = pendingByName.get(String(message.name));
+        if (queue && queue.length > 0) ref = queue.shift();
+      }
       const entry = ref ? byKey.get(ref.key) : null;
       if (!entry) continue;
       // Solo avanza si este resultado es de una instancia igual o mas nueva que la que ya
       // tenemos. Con los resultados en desorden, quedarse con el ULTIMO procesado dejaba el
       // digest de #1 pisando al de #2.
       if (ref.ordinal < entry.digestOrdinal) continue;
-      const content = typeof message.content === 'string'
-        ? message.content
-        : JSON.stringify(message.content ?? null);
-      entry.digest = truncateChars(collapseToOneLine(content), LEDGER_DIGEST_CHARS);
+      // El texto se recorta; los adjuntos se anuncian aparte y NUNCA se serializan.
+      const { text, attachments } = summariseToolResultContent(message);
+      const digestText = truncateChars(collapseToOneLine(text), LEDGER_DIGEST_CHARS);
+      const note = attachments > 0 ? attachmentNote(attachments) : '';
+      entry.digest = [digestText, note].filter(Boolean).join(' ');
       entry.hasResult = true;
       entry.digestOrdinal = ref.ordinal;
     }

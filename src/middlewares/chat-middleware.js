@@ -131,20 +131,28 @@ const processRequestBody = async (req, res, next) => {
     // （chat.image.video.js:1290-1313）。t2i/t2v 排除掉：那里 content 是纯文本提示词，
     // 收割会把它变成数组、塞进空的 '\n\n' 分隔符，还会为一张控制器根本不看的图付一次上传，
     // 顺带打断 '@16:9' 这类尺寸嗅探。
+    // El ledger se arma AQUI, antes de la cosecha: harvestCurrentTurnMedia reescribe
+    // `candidate.content` quitando los items de imagen, y un tool_result que solo traia la
+    // imagen (la forma exacta del Read de Claude Code) queda como `[]`. Construido
+    // despues, el digest sale `-> []` — le dice al modelo que el Read no devolvio nada,
+    // justo bajo la leyenda que le pide reusar el resultado en vez de repetir la llamada;
+    // Read es la herramienta mas repetida de la medicion (802 de 1.451). Gemelo de
+    // anthropic.js#buildInternalRequest, que por la misma razon lo arma antes de su
+    // barrido de medios (alli la imagen esta en el bypass `media`, no en `content`).
+    //
+    // Sigue siendo PRE-FOLD, que es el otro requisito: despues de foldToolMessages la
+    // llamada ya es texto (`[TOOL CALL #1]`) sin tool_calls ni tool_call_id que recorrer,
+    // y el ledger saldria vacio sin que nada lo delate.
+    const toolHistoryLedger = hasTools ? buildToolHistoryLedger(messages || []) : ''
+
     const currentTurnMedia = HARVEST_CHAT_TYPES.has(chatType)
       ? harvestCurrentTurnMedia(messages)
       : []
 
     let preparedMessages = messages
     let toolSystemPrompt = ''
-    let toolHistoryLedger = ''
     if (hasTools) {
       toolSystemPrompt = buildToolSystemPrompt(tools, { tool_choice })
-      // Sobre los mensajes CRUDOS, antes del fold: despues foldToolMessages deja la
-      // llamada como texto (`[TOOL CALL #1]`) sin tool_calls ni tool_call_id, y el ledger
-      // saldria vacio sin que nada lo delate. Gemelo de anthropic.js#buildInternalRequest,
-      // que lo arma sobre `flat` antes de su propio fold.
-      toolHistoryLedger = buildToolHistoryLedger(messages || [])
       // Semilla del ledger de deduplicacion del runtime (openai-agent-runtime.js), del
       // mismo recorrido pre-fold y con los mismos ordinales que ve el modelo. No suprime:
       // marca la llamada como ya ejecutada para poder registrarla. Gemelo de

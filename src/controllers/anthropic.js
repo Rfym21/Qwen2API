@@ -418,6 +418,21 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 1. 展开 Anthropic 消息（tool_use/tool_result 折叠由 foldToolMessages 完成）
   let flat = flattenAnthropicMessages(messages);
+  // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
+  const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
+  // El ledger se arma AQUI, antes del barrido de medios y del `delete message.media` que
+  // hay al final: la imagen de un tool_result viaja por el bypass `media` y unas lineas
+  // mas abajo desaparece de `flat`. Construido despues, el ledger no ve nada y renderiza
+  // `-> (empty)` — le dice al modelo que el Read no devolvio nada, justo bajo la leyenda
+  // que le pide reusar el resultado en vez de repetir la llamada; Read es la herramienta
+  // mas repetida de la medicion (802 de 1.451). Gemelo de chat-middleware.js, que por la
+  // misma razon lo arma antes de harvestCurrentTurnMedia (alli la imagen no esta en
+  // `media` sino como item del array de `content`, y la cosecha lo deja en `[]`).
+  //
+  // Sigue siendo PRE-FOLD, que es el otro requisito: despues de foldToolMessages la
+  // llamada ya es texto dentro de un string (`[TOOL CALL #1]`), sin tool_calls ni
+  // tool_call_id que recorrer, y el ledger saldria vacio sin ruido.
+  const toolLedger = hasTools ? buildToolHistoryLedger(flat) : '';
   // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
   // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
   // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
@@ -502,15 +517,7 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 2. system 文本拼到首条用户消息内容前缀（不要作为独立 system 消息，
   //    否则会被 parserMessages 折叠为 "system:..." 文字前缀污染模型理解）
-  // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
-  const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
   const toolPrompt = hasTools ? buildToolSystemPrompt(normalizedTools, { tool_choice: internalToolChoice }) : '';
-  // El ledger se arma sobre `flat` ANTES de foldToolMessages: despues del folding la
-  // llamada ya es texto dentro de un string (`[TOOL CALL #1]`), sin tool_calls ni
-  // tool_call_id que recorrer — el ledger saldria vacio y el bloque desapareceria sin
-  // ruido. Gemelo de chat-middleware.js#processRequestBody, que lo arma sobre `messages`
-  // antes de su propio fold; los dos caminos tienen que moverse juntos.
-  const toolLedger = hasTools ? buildToolHistoryLedger(flat) : '';
   // Semilla del ledger de deduplicacion, del MISMO recorrido pre-fold y con los mismos
   // ordinales que ve el modelo. No suprime nada: marca la llamada como ya ejecutada para
   // poder registrarla (los tres createToolCallLedger eran por-intento y jamas miraron la
@@ -562,6 +569,24 @@ const buildInternalRequest = async (anthropicReq) => {
   // Vive en el prefijo, que parseAgentEnvelope (utils/request.js) nunca externaliza: si
   // cayera dentro del bloque de historia, el contrapeso desapareceria justo en las
   // conversaciones largas, que son las que repiten llamadas.
+  //
+  // El sobre de turno se aplica ANTES del prefijo, igual que en el gemelo OpenAI
+  // (chat-middleware.js#processRequestBody). Al reves —que era como estaba— una peticion
+  // cuya historia entra en un solo mensaje no lleva el marcador `# Conversation history
+  // (JSONL)`, asi que ensureAgentCurrentEnvelope no cortocircuita y JSON-escapa el
+  // prefijo ENTERO (protocolo de herramientas + ledger) dentro de `# Current message`:
+  // el modelo recibe su contrato como `\n` literales dentro de un string, y el orden
+  // documentado (toolPrompt -> ledger -> envelope -> directive) queda invertido. Se
+  // alcanza con una peticion de UN mensaje; no hace falta ningun cambio futuro. Con
+  // historia el resultado es identico byte a byte: el marcador ya esta ahi y wrap()
+  // devuelve el texto tal cual.
+  if (hasTools && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
+    const lastForEnvelope = parsedMessages[parsedMessages.length - 1];
+    lastForEnvelope.content = ensureAgentCurrentEnvelope(
+      lastForEnvelope.content,
+      lastForEnvelope.role || 'user'
+    );
+  }
   const prefixParts = [systemText, toolPrompt, toolLedger].filter(Boolean);
   if (prefixParts.length > 0 && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
     const prefix = prefixParts.join('\n\n');
@@ -586,9 +611,7 @@ const buildInternalRequest = async (anthropicReq) => {
   // 5. Agent-loop injections (match OpenAI path ordering: envelope → prefix → directive)
   if (hasTools && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
     const last = parsedMessages[parsedMessages.length - 1];
-    const role = last.role || 'user';
-    // Wrap content with # Current message marker so upstream distinguishes turn from history
-    last.content = ensureAgentCurrentEnvelope(last.content, role);
+    // El sobre `# Current message` ya se aplico arriba, antes del prefijo (ver alli).
     // Append agent-turn directive after full content assembly
     const directive = buildAgentTurnDirective({ afterToolResult });
     if (typeof last.content === 'string') {
