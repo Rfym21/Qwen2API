@@ -26,6 +26,9 @@ const {
   buildAgentTurnDirective,
   buildToolHistoryLedger,
   extractHistoryToolCalls,
+  // Gemelo textual de chat-helpers.js#harvestCurrentTurnMedia: los dos caminos escriben
+  // la MISMA nota cuando sacan medios del cuerpo de un tool_result.
+  toolResultMediaNote,
   // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
@@ -446,7 +449,15 @@ const flattenAnthropicMessages = (messages) => {
         const toolResultMedia = Array.isArray(block.content)
           ? block.content.filter(b => b?.type === 'image').map(anthropicImageBlockToItem).filter(Boolean)
           : [];
-        if (toolResultMedia.length > 0) toolMessage.media = toolResultMedia;
+        if (toolResultMedia.length > 0) {
+          toolMessage.media = toolResultMedia;
+          // Y el cuerpo tiene que DECIRLO. Sin esto resultContent queda '' y
+          // foldToolMessages escribe `(empty)`: «el Read no devolvio nada», con la imagen
+          // viajando sin explicacion en files[]. Ver toolResultMediaNote (agent-turn.js)
+          // para la medicion y para por que la nota no promete que este adjunta.
+          const note = toolResultMediaNote(toolResultMedia.length);
+          toolMessage.content = resultContent ? `${resultContent}\n${note}` : note;
+        }
         out.push(toolMessage);
       } else if (block?.type === 'text' && typeof block.text === 'string') {
         collectedTextParts.push(block.text);

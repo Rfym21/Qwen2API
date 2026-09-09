@@ -1,6 +1,9 @@
 const { logger } = require('./logger')
 const { sha256Encrypt, generateUUID } = require('./tools.js')
 const { normalizeAllowedToolNames, ANSWER_PHASES } = require('./tool-prompt.js')
+// Nota compartida con controllers/anthropic.js: los dos escaneos gemelos escriben el
+// MISMO texto cuando sacan medios del cuerpo de un resultado de herramienta.
+const { toolResultMediaNote } = require('./agent-turn.js')
 // Referencia al módulo, no desestructurada: un binding desestructurado no se puede
 // sustituir desde un test y la prueba acabaría pegando a la red de verdad.
 const uploadModule = require('./upload.js')
@@ -758,9 +761,28 @@ const harvestCurrentTurnMedia = (messages) => {
         // 都只读 text，media 项对那份文档不可见 —— 5019f04 的提交信息在这一点上写错了。
         // 真正会把 base64 变成散文的是 foldToolMessages，那条路由上面的 willBeFolded 处理。
         const rest = candidate.content.filter(item => !isMediaContentItem(item))
-        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+        const collapsed = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
             ? rest[0].text
             : rest
+        if (candidate.role === 'tool' || candidate.role === 'function') {
+            // Gemelo textual de controllers/anthropic.js#flattenAnthropicMessages: si el
+            // cuerpo del resultado se queda sin nada, foldToolMessages escribe el literal
+            // `[]` (o `(empty)` si era string) = «la herramienta no devolvio nada», con el
+            // medio viajando sin explicacion en files[]. La nota dice lo que si es cierto.
+            const noun = carried.every(item => getMediaDescriptor(item)?.mediaType === 'image')
+                ? 'image'
+                : 'attachment'
+            const note = toolResultMediaNote(carried.length, noun)
+            // Se normaliza a string: el fold hace JSON.stringify de lo que no sea string,
+            // asi que pre-serializar el resto rinde el MISMO texto y ademas deja sitio a
+            // la nota. Un resultado de herramienta siempre se pliega (willBeFolded).
+            const existing = typeof collapsed === 'string'
+                ? collapsed
+                : (collapsed.length === 0 ? '' : JSON.stringify(collapsed))
+            candidate.content = existing ? `${existing}\n${note}` : note
+        } else {
+            candidate.content = collapsed
+        }
         harvested.unshift(...carried)
         // 上限按**项**算，不按消息算：一个正当的回合可以横跨几十条消息。倒着扫，所以留下的
         // 是最新的那些。这是保险，不是事故记录：需要它的病态形状（每条 assistant 都带

@@ -34,9 +34,10 @@ describe('image passthrough: tool_result blocks', () => {
   it('keeps a tool_result image alive through flattening instead of filtering it away', () => {
     const toolMessage = flattenAnthropicMessages(readTurn([imageBlock])).find(m => m.role === 'tool');
     assert.ok(toolMessage, 'tool_result must still become a role=tool message');
-    // resultContent stays exactly as today: text blocks only, so an image-only
-    // tool_result still yields an empty string here.
-    assert.equal(toolMessage.content, '');
+    // The body has to SAY an image came back. Leaving it '' made foldToolMessages write
+    // `(empty)` — "the Read returned nothing" — while the image rode along in files[].
+    // See tests/toolresult-image-note.test.js for the measurement.
+    assert.equal(toolMessage.content, '[1 image returned by this tool]');
     assert.deepEqual(toolMessage.media, [{ type: 'image_url', image_url: { url: IMG_URL } }]);
   });
 
@@ -45,7 +46,7 @@ describe('image passthrough: tool_result blocks', () => {
       { type: 'text', text: 'Read 1 image: magenta.png' },
       imageBlock
     ])).find(m => m.role === 'tool');
-    assert.equal(toolMessage.content, 'Read 1 image: magenta.png');
+    assert.equal(toolMessage.content, 'Read 1 image: magenta.png\n[1 image returned by this tool]');
     assert.deepEqual(toolMessage.media, [{ type: 'image_url', image_url: { url: IMG_URL } }]);
   });
 

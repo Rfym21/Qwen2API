@@ -1703,9 +1703,16 @@ const foldToolMessages = (messages) => {
       // Un resultado vacio NO es `null`: la herramienta corrio y devolvio nada. Escribir
       // `null` le dice al modelo que devolvio JSON null, que es otra cosa — y ahora se ve,
       // porque antes el mensaje entero desaparecia (ver el gate del fold en ambos caminos).
-      const content = typeof message.content === 'string'
-        ? (message.content || '(empty)')
-        : JSON.stringify(message.content ?? null);
+      // Un array vacio es el mismo hecho que un string vacio —la herramienta corrio y no
+      // devolvio nada— y `[]` no lo dice: se lee como un valor JSON de verdad. Llega asi
+      // cuando un escaneo de medios se lleva el unico item del cuerpo.
+      const isEmptyBody = message.content === '' ||
+        (Array.isArray(message.content) && message.content.length === 0);
+      const content = isEmptyBody
+        ? '(empty)'
+        : (typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content ?? null));
       // 认领不到调用就不编号：随便派一个序号等于指向**别人**的调用，比没有地址更坏。
       const open = ref ? numberedResultOpen(ref.ordinal) : TOOL_RESULT_OPEN;
       return {

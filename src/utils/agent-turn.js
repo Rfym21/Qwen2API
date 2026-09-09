@@ -475,11 +475,53 @@ const summariseToolResultContent = (message) => {
     // Un objeto de verdad (resultado estructurado) sigue siendo su JSON.
     text = JSON.stringify(raw);
   }
+  // La nota de medios se convierte en el contador, no en prosa del digest.
+  if (text) {
+    const kept = [];
+    for (const line of text.split('\n')) {
+      const noted = line.trim().match(TOOL_RESULT_MEDIA_NOTE_RE);
+      if (noted) attachments = Math.max(attachments, Number(noted[1]));
+      else kept.push(line);
+    }
+    text = kept.join('\n');
+  }
   return { text, attachments };
 };
 
 /** `(1 image)` / `(3 images)`: el digest DICE que hubo adjunto, sin poder cargarlo. */
 const attachmentNote = (count) => (count === 1 ? '(1 image)' : `(${count} images)`);
+
+/**
+ * Lo que el CUERPO del resultado dice cuando la herramienta devolvio medios.
+ *
+ * Medido 2026-09-08 contra Qwen real: un tool_result que solo trae un bloque image (lo
+ * EXACTO que manda Claude Code al hacer Read de una imagen) dejaba `resultContent` vacio,
+ * y foldToolMessages lo renderizaba como `(empty)`. La imagen SI llegaba a files[] —el
+ * cuerpo upstream era identico byte a byte al de un control que funciona, salvo ese texto—
+ * asi que el modelo leia «el Read no devolvio nada» con una imagen sin explicar al lado, y
+ * contestaba NO_IMAGE. El prompt ademas se contradecia: el ledger de agent-turn ya decia
+ * `-> (1 image)` para esa misma llamada.
+ *
+ * La nota NO dice «adjunta»: solo se sube el medio del ULTIMO turno (los dos escaneos
+ * gemelos), y aun ahi la deduplicacion por URL o HARVEST_MEDIA_CAP pueden descartarlo.
+ * Prometer un adjunto que el modelo no puede ver es peor que el `(empty)` que sustituye.
+ * Se queda en el hecho comprobable —la herramienta devolvio N medios— y concuerda con el
+ * digest del ledger.
+ *
+ * @param {number} count - cuantos medios traia el resultado
+ * @param {string} [noun] - 'image' salvo que el resultado traiga algo que no sea imagen
+ * @returns {string} la linea que sustituye/acompana al cuerpo del resultado
+ */
+const toolResultMediaNote = (count, noun = 'image') =>
+  `[${count} ${noun}${count === 1 ? '' : 's'} returned by this tool]`;
+
+// La MISMA nota, reconocida de vuelta. El digest del ledger tiene que contar el adjunto
+// una sola vez: segun el camino, la nota llega ya escrita en el cuerpo (Anthropic, y
+// OpenAI despues del harvest) o el medio sigue como item del array (OpenAI antes). Sin
+// esto la linea del ledger diverge entre rutas y ademas se lee `-> [1 image returned by
+// this tool] (1 image)`. Un cuerpo no confiable puede falsificar la linea, pero lo unico
+// que consigue es inflar un contador del ledger: no es un marcador de protocolo.
+const TOOL_RESULT_MEDIA_NOTE_RE = /^\[(\d+) (?:image|attachment)s? returned by this tool\]$/;
 
 /**
  * Las llamadas ya ejecutadas que viven en la historia, como bloque de texto.
@@ -909,6 +951,10 @@ module.exports = {
   // razonamiento de anthropic.js corta igual que el digest del ledger de aqui.
   trimLoneSurrogates,
   buildToolHistoryLedger,
+  // El cuerpo del resultado cuando la herramienta devolvio medios. Lo usan los DOS
+  // caminos (controllers/anthropic.js#flattenAnthropicMessages y
+  // utils/chat-helpers.js#harvestCurrentTurnMedia) para no divergir en el texto.
+  toolResultMediaNote,
   extractHistoryToolCalls,
   createToolCallLedger,
   isRejectedTextCallWarning,
