@@ -16,6 +16,59 @@
  * back now.
  *
  * ---------------------------------------------------------------------------
+ * MEASURED 2026-09-08 — READ THIS BEFORE SPENDING A SINGLE REQUEST.
+ *
+ * THE PRE-FIX ARM DOES NOT REPRODUCE THE BUG. 24 upstream requests, qwen3.8-max,
+ * pre-fix service at 309da59 (no numbering, no ledger) and post-fix at 785486d:
+ *
+ *   arm        stratum                                  REPEATED  tool-emission
+ *   pre-fix    95b7b0c1, budget 48, collisions p50=6       0/8          100%
+ *   pre-fix    33f8544e, budget 90, collisions p50=44      0/8          100%
+ *   post-fix   95b7b0c1, the same 8 byte-identical cells   0/8          100%
+ *
+ * The null is NOT the vacuous one that made probe cell C worthless. Tool-emission
+ * was 100% in every arm: the model engaged on every cell and chose a DIFFERENT
+ * call. The instrument was audited against this exact failure mode — prefixSigs
+ * held 20-52 signatures per cell and the about-to-be-repeated signature WAS in
+ * the set, so a repeat would have been caught. The absence is real.
+ *
+ * WHY, STRUCTURALLY. Repetition lives in a context regime this replay cannot
+ * reach. 100% of runnable onsets are WINDOWED: 0 of 99 fitting onsets in
+ * 95b7b0c1 and 4 of 94 in 33f8544e survive as a full prefix even at the 90 KiB
+ * ceiling, and those 4 have gap<=6 and collisions<=3 — no headroom by
+ * construction. The recorded prefixes run to ~340 KiB, and above 90 KiB the
+ * proxy externalises context into an uploaded document, which is a different
+ * subsystem. So the window is not a tunable: it is forced, and it removes the
+ * accumulated task state. It shows in the output — pre-fix cells answered with
+ * `cd … && ls package.json` and `cat package.json`, i.e. the model RE-ORIENTING
+ * in a repo it no longer has the history for, not continuing the paging loop
+ * that produced the duplicate. MOVED_ON here does not mean "correctly used the
+ * numbered result"; it means the replay put the model in a different behavioural
+ * regime from the one that was recorded.
+ *
+ * WHAT THE 24 REQUESTS DID BUY, and it is not nothing:
+ *   - No regression, two-sided. 8/8 concordant pairs, discordant b=0 c=0. The
+ *     pre-registered upward direction (the ledger PRIMING repeats by printing
+ *     the exact strings) did not materialise on this sample.
+ *   - The lazy-model risk did not materialise either. The anti-repetition rule
+ *     was predicted to buy a fake win by making the model call fewer tools;
+ *     instead the post-fix arm emitted MORE calls than pre-fix (11 vs 9) at
+ *     identical tool-emission, so the raw metric was not being flattered.
+ *   - Prompt cost, measured on real agentic requests rather than a synthetic
+ *     one: +6679 input tokens across 8 cells, +15.8% versus pre-fix on
+ *     byte-identical request bodies. Larger than the +12.7% measured on a bare
+ *     prompt, because the ledger grows with tool history. Any further prompt
+ *     growth pays this multiplier on EVERY request.
+ *   - Zero protocol residue and zero errors in either arm.
+ *
+ * DO NOT run the paired A/B on this design expecting a duplicate-rate number.
+ * It would spend 40+ requests comparing 0% against 0%. To get headroom, the
+ * replay has to keep the full recorded prefix, which means either measuring
+ * ON the externalisation path deliberately (a different subject, with its own
+ * invariant) or capturing fresh sessions against a live proxy instead of
+ * replaying windowed ones. Until one of those exists, the duplicate-rate claim
+ * stays UNPROVEN, and that is the honest state to leave it in.
+ * ---------------------------------------------------------------------------
  * PRE-REGISTRATION. Fill this in BEFORE spending a request, and do not revise it
  * afterwards. The test is TWO-SIDED. The ledger prints the exact command strings
  * that count as REPEATED, so it is a plausible PRIMING mechanism: REPEATED going
@@ -965,6 +1018,18 @@ async function main () {
   console.log(`collisions      p50=${q(capped.map((s) => s.collisions), 0.5)}; zero-collision ${capped.filter((s) => s.collisions === 0).length}/${capped.length} (numbering fix has nothing to disambiguate there)`)
   console.log(`empty results   ${capped.filter((s) => s.decisionResultEmpty).length}/${capped.length}; mutation-between ${capped.filter((s) => s.mutationBetween).length}/${capped.length}`)
   console.log(`truncation      ${truncatedResults} tool_result bodies, ${truncatedThinking} thinking blocks; ${windowed}/${capped.length} windowed; largest request ${(maxBytes / 1024).toFixed(1)} KiB`)
+  if (capped.length > 0 && windowed === capped.length) {
+    // The header records the measurement: with every cell windowed, both arms
+    // came back 0/8 REPEATED at 100% tool-emission, because the window strips
+    // the accumulated task state and the model re-orients instead of repeating.
+    // Printing it here too so an operator about to spend quota sees it without
+    // reading 200 lines of comment first.
+    console.log('WARNING         every selected cell is WINDOWED. Measured 2026-09-08: with an all-windowed')
+    console.log('                sample the pre-fix arm reproduced the bug 0/8 (and the post-fix arm 0/8),')
+    console.log('                because the window removes the task state that drives repetition — the model')
+    console.log('                re-orients rather than repeating. A duplicate-RATE comparison on this sample')
+    console.log('                is expected to compare 0% against 0%. See MEASURED in the header.')
+  }
   console.log('')
 
   if (opts.dryRun) {
