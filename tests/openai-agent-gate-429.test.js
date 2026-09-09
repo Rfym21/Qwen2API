@@ -2,7 +2,12 @@
 //
 // Medido en vivo contra Qwen real (2026-09-08, qwen3.8-max, celda F de probe-matrix,
 // LOG_LEVEL=INFO para que el warn del gate fuera visible): de 5 rechazos del gate,
-// 3 fueron `invalid_control` y 2 `invalid_tool_call:tool_errors`. CERO fueron `bare`.
+// 3 fueron `invalid_control` y 2 `invalid_tool_call:tool_errors`; en esa tanda no salio
+// ningun `bare`. OJO CON ESE DATO: una verificacion posterior con n=5 sobre la MISMA celda
+// SI observo un rechazo `bare` en el log del gate, asi que la familia `bare` no esta
+// descartada — solo es minoritaria, y n=10 era demasiado poco para afirmar lo contrario.
+// Un `bare` agotado sigue siendo un error HTTP duro (502) a proposito: ahi el modelo nunca
+// declaro un cierre, y fabricarlo esta prohibido por config/index.js:58.
 // El texto exacto que el modelo emitio en los tres invalid_control tenia siempre la
 // MISMA forma — prosa de razonamiento filtrada al canal de respuesta, y detras un par
 // <agent_final>...</agent_final> perfectamente bien formado:
@@ -24,7 +29,7 @@ const { Readable } = require('node:stream')
 
 process.env.API_KEY = process.env.API_KEY || 'test-only-key'
 
-const { parseAgentControlText, buildAgentRetryHint } = require('../src/utils/agent-turn.js')
+const { parseAgentControlText, buildAgentRetryHint, stripAgentTags } = require('../src/utils/agent-turn.js')
 const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime.js')
 const { Logger } = require('../src/utils/logger.js')
 
@@ -67,17 +72,47 @@ test('control parse: la forma medida en vivo (prosa + par bien formado) es un fi
   assert.doesNotMatch(parsed.text, /<\/?agent_final>/i)
 })
 
-test('control parse: prosa DESPUES del par tambien es un final valido', () => {
-  const parsed = parseAgentControlText('<agent_final>Magenta</agent_final>\n\nEspero que ayude.')
-  assert.equal(parsed.kind, 'final')
-  assert.equal(parsed.text, 'Magenta\n\nEspero que ayude.')
+test('control parse: texto DESPUES del cierre no es un cierre — sigue siendo invalid_control', () => {
+  // El cierre tiene que ser lo ultimo. Esta forma nunca se observo en vivo, y aceptarla es
+  // justo lo que rompia el veto de `bare`: cualquier prosa con un par balanceado dentro
+  // —«luego emito <agent_final>el resumen</agent_final> cuando acabe»— se promovia a `final`
+  // y se entregaba como turno COMPLETO al primer intento. Un plan entregado como tarea
+  // terminada es exactamente lo que config/index.js:58 prohibe.
+  assert.equal(
+    parseAgentControlText('<agent_final>Magenta</agent_final>\n\nEspero que ayude.').kind,
+    'invalid_control'
+  )
 })
 
-test('control parse: el par dentro de una valla de codigo sigue siendo un final valido', () => {
-  const parsed = parseAgentControlText('```\n<agent_final>listo</agent_final>\n```')
-  assert.equal(parsed.kind, 'final')
-  assert.match(parsed.text, /listo/)
-  assert.doesNotMatch(parsed.text, /agent_final/i)
+test('control parse: un tag incidental a mitad de frase NO cierra el turno', () => {
+  // Reproducido por el revisor adversario: estas dos formas se entregaban con
+  // finish_reason=stop al primer intento, sin un solo reintento.
+  assert.equal(
+    parseAgentControlText('Next I will read the file and then emit <agent_final>the summary</agent_final> when done.').kind,
+    'invalid_control'
+  )
+  assert.equal(
+    parseAgentControlText('To finish, emit <agent_final>your report</agent_final> exactly once.').kind,
+    'invalid_control'
+  )
+})
+
+test('control parse: un par dentro de una valla de codigo no cierra el turno', () => {
+  // La valla continua despues del cierre, asi que el tag es documentacion, no un cierre.
+  // Tratarlo como `final` ademas entregaria «```\nlisto\n```» como respuesta final, que es
+  // peor que regenerar. Es la conducta previa a esta spec, restaurada a proposito.
+  assert.equal(parseAgentControlText('```\n<agent_final>listo</agent_final>\n```').kind, 'invalid_control')
+})
+
+test('control parse: un desfase de indices por toLowerCase se rechaza, no muerde el texto', () => {
+  // `İ` (U+0130) mide 1 en el original y 2 en minusculas, asi que los indices calculados
+  // sobre el lowercase dejan de valer. Esos offsets ya no solo recortan el texto: tambien
+  // rebasan los spans de residuo, asi que un desfase corromperia la respuesta entregada.
+  const skewed = 'İİİ prosa\n<agent_final>Magenta</agent_final>'
+  const parsed = parseAgentControlText(skewed)
+  assert.equal(parsed.kind, 'invalid_control', 'se regenera en vez de cortar en el sitio equivocado')
+  // Sin caracteres que desfasen, la MISMA forma se acepta con normalidad.
+  assert.equal(parseAgentControlText('III prosa\n<agent_final>Magenta</agent_final>').kind, 'final')
 })
 
 test('control parse: agent_blocked con prosa alrededor conserva su clase', () => {
@@ -111,9 +146,20 @@ test('control parse: dos pares o dos familias con prosa alrededor siguen siendo 
     parseAgentControlText('Antes <agent_final>uno</agent_final> y <agent_final>dos</agent_final> despues').kind,
     'invalid_control'
   )
-  // Nota de alcance: una cadena que EMPIEZA por el tag de apertura y TERMINA por el de
-  // cierre la sigue absorbiendo `unwrapExactTag` con su body perezoso, exactamente igual
-  // que antes de este arreglo. Es comportamiento preexistente, no lo toca esta spec.
+})
+
+test('control parse: hueco conocido — dos pares que abren y cierran la cadena NO se rechazan', () => {
+  // Correccion de una afirmacion falsa del commit anterior ("doubled shapes still reject").
+  // `unwrapExactTag` esta anclado en los dos extremos pero su cuerpo es perezoso CON
+  // backtracking, asi que una cadena que empieza por la apertura y termina por el cierre la
+  // absorbe entera, con los tags interiores dentro del cuerpo. Es preexistente (anterior a
+  // esta spec) y no lo toca este arreglo; se pincha aqui para que nadie lea el test de arriba
+  // como "los pares dobles estan cubiertos".
+  const parsed = parseAgentControlText('<agent_final>uno</agent_final> y <agent_final>dos</agent_final>')
+  assert.equal(parsed.kind, 'final')
+  assert.match(parsed.text, /<\/agent_final>/)
+  // No hay fuga al cliente: la capa de entrega pela las etiquetas (chat.js#peelDeliverableText).
+  assert.doesNotMatch(stripAgentTags(parsed.text), /agent_final/i)
 })
 
 // --------------------------------------------------------------------- runOpenAIAgentTurn
@@ -127,11 +173,11 @@ test('gate: la ronda medida en vivo se entrega con 200 al primer intento, no con
   assert.doesNotMatch(result.attempt.visibleText, /agent_final/i)
 })
 
-test('gate: un invalid_control real se entrega en el ultimo intento en vez de morir con 429', async () => {
-  // Desbalanceado de verdad: se reintenta (el hint puede corregirlo), pero si el modelo
-  // insiste, el cliente recibe la respuesta pelada — nunca un error HTTP. Es la unica
-  // familia de rechazo que hoy no tiene cupo de rendicion; intercepted/malformed_protocol
-  // ya lo tienen (protocol_recovery_used).
+test('gate: un invalid_control agotado falla con 502 — nunca con un stop fabricado', async () => {
+  // Aqui NO hay cupo de rendicion, y es deliberado. Se probo darselo y la verificacion
+  // adversaria lo tumbo: tras anclar el cierre al final, lo que queda en invalid_control son
+  // justo las formas que NO declaran un cierre legible (desbalanceadas, invertidas, dobles,
+  // dos familias) — el mismo caso que `bare` y `empty` tienen vetado por config/index.js:58.
   let sent = 0
   const result = await runTurn('<agent_final>respuesta a medio envolver', {
     sendChatRequest: async () => {
@@ -139,11 +185,37 @@ test('gate: un invalid_control real se entrega en el ultimo intento en vez de mo
       return { status: true, response: turnStream(answerFrame('<agent_final>respuesta a medio envolver')) }
     }
   })
-  assert.equal(sent, 2, 'se agotan los reintentos antes de rendirse')
-  assert.equal(result.ok, true)
-  assert.equal(result.finishReason, 'stop')
-  assert.equal(result.attempt.visibleText.includes('respuesta a medio envolver'), true)
-  assert.doesNotMatch(result.attempt.visibleText, /agent_final/i, 'el tag nunca se filtra al cliente')
+  assert.equal(sent, 2, 'se gastan los reintentos antes de rendirse')
+  assert.equal(result.ok, false)
+  assert.equal(result.error.status, 502)
+  assert.equal(result.error.code, 'upstream_agent_turn_incomplete')
+})
+
+test('gate: sin requestSender la primera ronda malformada tampoco se entrega como stop', async () => {
+  // El `break` del bucle salta tanto por agotamiento como por no haber requestSender. Con el
+  // cupo de rendicion, ese segundo camino entregaba la PRIMERA ronda malformada con
+  // finish_reason=stop y attempts=1, sin un solo reintento.
+  const result = await runTurn('<agent_final>respuesta a medio envolver', { sendChatRequest: undefined })
+  assert.equal(result.ok, false, 'un turno sin cierre declarado nunca es un stop')
+  assert.equal(result.error.status, 502)
+})
+
+test('gate: un turno que declara «terminado» y «bloqueado» a la vez nunca se entrega', async () => {
+  // Reproducido por el revisor adversario: se entregaba como turno completo con
+  // finish_reason=stop, uniendo las dos mitades — «task complete and I need your DB password».
+  const contradictory = 'x <agent_final>task complete</agent_final> and <agent_blocked>I need your DB password</agent_blocked>'
+  const result = await runTurn(contradictory)
+  assert.equal(result.ok, false)
+  assert.equal(result.error.status, 502)
+})
+
+test('gate: un tag incidental no se entrega como turno terminado', async () => {
+  // El plan «luego emito <agent_final>el resumen</agent_final> cuando acabe» llegaba al
+  // cliente como tarea terminada, al primer intento y sin reintentos.
+  const plan = 'Next I will read the file and then emit <agent_final>the summary</agent_final> when done.'
+  const result = await runTurn(plan)
+  assert.equal(result.ok, false, 'un plan no es una conclusion')
+  assert.equal(result.error.status, 502)
 })
 
 test('gate: sin texto entregable el invalid_control agotado sigue siendo un error, no un stop falso', async () => {
@@ -199,6 +271,84 @@ test('streaming: la ronda medida en vivo llega entera al cliente SSE, sin tags y
   assert.match(streamed, /^The image is clearly visible/)
   assert.doesNotMatch(streamed, /agent_final/i)
   assert.equal(streamed.match(/Magenta/g).length, 1, 'una sola copia: nada se emitio en vivo y luego otra vez')
+})
+
+// -------------------------------------------------------------- residuo tras el desenvoltorio
+//
+// El desenvoltorio tolerante quita los tags de EN MEDIO del texto, asi que el entregable deja
+// de ser un tramo contiguo de `cleanedText`. rebaseResidueSpans localizaba ese tramo con un
+// `indexOf`: devolvia -1 y descartaba TODOS los spans, o sea que la ronda se aceptaba con el
+// residuo sin pelar y un `[END TOOL CALL]` huerfano volvia a salir como texto del asistente —
+// la fuga (20 de 29.352 turnos reales) que la spec T7 habia cerrado. Los tres revisores
+// adversarios la encontraron por separado. Se arregla rebasando por segmentos.
+const RESIDUE_ROUND = 'Ya inspeccione el archivo.\n[END TOOL CALL]\nEso es todo.\n\n<agent_final>Listo</agent_final>'
+
+test('residuo: el desenvoltorio tolerante devuelve los segmentos que permiten rebasar', () => {
+  const parsed = parseAgentControlText(RESIDUE_ROUND)
+  assert.equal(parsed.kind, 'final')
+  assert.ok(Array.isArray(parsed.segments) && parsed.segments.length > 0,
+    'sin segmentos el rebase vuelve al indexOf que no puede con un corte interior')
+  // El texto entregable NO es un tramo contiguo del original: ese es justo el caso que rompia.
+  assert.equal(RESIDUE_ROUND.includes(parsed.text), false)
+})
+
+test('residuo: una ronda tolerada conserva sus spans en vez de tirarlos al suelo', async () => {
+  const result = await runTurn(RESIDUE_ROUND)
+  assert.equal(result.ok, true)
+  assert.equal(result.finishReason, 'stop')
+  assert.equal(result.attempt.residueSpans.length, 1, 'el span se descartaba entero (indexOf === -1)')
+  const span = result.attempt.residueSpans[0]
+  assert.equal(span.text, '[END TOOL CALL]')
+  // Rebasado a coordenadas de visibleText: la capa de entrega pela por POSICION, nunca busca.
+  assert.equal(result.attempt.visibleText.slice(span.at, span.at + span.text.length), span.text)
+})
+
+test('residuo: el marcador huerfano no llega al cliente por SSE', async () => {
+  const { handleStreamResponse } = require('../src/controllers/chat.js')
+  const res = {
+    output: '', headers: {}, statusCode: 200,
+    status(code) { this.statusCode = code; return this },
+    set(h) { Object.assign(this.headers, h); return this },
+    write(chunk) { this.output += chunk; return true },
+    end(chunk) { if (chunk) this.output += chunk; this.writableEnded = true },
+    json(payload) { this.output += JSON.stringify(payload) },
+    writeHead(code, headers) { this.statusCode = code; Object.assign(this.headers, headers || {}) }
+  }
+  await handleStreamResponse(
+    res,
+    turnStream(answerFrame(RESIDUE_ROUND)),
+    false,
+    false,
+    { messages: [{ role: 'user', content: 'que hiciste' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['get_time'],
+      agent_turn_max_attempts: 3,
+      sendChatRequest: async () => ({ status: true, response: turnStream(answerFrame(RESIDUE_ROUND)) })
+    }
+  )
+  assert.equal(res.statusCode, 200)
+  const delivered = res.output.split('\n')
+    .filter(line => line.startsWith('data: ') && !line.includes('[DONE]'))
+    .map(line => { try { return JSON.parse(line.slice(6)) } catch (_) { return null } })
+    .map(payload => payload?.choices?.[0]?.delta?.content || '')
+    .join('')
+  assert.doesNotMatch(delivered, /\[END TOOL CALL\]/, 'protocolo crudo entregado como texto del asistente')
+  assert.match(delivered, /Ya inspeccione el archivo/)
+  assert.match(delivered, /Listo/)
+})
+
+test('residuo: el markdown de imagen que el proxy antepone sobrevive al pelado', async () => {
+  // El proxy vuelca `pendingImages` en cuanto arranca el canal de respuesta, o sea que la
+  // imagen va SIEMPRE delante del texto del modelo. Quedarse solo con el cuerpo del envoltorio
+  // la borraria; el rebase por segmentos tampoco puede desplazarla ni morderla.
+  const withImage = '![image](https://x/y.png)\n\n[END TOOL CALL]\n\n<agent_final>Magenta</agent_final>'
+  const result = await runTurn(withImage)
+  assert.equal(result.ok, true)
+  assert.equal(result.attempt.residueSpans.length, 1)
+  assert.match(result.attempt.visibleText, /^!\[image\]\(https:\/\/x\/y\.png\)/)
+  assert.match(result.attempt.visibleText, /Magenta$/)
 })
 
 test('gate: el hint de invalid_control nombra la restriccion que se sigue exigiendo', () => {

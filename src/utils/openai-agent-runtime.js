@@ -13,7 +13,6 @@ const {
   parseAgentControlText,
   createAgentControlStreamParser,
   createAgentTagStripper,
-  stripAgentTags,
   buildAgentRetryHint,
   // Guarda de fuga del canal de texto: una sola implementacion, compartida con
   // anthropic.js (spec agent-turn-cutoff-openai-parity). El `tag` de log es parametro.
@@ -41,29 +40,51 @@ const NON_RETRYABLE_FINISH_REASONS = new Set([
  * entregarse en este camino (el gate rechaza la prosa desnuda con agentTurnAcceptBareFinal
  * en false), o sea que sin esto el pelado no encontraría un solo span y no pelaría nada.
  *
- * Fail closed en las dos direcciones: se exige que el texto entregado sea un tramo contiguo
- * y NO ambiguo de `cleanedText` (un `indexOf` a secas elegiría el primero de dos tramos
- * idénticos y borraría en el sitio equivocado), y cada span se revalida contra el destino
- * con la misma regla que aplicará stripToolCallResidue — coincidencia exacta, o cola
- * recortada que sea prefijo del span. Lo que no cuadra se descarta: mejor entregar un
- * residuo que morder la respuesta.
+ * DOS MODOS, y el segundo existe por una fuga reproducida:
+ *
+ * 1. Con `segments` (los que devuelve el desenvoltorio tolerante de agent-turn.js): el texto
+ *    entregable NO es un tramo contiguo del original —los tags se quitan de EN MEDIO—, así
+ *    que se rebasa segmento a segmento, aritmética pura. Cuando esto no existía, el `indexOf`
+ *    del modo 2 devolvía -1 para toda ronda tolerada y se descartaban TODOS los spans: un
+ *    `[END TOOL CALL]` huérfano volvía a salir como texto del asistente (la fuga medida en
+ *    20 de 29.352 turnos que cerró la spec T7). Verificado por tres revisores adversarios
+ *    de forma independiente y pinchado en tests/openai-agent-gate-429.test.js.
+ * 2. Sin `segments` (envoltorio exacto, `bare`, `invalid_control`): el texto sí es contiguo;
+ *    se exige además que sea NO ambiguo (un `indexOf` a secas elegiría el primero de dos
+ *    tramos idénticos y borraría en el sitio equivocado).
+ *
+ * Fail closed en los dos modos: cada span se revalida contra el destino con la misma regla
+ * que aplicará stripToolCallResidue — coincidencia exacta, o cola recortada que sea prefijo
+ * del span. Lo que no cuadra se descarta: mejor entregar un residuo que morder la respuesta.
  */
-const rebaseResidueSpans = (cleanedText, visibleText, spans) => {
+const rebaseResidueSpans = (cleanedText, visibleText, spans, segments = null) => {
   if (!Array.isArray(spans) || spans.length === 0) return []
   const source = String(cleanedText || '')
   const target = String(visibleText || '')
   if (!target) return []
-  const offset = source.indexOf(target)
-  if (offset === -1 || source.indexOf(target, offset + 1) !== -1) return []
-  return spans
-    .filter(span => span && typeof span.text === 'string' && span.text && Number.isInteger(span.at))
-    .map(span => ({ ...span, at: span.at - offset }))
-    .filter(span => {
-      if (span.at < 0 || span.at >= target.length) return false
-      const slice = target.slice(span.at, span.at + span.text.length)
-      if (slice === span.text) return true
-      return slice.length < span.text.length && span.text.startsWith(slice)
-    })
+  const usable = spans.filter(span =>
+    span && typeof span.text === 'string' && span.text && Number.isInteger(span.at))
+
+  let moved
+  if (Array.isArray(segments)) {
+    moved = usable
+      .map(span => {
+        const segment = segments.find(item => span.at >= item.from && span.at < item.to)
+        return segment ? { ...span, at: span.at - segment.from + segment.at } : null
+      })
+      .filter(Boolean)
+  } else {
+    const offset = source.indexOf(target)
+    if (offset === -1 || source.indexOf(target, offset + 1) !== -1) return []
+    moved = usable.map(span => ({ ...span, at: span.at - offset }))
+  }
+
+  return moved.filter(span => {
+    if (span.at < 0 || span.at >= target.length) return false
+    const slice = target.slice(span.at, span.at + span.text.length)
+    if (slice === span.text) return true
+    return slice.length < span.text.length && span.text.startsWith(slice)
+  })
 }
 
 const normalizeCreatedMetadata = (payload) => {
@@ -529,7 +550,7 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   // containsOrphanProtocolResidue decide malformed_protocol sobre él y pelarlo aquí apagaría
   // el reintento que hoy recupera la ronda.
   const residueSpans = hasTools
-    ? rebaseResidueSpans(textTools.cleanedText, control.text, textTools.residueSpans)
+    ? rebaseResidueSpans(textTools.cleanedText, control.text, textTools.residueSpans, control.segments)
     : []
   const metadata = (acceptedResponseId && createdByResponseId.get(acceptedResponseId)) || primaryCreated || lastCreated || {
     chatId: null,
@@ -860,38 +881,25 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     })
   }
 
-  // Cupo de rendición para invalid_control — la única familia de rechazo que no tenía uno.
-  // `intercepted`/`malformed_protocol` ya se entregan por las bravas tras gastar
-  // protocol_recovery_used; `bare` conserva a propósito su veto (no fabricar una conclusión
-  // que el modelo no declaró). invalid_control es distinto de los dos: el modelo SÍ declaró
-  // el cierre, sólo escribió mal el envoltorio, así que hay una respuesta real que entregar
-  // y matar el turno con un error HTTP es la peor de las salidas para un cliente agéntico.
-  // Se pelan los tags: un `<agent_final>` crudo en el texto del asistente es fuga medida.
+  // NO hay cupo de rendición para `invalid_control`, y es deliberado.
   //
-  // Sobre la regla de config/index.js:58 ("耗尽后必须显式失败，绝不能伪装成 finish_reason=stop"):
-  // no se la salta. Esa regla prohíbe fabricar una conclusión que el modelo NO declaró — que es
-  // exactamente lo que sigue vetado en `bare` y en `empty`. Aquí el modelo sí declaró el cierre
-  // (emitió el tag); sólo escribió mal el envoltorio. Entregar su conclusión no es disfrazar nada.
-  if (lastEvaluation?.retryReason === 'invalid_control') {
-    const salvaged = stripAgentTags(String(lastAttempt?.visibleText || '')).trim()
-    if (salvaged) {
-      logger.warn(
-        `Agent 回合门禁在 invalid_control 上耗尽 ${attemptsMade} 次尝试，剥离包装标签后按原样交付`,
-        'AGENT'
-      )
-      return {
-        ok: true,
-        // residueSpans quedan en coordenadas del visibleText VIEJO; tras pelar los tags ya no
-        // apuntan a donde creen. Pelar por offsets equivocados corrompe el texto, así que se
-        // descartan (un residuo huérfano habría dado malformed_protocol, no invalid_control).
-        attempt: { ...lastAttempt, visibleText: salvaged, controlKind: 'final', residueSpans: [] },
-        finishReason: 'stop',
-        attempts: attemptsMade,
-        suppressVisibleText: false
-      }
-    }
-  }
-
+  // Se probó darle uno (entregar el texto pelado con finish_reason=stop tras agotar los
+  // intentos) y la verificación adversaria lo tumbó por tres motivos, los tres reproducidos:
+  //  - Su justificación era "el modelo SÍ declaró el cierre, sólo escribió mal el envoltorio".
+  //    Falso para casi todo lo que le llegaba: tras anclar el cierre al final, las formas que
+  //    siguen cayendo en invalid_control son exactamente las que NO declaran un cierre legible
+  //    —desbalanceadas («<agent_final>respuesta a medio envolver», sin cierre), invertidas,
+  //    dobles, y las dos familias a la vez— es decir el mismo caso que `bare` y `empty` tienen
+  //    vetado. Entregaba «terminé» y «necesito tu contraseña» como un turno completo.
+  //  - No estaba atado al agotamiento real: el `break` de arriba también salta cuando no hay
+  //    requestSender, así que la PRIMERA ronda malformada se entregaba como stop con
+  //    attempts=1, sin un solo reintento.
+  //  - En SSE ni siquiera se alcanzaba para su propio caso de prueba: con on_content_delta
+  //    cableado (chat.js), el texto ya emitido dispara antes el 422 de stream invalidado.
+  //
+  // Regla que manda, config/index.js:58: 耗尽后必须显式失败，绝不能伪装成 finish_reason=stop.
+  // El arreglo real de la fuga de 429 es el desenvoltorio tolerante de arriba, que acepta la
+  // forma medida en vivo al PRIMER intento; cuando eso no aplica, agotar es agotar.
   return {
     ok: false,
     error: exhaustedError(lastAttempt, lastEvaluation?.retryReason),

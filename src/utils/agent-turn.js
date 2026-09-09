@@ -44,26 +44,88 @@ const countOccurrences = (haystackLower, needle) => {
 }
 
 /**
- * Un único par bien formado con texto alrededor: se acepta y se conserva TODO, sin tags.
+ * Aplica recortes sobre `source` y devuelve el texto resultante MÁS los segmentos que
+ * sobrevivieron: cada uno dice de dónde viene (`from`/`to`, coordenadas del original) y
+ * dónde cae (`at`, coordenadas de la salida).
  *
- * Medido en vivo (2026-09-08, qwen3.8-max, celda F de probe-matrix con LOG_LEVEL=INFO):
- * de 5 rechazos del gate en /v1/chat/completions, 3 fueron `invalid_control` y los 3
- * tenían la misma forma — prosa de razonamiento filtrada al canal de respuesta y, detrás,
- * un `<agent_final>Magenta</agent_final>` perfectamente bien formado. La respuesta era
- * correcta y completa; el ancla `$` de unwrapExactTag la tiraba, y sin cupo de rendición
- * esa familia quemaba los 3 intentos y salía como HTTP 429 (~1 de cada 4 peticiones).
- *
- * Se conservan las dos mitades en vez de quedarse sólo con el cuerpo por dos razones:
- * es exactamente lo que el gemelo Anthropic ya entrega hoy (createAgentTagStripper, cuyo
- * comentario dice que juzgar "prosa + envoltorio" como inválido sólo hace fallar el turno
- * entero), y porque el propio proxy antepone markdown de imagen al `answer` antes de este
- * parse (openai-agent-runtime.js#appendAnswer): quedarse con el cuerpo borraría la imagen.
- *
- * Lo que NO se tolera, porque es ambiguo de verdad y no un resbalón de formato: tags
- * desbalanceados, más de un par, y las dos familias a la vez. Esas siguen en
- * `invalid_control` — pero ya no son fatales: el gate tiene cupo de rendición.
+ * Existe por un fallo concreto y medido: openai-agent-runtime.js#rebaseResidueSpans
+ * localizaba el texto entregable dentro de `cleanedText` con un `indexOf`, lo que sólo
+ * funciona si la salida es un tramo CONTIGUO del original. Quitar un par de tags de EN
+ * MEDIO rompe esa premisa, `indexOf` devolvía -1 y se descartaban TODOS los spans de
+ * residuo — así que un `[END TOOL CALL]` huérfano volvía a llegar crudo al cliente,
+ * justo la fuga que la spec T7 había cerrado. Con los segmentos el rebase es aritmético
+ * y no busca nada.
  */
-const unwrapSinglePairWithSurroundings = (trimmed) => {
+const spliceWithSegments = (source, cuts) => {
+  const ordered = cuts
+    .filter(cut => cut && cut.len > 0 && cut.at >= 0)
+    .sort((a, b) => a.at - b.at)
+  const segments = []
+  let text = ''
+  let cursor = 0
+  for (const cut of ordered) {
+    if (cut.at > cursor) {
+      segments.push({ from: cursor, to: cut.at, at: text.length })
+      text += source.slice(cursor, cut.at)
+    }
+    cursor = Math.max(cursor, cut.at + cut.len)
+  }
+  if (cursor < source.length) {
+    segments.push({ from: cursor, to: source.length, at: text.length })
+    text += source.slice(cursor)
+  }
+  return { text, segments }
+}
+
+/** Recorta los extremos en blanco manteniendo los segmentos alineados con el original. */
+const trimWithSegments = ({ text, segments }) => {
+  const lead = text.length - text.trimStart().length
+  const trimmed = text.trim()
+  const end = lead + trimmed.length
+  const kept = []
+  for (const segment of segments) {
+    const from = Math.max(segment.at, lead)
+    const to = Math.min(segment.at + (segment.to - segment.from), end)
+    if (to <= from) continue
+    kept.push({
+      from: segment.from + (from - segment.at),
+      to: segment.from + (to - segment.at),
+      at: from - lead
+    })
+  }
+  return { text: trimmed, segments: kept }
+}
+
+/**
+ * Prosa delante + un único par bien formado que CIERRA el mensaje: se acepta y se conserva
+ * todo, sin tags.
+ *
+ * Medido en vivo (2026-09-08, qwen3.8-max, celda F de probe-matrix con LOG_LEVEL=INFO para
+ * que el warn del gate fuera visible): en una tanda de 5 rechazos, 3 fueron `invalid_control`
+ * y los 3 tenían la misma forma — prosa de razonamiento filtrada al canal de respuesta y,
+ * detrás, un `<agent_final>Magenta</agent_final>` perfectamente bien formado. La respuesta era
+ * correcta y completa; el ancla `^` de unwrapExactTag la tiraba, y esa familia quemaba los 3
+ * intentos y salía como error HTTP (~1 de cada 4 peticiones).
+ *
+ * Se conservan las dos mitades en vez de quedarse sólo con el cuerpo porque el propio proxy
+ * antepone markdown de imagen al `answer` antes de este parse (openai-agent-runtime.js, el
+ * volcado de `pendingImages` en cuanto arranca el canal de respuesta): quedarse con el cuerpo
+ * borraría la imagen. Es además lo que el gemelo Anthropic ya entrega hoy
+ * (createAgentTagStripper).
+ *
+ * EL CIERRE TIENE QUE SER LO ÚLTIMO. Un tag con texto detrás no es un cierre: es una mención
+ * incidental, y el modelo siguió escribiendo después de "terminar". Sin este ancla, cualquier
+ * prosa con un par balanceado dentro —«luego emito <agent_final>el resumen</agent_final>
+ * cuando acabe»— se promovía de `bare` (vetado) a `final` y se entregaba como turno completo
+ * al primer intento: exactamente la conclusión fabricada que prohíbe config/index.js:58.
+ * Verificado por el revisor adversario, reproducido, y cerrado aquí.
+ *
+ * Lo que NO se tolera, porque es ambiguo de verdad: tags desbalanceados, más de un par, las
+ * dos familias a la vez, y texto después del cierre. Todo eso sigue en `invalid_control`.
+ */
+const unwrapSinglePairWithSurroundings = (raw) => {
+  const trimmed = raw.trim()
+  const lead = raw.length - raw.trimStart().length
   const lower = trimmed.toLowerCase()
   const families = [
     { kind: 'final', open: AGENT_FINAL_OPEN, close: AGENT_FINAL_CLOSE },
@@ -85,11 +147,22 @@ const unwrapSinglePairWithSurroundings = (trimmed) => {
   const openIndex = lower.indexOf(family.open.toLowerCase())
   const closeIndex = lower.indexOf(family.close.toLowerCase())
   if (openIndex > closeIndex) return null
+  // Terminal, no incidental: nada puede venir después del cierre.
+  if (closeIndex + family.close.length !== trimmed.length) return null
+  // Los índices vienen del lowercase, y toLowerCase puede cambiar la LONGITUD de algún
+  // carácter (U+0130 se convierte en dos), con lo que dejarían de valer sobre el original.
+  // Se comprueba antes de cortar: ahora esos offsets no sólo recortan el texto, también
+  // rebasan los spans de residuo, así que un desfase mordería la respuesta. Fail closed.
+  if (trimmed.slice(openIndex, openIndex + family.open.length).toLowerCase() !== family.open) return null
+  if (trimmed.slice(closeIndex, closeIndex + family.close.length).toLowerCase() !== family.close) return null
 
-  const body = trimmed.slice(openIndex + family.open.length, closeIndex)
-  const before = trimmed.slice(0, openIndex)
-  const after = trimmed.slice(closeIndex + family.close.length)
-  return { kind: family.kind, text: `${before}${body}${after}`.trim() }
+  const spliced = trimWithSegments(spliceWithSegments(raw, [
+    { at: 0, len: lead },
+    { at: lead + openIndex, len: family.open.length },
+    // Del cierre hasta el final del original: el tag y el blanco de cola de una vez.
+    { at: lead + closeIndex, len: raw.length - lead - closeIndex }
+  ]))
+  return { kind: family.kind, text: spliced.text, segments: spliced.segments }
 }
 
 /**
@@ -107,7 +180,7 @@ const parseAgentControlText = (value) => {
   const blockedText = unwrapExactTag(trimmed, AGENT_BLOCKED_OPEN, AGENT_BLOCKED_CLOSE)
   if (blockedText !== null) return { kind: 'blocked', text: blockedText }
 
-  const tolerated = unwrapSinglePairWithSurroundings(trimmed)
+  const tolerated = unwrapSinglePairWithSurroundings(raw)
   if (tolerated) return tolerated
 
   if (/<\/?agent_(?:final|blocked)>/i.test(trimmed)) {

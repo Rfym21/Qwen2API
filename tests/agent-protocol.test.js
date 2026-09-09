@@ -1015,9 +1015,15 @@ test('Agent completion control parser rejects bare and mixed completion claims',
   // par perfectamente bien formado, con la respuesta correcta dentro). Ahora se acepta y se
   // conservan las dos mitades sin tags — paridad con el gemelo Anthropic. Detalle completo y
   // los casos que SIGUEN rechazándose: tests/openai-agent-gate-429.test.js.
-  assert.deepEqual(
-    parseAgentControlText('prefix <agent_final>done</agent_final>'),
-    { kind: 'final', text: 'prefix done' }
+  const prefixed = parseAgentControlText('prefix <agent_final>done</agent_final>')
+  assert.equal(prefixed.kind, 'final')
+  assert.equal(prefixed.text, 'prefix done')
+  // El cierre tiene que ser LO ULTIMO: un tag con texto detras es una mencion incidental, no
+  // un cierre, y aceptarla entregaba planes («luego emito <agent_final>x</agent_final> cuando
+  // acabe») como turnos terminados al primer intento. Detalle en openai-agent-gate-429.
+  assert.equal(
+    parseAgentControlText('prefix <agent_final>done</agent_final> y sigo').kind,
+    'invalid_control'
   )
   // Lo genuinamente ambiguo sigue vetado: dos familias en el mismo turno.
   assert.equal(
