@@ -2517,3 +2517,16 @@ test('cierre truncado: ya no bloquea la llamada que viene detras', () => {
   const r = parseCloser(CLOSER_CALL + '[END TOOL C\n[TOOL CALL]\n{"name":"Read","arguments":{"path":"a"}}\n[END TOOL CALL]')
   assert.ok(r.toolCalls.map(c => c.function.name).includes('Bash'))
 })
+
+test('Agent tool prompt names the absent platform tools so the model does not call them', () => {
+  // 5 turnos en 30 min (2026-09-09) entregados a medias porque el modelo invoco
+  // code_interpreter / web_search, que existen en el chat de Qwen pero no aqui.
+  const schema = { type: 'object', properties: {} }
+  const prompt = buildToolSystemPrompt([{ type: 'function', function: { name: 'read_file', parameters: schema } }])
+  assert.match(prompt, /`code_interpreter`, `web_search`[^\n]*NOT available; never call them/)
+
+  // Un web_search declarado por el cliente es legitimo: no se veta.
+  const withSearch = buildToolSystemPrompt([{ type: 'function', function: { name: 'web_search', parameters: schema } }])
+  assert.match(withSearch, /`code_interpreter`[^\n]*NOT available/)
+  assert.doesNotMatch(withSearch, /`web_search`[^\n]*NOT available/)
+})

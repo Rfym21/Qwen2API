@@ -42,6 +42,30 @@ const isRateLimitError = (error) => {
 };
 
 /**
+ * El adjunto de contexto largo (upload + parse en Qwen) fallo en una peticion que NO
+ * puede compactarse (lleva tools). Es una averia temporal del upstream —el servicio de
+ * parse cae a ratos durante minutos u horas; 4 episodios en 9 dias de prod, el del
+ * 2026-09-09 21:25 medido en vivo— asi que sale como 529 `overloaded_error` (Anthropic)
+ * / 503 `upstream_unavailable` (OpenAI) con Retry-After: el cliente agentico reintenta
+ * solo y nunca ejecuta un turno viendo el 7–50 % de su historial.
+ */
+const CONTEXT_ATTACHMENT_CODE = 'context_externalization_failed';
+const CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS = 10;
+
+class ContextExternalizationError extends Error {
+  constructor(cause) {
+    super(`Agent context attachment failed: ${cause?.message || cause}`);
+    this.name = 'ContextExternalizationError';
+    this.code = CONTEXT_ATTACHMENT_CODE;
+    this.cause = cause;
+    this.publicMessage = 'Upstream document parse unavailable; retry shortly';
+    this.retryAfter = CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS;
+  }
+}
+
+const isContextAttachmentError = (error) => String(error?.code || '') === CONTEXT_ATTACHMENT_CODE;
+
+/**
  * Retry-After en segundos, SOLO si el upstream mando una espera de verdad.
  *
  * Qwen manda `data.num` en HORAS en el paquete de cuota; es la misma lectura que ya hace
@@ -87,13 +111,21 @@ const rateLimitRetryAfterSeconds = (error) => {
  * repetir la deteccion; el `type` de cable lo pone cada uno con su constante de arriba.
  * @param {unknown} error - Error capturado
  * @param {number} [fallbackStatus] - Status cuando NO es cuota (500 Anthropic / 502 OpenAI)
- * @returns {{ rateLimited: boolean, status: number, retryAfter: number|null }}
+ * @returns {{ rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null }}
  */
 const describeUpstreamFailure = (error, fallbackStatus = 502) => {
-  if (!isRateLimitError(error)) {
-    return { rateLimited: false, status: fallbackStatus, retryAfter: null };
+  if (isContextAttachmentError(error)) {
+    return {
+      rateLimited: false,
+      overloaded: true,
+      status: 529,
+      retryAfter: Number(error.retryAfter) || CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS
+    };
   }
-  return { rateLimited: true, status: 429, retryAfter: rateLimitRetryAfterSeconds(error) };
+  if (!isRateLimitError(error)) {
+    return { rateLimited: false, overloaded: false, status: fallbackStatus, retryAfter: null };
+  }
+  return { rateLimited: true, overloaded: false, status: 429, retryAfter: rateLimitRetryAfterSeconds(error) };
 };
 
 /**
@@ -177,6 +209,8 @@ module.exports = {
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,
+  ContextExternalizationError,
+  isContextAttachmentError,
   RATE_LIMIT_CODE,
   RATE_LIMIT_ANTHROPIC_TYPE,
   RATE_LIMIT_OPENAI_TYPE

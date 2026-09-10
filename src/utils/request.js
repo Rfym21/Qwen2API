@@ -7,6 +7,7 @@ const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
+const { ContextExternalizationError } = require('./upstream-error.js')
 const { TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger } = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
@@ -398,7 +399,7 @@ const buildAgentContextLivePrompt = (
     return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: true })
 }
 
-const compactAgentContextFallback = (original, maxBytes = config.agentContextLivePromptBytes) => {
+const compactAgentContextFallback = (original, maxBytes = config.agentContextFallbackPromptBytes) => {
     const notice = [
         '# Agent context recovery',
         'The upstream document attachment failed, so older context was compacted to stay below the Qwen Web request limit.',
@@ -431,10 +432,19 @@ const externalizeOversizedAgentContext = async (
     try {
         file = await uploader(originalContent, currentToken, currentAccount, options)
     } catch (error) {
+        // Sin permiso explicito un adjunto fallido NO se disimula. Un turno con tools que
+        // ve una fraccion del historial repite lo ya hecho (3 duplicados y 7 turnos
+        // desbocados en 6 min el 2026-09-09, todos tras caer el parse de Qwen; cero antes).
+        // El error sale como 529/503 reintentable; solo el chat sin tools opta por
+        // compactar, y los reenvios de correccion (sin opciones) nunca.
+        if (options.allowContextCompaction !== true) {
+            logger.error('Agent 长上下文附件上传/解析失败，带工具的请求拒绝削减上下文', 'REQUEST', '', error)
+            throw new ContextExternalizationError(error)
+        }
         logger.error('Agent 长上下文附件上传/解析失败，回退到最近上下文', 'REQUEST', '', error)
         const fallbackMessage = replaceMessageTextContent(
             message,
-            compactAgentContextFallback(originalContent, options.livePromptBytes)
+            compactAgentContextFallback(originalContent, options.fallbackPromptBytes)
         )
         fallbackMessage.files = Array.isArray(message.files) ? [...message.files] : []
         return {
@@ -545,7 +555,9 @@ const sendChatRequest = async (body, options = {}) => {
     const contextResult = await externalizeOversizedAgentContext(
         rawPayload,
         currentToken,
-        currentAccount
+        currentAccount,
+        // Solo quien conoce la peticion (¿lleva tools?) puede permitir compactar.
+        { allowContextCompaction: options.allowContextCompaction === true }
     )
     const payload = contextResult.payload
     if (contextResult.externalized) {

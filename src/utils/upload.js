@@ -322,6 +322,33 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
  * @param {Object} [account]
  * @param {Object} [options]
  */
+/**
+ * 解析服务整体故障的信号。Qwen 挂掉时仍回 HTTP 200，但 body 是
+ * `{"success":false,"data":{"code":"Internal_Server_Error"}}`（status 接口）或
+ * `{"success":true,"data":{"code":"Internal_Server_Error"}}`（parse 接口），没有任何
+ * 按文件的 status。下面的轮询把它当成「还没好」：30 次 × 500 ms = 15 s，然后报一个
+ * 并非超时的「解析超时」。实测 2026-09-09 21:25 起 22/22 次都是这个形状。
+ * @param {import('axios').AxiosResponse} response
+ * @returns {string|null} 故障码；正常或未知时为 null
+ */
+const parseServiceFailureCode = (response) => {
+    const body = response?.data
+    if (!body || typeof body !== 'object') return null
+    const code = body.data && typeof body.data === 'object' ? body.data.code : undefined
+    if (body.success === false) return String(code || body.code || body.message || 'unknown')
+    if (typeof code === 'string' && /error|fail/i.test(code)) return code
+    return null
+}
+
+const throwIfParseServiceFailed = (response, fileId) => {
+    const code = parseServiceFailureCode(response)
+    if (code === null) return
+    const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId})`)
+    error.code = 'qwen_parse_unavailable'
+    error.parseCode = code
+    throw error
+}
+
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
 
@@ -331,16 +358,19 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)
 
-    await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+    const parseResponse = await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+    throwIfParseServiceFailed(parseResponse, fileId)
 
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 30)
     const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
+    let lastStatus = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const response = await axios.post(
             `${baseUrl}/api/v2/files/parse/status`,
             { file_id_list: [fileId] },
             requestConfig
         )
+        throwIfParseServiceFailed(response, fileId)
         const payload = unwrapApiData(response)
         const records = Array.isArray(payload) ? payload : (payload?.list || payload?.items || [])
         const record = records.find(item => item?.file_id === fileId) || records[0]
@@ -350,10 +380,11 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         if (status === 'failed' || status === 'error') {
             throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
         }
+        if (status) lastStatus = status
         if (attempt < maxAttempts) await delay(intervalMs)
     }
 
-    throw new Error(`Qwen 文档解析超时: ${fileId}`)
+    throw new Error(`Qwen 文档解析超时: ${fileId} (last status="${lastStatus || 'none'}")`)
 }
 
 /**

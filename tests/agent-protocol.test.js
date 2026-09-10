@@ -925,6 +925,9 @@ test('oversized multimodal Agent context is externalized and upload failure keep
     {
       thresholdBytes: 1024,
       livePromptBytes: 4096,
+      // Compactar es opt-in (peticion sin tools). Ver el test siguiente para el defecto.
+      allowContextCompaction: true,
+      fallbackPromptBytes: 4096,
       uploader: async () => { throw new Error('parse failed') }
     }
   )
@@ -932,6 +935,35 @@ test('oversized multimodal Agent context is externalized and upload failure keep
   assert.match(compacted.payload.messages[0].content, /strict tool protocol with read_file/)
   assert.match(compacted.payload.messages[0].content, /continue the unfinished task/)
   assert.ok(Buffer.byteLength(compacted.payload.messages[0].content) <= 4096)
+})
+
+test('upload failure without explicit compaction permission rejects with a retryable error instead of a silent 200', async () => {
+  // 2026-09-09 21:25: el parse de Qwen cayo y cada turno con tools salio 200 con el
+  // 7–50 % del historial. Sin permiso explicito el fallo tiene que SALIR, no disimularse.
+  const original = [
+    '# Tools',
+    'strict tool protocol with read_file(path: string)',
+    '# Conversation history (JSONL)',
+    JSON.stringify({ role: 'tool', content: 'x'.repeat(12000) }),
+    '# Current message',
+    JSON.stringify({ role: 'user', content: 'continue the unfinished task' })
+  ].join('\n')
+  const parseDown = new Error('Qwen 文档解析服务失败: Internal_Server_Error (f1)')
+  await assert.rejects(
+    externalizeOversizedAgentContext(
+      { messages: [{ role: 'user', content: original }] },
+      'token',
+      {},
+      { thresholdBytes: 1024, livePromptBytes: 4096, uploader: async () => { throw parseDown } }
+    ),
+    (error) => {
+      assert.equal(error.code, 'context_externalization_failed')
+      assert.equal(error.cause, parseDown)
+      assert.equal(error.retryAfter, 10)
+      assert.match(error.message, /Internal_Server_Error/)
+      return true
+    }
+  )
 })
 
 test('externalized Agent context keeps system rules active task and recent tool progress inline', async () => {

@@ -1533,6 +1533,13 @@ const numberedResultOpen = (ordinal) => TOOL_RESULT_OPEN.replace(/:[ \t]*$/, ` #
  * @param {string|Object} [options.tool_choice] - OpenAI tool_choice 参数
  * @returns {string} 完整的工具调用系统提示词
  */
+/**
+ * Herramientas propias del chat de Qwen que el modelo conoce de memoria y aqui no existen.
+ * Medido 2026-09-09: 5 turnos en 30 min entregados a medias por invocarlas. Solo se
+ * nombran las que el cliente NO declaro (un `web_search` declarado es legitimo).
+ */
+const PLATFORM_ONLY_TOOL_NAMES = ['code_interpreter', 'web_search'];
+
 const buildToolSystemPrompt = (tools, options = {}) => {
   if (!Array.isArray(tools) || tools.length === 0) {
     return '';
@@ -1542,6 +1549,9 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     .map(compressToolDefinition)
     .filter(Boolean)
     .join('\n');
+
+  const declaredNames = new Set(tools.map(tool => tool?.function?.name || tool?.name).filter(Boolean));
+  const absentPlatformTools = PLATFORM_ONLY_TOOL_NAMES.filter(name => !declaredNames.has(name));
 
   const lines = [
     '# Tools',
@@ -1572,6 +1582,9 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     `- The JSON inside \`${TOOL_CALL_OPEN}\` must be valid and on a single logical block.`,
     `- Write the opening marker as exactly \`${TOOL_CALL_OPEN}\` and the closing marker as exactly \`${TOOL_CALL_CLOSE}\`, each on its own line. They never take attributes, an id, or the tool name — everything the call needs is inside the JSON.`,
     '- Use the exact tool name listed above.',
+    ...(absentPlatformTools.length > 0
+      ? [`- Only the tools listed above exist here. ${absentPlatformTools.map(name => `\`${name}\``).join(', ')} and other platform tools are NOT available; never call them.`]
+      : []),
     '- Provide all required arguments; omit unknown ones.',
     `- You may emit multiple \`${TOOL_CALL_OPEN}\` blocks back-to-back when more than one tool is needed.`,
     // Contrapeso a la linea de arriba y a la de "After every tool result...". Medido:

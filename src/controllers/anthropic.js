@@ -2630,7 +2630,9 @@ const handleAnthropicMessages = async (req, res) => {
     const built = await buildInternalRequest(req.body || {});
     const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
 
-    const upstreamResp = await sendChatRequest(body);
+    // Sin tools el contexto puede compactarse si el adjunto falla; con tools NO: un agente
+    // que ve una fraccion del historial repite lo hecho, asi que sale 529 reintentable.
+    const upstreamResp = await sendChatRequest(body, { allowContextCompaction: !hasTools });
     currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
       return res.status(500).json({
@@ -2671,7 +2673,9 @@ const handleAnthropicMessages = async (req, res) => {
     // `api_error`. Gemelo: chat.js#writeOpenAIHttpError. La deteccion es unica
     // (utils/upstream-error.js#describeUpstreamFailure); aqui solo se traduce al cable.
     const failure = describeUpstreamFailure(error, 500);
-    const errorType = failure.rateLimited ? RATE_LIMIT_ANTHROPIC_TYPE : 'api_error';
+    const errorType = failure.rateLimited
+      ? RATE_LIMIT_ANTHROPIC_TYPE
+      : (failure.overloaded ? 'overloaded_error' : 'api_error');
     // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
     // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
     noteRateLimitedAccount(error, currentAccount);

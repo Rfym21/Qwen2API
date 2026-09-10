@@ -84,6 +84,13 @@ const config = {
         8 * 1024,
         parseInt(process.env.AGENT_CONTEXT_LIVE_PROMPT_BYTES, 10) || 48 * 1024
     ),
+    // Presupuesto del fallback cuando el adjunto falla y la peticion NO lleva tools
+    // (con tools no se compacta: se responde 529/503 reintentable). Mas holgado que el
+    // live prompt porque aqui no hay adjunto que complete el resto.
+    agentContextFallbackPromptBytes: Math.max(
+        8 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_FALLBACK_PROMPT_BYTES, 10) || 84 * 1024
+    ),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',

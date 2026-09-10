@@ -1478,7 +1478,9 @@ const handleChatCompletion = async (req, res) => {
     const enable_web_search = req.enable_web_search
 
     try {
-        const response_data = await sendChatRequest(req.body)
+        // Gemelo de anthropic.js: compactar solo sin tools; con tools el fallo del
+        // adjunto sale como 503 reintentable (catch de abajo).
+        const response_data = await sendChatRequest(req.body, { allowContextCompaction: req.has_tools !== true })
 
         if (!response_data.status || !response_data.response) {
             res.status(500)
@@ -1536,6 +1538,18 @@ const handleChatCompletion = async (req, res) => {
 
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
+        // Adjunto de contexto caido con tools: 503 reintentable (gemelo del 529 de
+        // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.
+        const failure = describeUpstreamFailure(error, 500)
+        if (failure.overloaded) {
+            return writeOpenAIHttpError(res, {
+                status: 503,
+                message: error.publicMessage || 'Upstream context attachment unavailable; retry',
+                type: 'server_error',
+                code: 'upstream_unavailable',
+                retry_after: failure.retryAfter
+            })
+        }
         res.status(500)
             .json({
                 error: "Invalid token, request failed"
