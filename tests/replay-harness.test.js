@@ -250,7 +250,10 @@ test('parseArgs: the budget cannot be raised past the externalisation threshold'
 
 test('parseArgs: defaults target the population the numbering fix is aimed at', () => {
   const o = H.parseArgs([])
-  assert.match(o.transcript, /95b7b0c1/, 'default transcript must be the Read-heavy session')
+  // No built-in transcript default: transcripts are the operator's own sessions, so the harness
+  // refuses to run rather than shipping somebody's absolute path. --transcript / TRANSCRIPT supply it.
+  assert.equal(o.transcript, '', 'there must be no hardcoded transcript path')
+  assert.match(H.parseArgs(['--transcript', '/tmp/s.jsonl']).transcript, /s\.jsonl$/)
   assert.equal(o.resultCap, 1200, 'the p90 real result is 980 B and must survive intact')
   assert.equal(o.strata, 'gap')
   assert.equal(o.perTarget, 3)

@@ -232,9 +232,10 @@ const fs = require('fs')
 const { buildToolHistoryLedger, canonicalJson, neutraliseUntrustedBody } = require('../../src/utils/agent-turn.js')
 const { flattenAnthropicMessages } = require('../../src/controllers/anthropic.js')
 
-const DEFAULT_TRANSCRIPT =
-  '/Users/pedro/.claude/projects/-Users-pedro-Documents-git-Prueba-Qwen2API/' +
-  '95b7b0c1-da49-459f-8bb3-fab2fd7df7f7.jsonl'
+// Path to a Claude Code session transcript to replay. Supply it with --transcript or the
+// TRANSCRIPT env var; Claude Code stores them under ~/.claude/projects/<slugified-cwd>/<uuid>.jsonl.
+// There is deliberately no built-in default: transcripts are the operator's own work.
+const DEFAULT_TRANSCRIPT = process.env.TRANSCRIPT || ''
 
 // A call to one of these between j and i means the world may legitimately have
 // changed, so re-reading is correct behaviour rather than the failure under test.
@@ -933,6 +934,12 @@ async function main () {
     process.exit(2)
   }
   if (opts.help) { console.log(HELP); return }
+
+  if (!opts.transcript) {
+    console.error('No transcript given. Pass --transcript <file> or set TRANSCRIPT=<file>.')
+    console.error('Claude Code stores them under ~/.claude/projects/<slugified-cwd>/<uuid>.jsonl')
+    process.exit(2)
+  }
 
   const parsed = parseTranscript(opts.transcript)
   const { all, eligible, droppedNotAfterResult } = findOnsets(parsed, opts.mode)
