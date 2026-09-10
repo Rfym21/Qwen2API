@@ -210,9 +210,19 @@ test('ledger: el tope de entradas por defecto es exactamente 40, y conserva las 
 // se puede bajar a la mitad y las 896 pruebas siguen en verde.
 //
 // Alcance = con la llamada a punto de repetirse, el ledger construido con la historia
-// PREVIA todavia nombra la instancia anterior. Es el mecanismo entero: una entrada que
-// se cayo por el tope de bytes es una repeticion que el modelo ya no puede ver que hizo.
-const LEDGER_DEFAULT_MAX_BYTES = 12000
+// PREVIA todavia nombra la instancia anterior. Una entrada que se cayo por el tope de
+// bytes es una repeticion que el modelo ya no puede ver que hizo.
+//
+// EL DEFAULT VOLVIO A 6.000. El alcance es condicion necesaria para que el bloque
+// funcione, no evidencia de que funcione, y ese salto de 10,4 puntos nunca se tradujo en
+// un efecto medido: no hay ni ha habido un brazo con el bloque apagado. Su clase de
+// intervencion si esta medida —el hook de cliente del corpus, 364 disparos en 79
+// sesiones, RR 1,08 IC [0,90, 1,42] en train y 0,96 en holdout— y sale nula. El
+// razonamiento entero vive en agent-turn.js#buildToolHistoryLedger; aqui solo se clava el
+// numero. Este techo y el floor de abajo son las dos mitades: sin el floor el default se
+// puede bajar a 1.000 y el bloque desaparece en silencio; sin el techo se puede volver a
+// subir sin que nadie lo note.
+const LEDGER_DEFAULT_MAX_BYTES = 6000
 
 /**
  * n llamadas distintas con entradas PESADAS a proposito: ruta absoluta larga (los
@@ -237,7 +247,7 @@ const historiaPesada = (n) => {
   return messages
 }
 
-test('ledger: el tope de bytes por defecto alcanza a nombrar >=30 llamadas pesadas, las mas nuevas', () => {
+test('ledger: el tope de bytes por defecto alcanza a nombrar >=15 llamadas pesadas, las mas nuevas', () => {
   const messages = historiaPesada(60)
   const block = buildToolHistoryLedger(messages)
   const lines = entryLines(block)
@@ -249,10 +259,11 @@ test('ledger: el tope de bytes por defecto alcanza a nombrar >=30 llamadas pesad
     `entraron ${lines.length} lineas: el tope de ENTRADAS mordio primero y este test dejo de medir maxBytes`
   )
 
-  // El floor. Con 12.000 B y renglones de ~333 B entran 35; con los 6.000 B originales
-  // entran 17 y con 9.000 entran 26. Bajar el default rompe aqui, que es el punto.
+  // El floor. Con los 6.000 B de default y renglones de ~333 B entran 18; con 9.000
+  // entrarian 26 y con 12.000, 35. Bajar mas el default rompe aqui, que es el punto: el
+  // bloque tiene que seguir nombrando una cola util de llamadas recientes, no dos.
   assert.ok(
-    lines.length >= 30,
+    lines.length >= 15,
     `solo entraron ${lines.length} de 60 llamadas en ${Buffer.byteLength(block)} B: ` +
     `el tope de bytes dejo fuera ${60 - lines.length} llamadas que el modelo puede repetir sin verlo`
   )
@@ -370,7 +381,7 @@ test('ledger: la entrada MAS NUEVA sobrevive al presupuesto inline de una petici
 
   const enBloque = ordinalesDe(ledger)
   const enInline = ordinalesDe(inline)
-  assert.ok(enBloque.length >= 30, `el bloque solo trae ${enBloque.length} entradas`)
+  assert.ok(enBloque.length >= 15, `el bloque solo trae ${enBloque.length} entradas`)
 
   // EL PIN. La entrada mas nueva es la llamada que el modelo esta a punto de repetir:
   // es la unica que el bloque no puede permitirse perder. Con el ledger dentro del
@@ -875,6 +886,111 @@ test('wiring: el ledger se arma antes del folding, sobre bloques estructurados',
     assert.match(linea, /a\.txt/, `${label}: la entrada perdio los argumentos que la identifican`)
     assert.match(linea, /-> AAA/, `${label}: la entrada perdio el digest del resultado`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// El precio del bloque, medido donde se paga: en el prompt que sale, en las dos rutas.
+//
+// El default de maxBytes subio de 6.000 a 12.000 sobre una curva de ALCANCE (81,0% ->
+// 91,4% de las reemisiones quedan nombradas por el bloque). El alcance es condicion
+// NECESARIA para que el ledger sirva, no evidencia de que sirva — y la clase de
+// intervencion a la que pertenece si esta medida. El corpus trae un experimento natural:
+// un hook de cliente que sustituye el tool_result por "Wasted call — file unchanged since
+// your last Read. Refer to that earlier tool_result instead.", 364 disparos en 79
+// sesiones. Es una version ESTRICTAMENTE MAS FUERTE de lo que dice el ledger (va dentro
+// del resultado que el modelo acaba de pedir, nombra la ofensa concreta, 95 B, imposible
+// de no leer) y, condicionado a la poblacion en la que dispara, sale nula: repite otra vez
+// 64,0% con hook contra 59,1% sin el (RR 1,08, IC por sesion [0,90, 1,42]); en holdout
+// 43,0% contra 45,0% (RR 0,96). El signo por sesion es cara o cruz: 26 arriba, 12 iguales,
+// 22 abajo. Una version mas debil y mucho mas lejos del punto de decision no puede mas.
+//
+// Sin efecto medido, los bytes no se ganan el sitio: el bloque viaja en CADA request con
+// herramientas y, en una peticion externalizada, se cobra ademas ~2,9 renglones de
+// historia reciente inline (~7 KB de resultados de verdad) para nombrar llamadas a ~333 B.
+//
+// Este test mide el MECANISMO, no la constante: cuenta los bytes del bloque EN EL
+// CONTENIDO ENSAMBLADO que sale hacia upstream. Renombrar el knob, moverlo a un env var,
+// o pasar otro maxBytes desde uno de los dos call sites lo sigue disparando; un
+// `assert.equal(DEFAULT, 6000)` no.
+// ---------------------------------------------------------------------------
+
+const LEDGER_PROMPT_BYTE_CAP = 6000
+
+/** El bloque tal y como viaja en el contenido ensamblado: de su cabecera a la historia. */
+const ledgerBlockIn = (content, label) => {
+  const text = String(content)
+  const start = text.indexOf(LEDGER_HEADER)
+  assert.ok(start >= 0, `${label}: no hay ledger en el contenido ensamblado`)
+  const end = text.indexOf(`\n${HISTORY_HEADER}`, start)
+  assert.ok(end > start, `${label}: el ledger no termina antes de la historia`)
+  return text.slice(start, end)
+}
+
+/** historiaPesada(n) en forma nativa Anthropic, misma carga y mismos argumentos. */
+const historiaPesadaAnthropic = (n) => {
+  const out = [{ role: 'user', content: [{ type: 'text', text: 'audita el paquete utils' }] }]
+  for (const message of historiaPesada(n)) {
+    if (message.role === 'assistant') {
+      const fn = message.tool_calls[0]
+      out.push({
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: `toolu_${fn.id}`, name: fn.function.name, input: JSON.parse(fn.function.arguments) }]
+      })
+    } else {
+      out.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_${message.tool_call_id}`, content: message.content }] })
+    }
+  }
+  return out
+}
+
+test('wiring: el ledger que sale hacia upstream cabe en su presupuesto de bytes, en ambas rutas', async () => {
+  const rutas = [
+    ['anthropic', await anthropicContent({ messages: historiaPesadaAnthropic(60) })],
+    ['openai', await openaiContent({ messages: [{ role: 'user', content: 'audita el paquete utils' }, ...historiaPesada(60)] })]
+  ]
+
+  for (const [label, content] of rutas) {
+    const bloque = ledgerBlockIn(content, label)
+    const bytes = Buffer.byteLength(bloque)
+
+    // Guardia: si el fixture no llegara a recortar, el techo se cumpliria por no haber
+    // suficiente historia y este test no mediria el tope de nada.
+    assert.match(
+      bloque,
+      /omitted/,
+      `${label}: el fixture no llego a recortar (${bytes} B); este test no esta midiendo el tope`
+    )
+
+    assert.ok(
+      bytes <= LEDGER_PROMPT_BYTE_CAP,
+      `${label}: el ledger inyecta ${bytes} B de prompt en cada request con herramientas, ` +
+      `contra un presupuesto de ${LEDGER_PROMPT_BYTE_CAP} B. La clase de intervencion que ` +
+      'justifica esos bytes se midio nula (hook cliente, 364 disparos, RR 1,08 [0,90, 1,42]); ' +
+      'subir el tope necesita un efecto medido que sobreviva a un holdout, no una curva de alcance.'
+    )
+
+    // Y el techo no puede cumplirse emitiendo nada: el bloque sigue nombrando las
+    // llamadas MAS NUEVAS, que son las que el modelo esta a punto de repetir.
+    const ordinales = bloque.split('\n').filter(l => /^#\d+\s/.test(l)).map(l => Number(l.match(/^#(\d+)/)[1]))
+    assert.ok(
+      ordinales.length >= 15,
+      `${label}: solo sobrevivieron ${ordinales.length} entradas; el recorte se comio el bloque`
+    )
+    assert.equal(ordinales[0], 60, `${label}: la entrada mas nueva no es la primera del bloque`)
+    assert.deepEqual(
+      ordinales,
+      Array.from({ length: ordinales.length }, (_, i) => 60 - i),
+      `${label}: el recorte por bytes debe conservar la cola mas nueva, no un tramo del medio`
+    )
+  }
+
+  // Gemelas: el mismo bloque logico pesa lo mismo en las dos rutas. Un call site que
+  // pasara su propio maxBytes rompe aqui aunque el otro siga en presupuesto.
+  assert.equal(
+    Buffer.byteLength(ledgerBlockIn(rutas[0][1], 'anthropic')),
+    Buffer.byteLength(ledgerBlockIn(rutas[1][1], 'openai')),
+    'las dos rutas inyectan ledgers de distinto tamano para la misma historia'
+  )
 })
 
 /**

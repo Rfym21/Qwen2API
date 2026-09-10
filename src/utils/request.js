@@ -75,7 +75,11 @@ const truncateUtf8HeadTail = (
 // la rebanada de cola conserva sus entradas mas viejas y el hueco compactado se lleva las
 // mas nuevas — justo la llamada que el modelo esta a punto de repetir, que es la unica
 // razon por la que el bloque existe. Con el tope en 6000 B el bloque cabia entero en esa
-// cola por casualidad aritmetica; a 12000 ya no. Medido sobre 48 sobres externalizados
+// cola por casualidad aritmetica; a 12000 ya no. El tope volvio a 6000 (ver el porque en
+// agent-turn.js#buildToolHistoryLedger), pero la seccion propia SE QUEDA: la casualidad
+// aritmetica no es una garantia, y lo que arregla es el ORDEN de lo que sobrevive — las
+// entradas MAS NUEVAS, que es la unica propiedad que el bloque no puede perder. Medido
+// sobre 48 sobres externalizados
 // (94-384 KB, 8-60 herramientas, 30-120 llamadas): dentro del prefijo sobrevivian 23-24
 // entradas de las 30-37 del bloque y en 44 de los 48 la MAS NUEVA no llegaba; en seccion
 // propia llegan los 48 de 48 enteros. tests/tool-repetition.test.js lo clava.
@@ -279,13 +283,13 @@ const buildBudgetedAgentPrompt = (
     const naturalBytes = sections.map(section => byteLength(section.value))
 
     // El ledger se sirve ANTES del reparto por pesos, y por una razon distinta a las demas
-    // secciones: es pequeno, esta acotado en origen (12000 B) y ya sabe degradar solo, con
+    // secciones: es pequeno, esta acotado en origen (6000 B) y ya sabe degradar solo, con
     // renglones enteros y su nota de omision. Darle un peso lo dejaria a merced del reparto
     // — con el pool tipico, un 8% son 3872 B y el bloque saldria recortado siempre — y
     // meterlo en el prefijo es lo que rompio la version anterior de esto.
     //
     // El tope de un cuarto del pool no es para produccion: con los 48 KiB por defecto el
-    // pool son ~48400 B y el bloque entero (<=12000) cabe con holgura. Existe para que un
+    // pool son ~48400 B y el bloque entero (<=6000) cabe con holgura. Existe para que un
     // AGENT_CONTEXT_LIVE_PROMPT_BYTES pequeno no deje al resto sin sitio; ahi el bloque se
     // recorta por renglones, conservando los MAS NUEVOS, que es lo que se pedia.
     const ledgerIndex = sections.findIndex(section => section.kind === 'ledger')

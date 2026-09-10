@@ -742,14 +742,15 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   (con assistant.tool_calls y role=tool estructurados, no ya convertidos a texto)
  * @param {Object} [options]
  * @param {number} [options.maxEntries=40] - tope de entradas, las mas recientes primero
- * @param {number} [options.maxBytes=12000] - tope duro del bloque completo, y el knob que
+ * @param {number} [options.maxBytes=6000] - tope duro del bloque completo, y el knob que
  *   REALMENTE gobierna: una entrada ASCII realista (Read con ruta absoluta + digest lleno)
  *   pesa ~223 B y una pesada ~333 B, asi que los bytes muerden antes que maxEntries en
  *   todos los recortes reales — el ledger nunca llega a sus 40 entradas anunciadas.
  *
- *   El 12000 esta medido, no elegido. Alcance = con la llamada a punto de repetirse, el
- *   ledger construido con la historia previa todavia nombra la instancia anterior. Sobre
- *   199 sesiones reales de Claude Code con duplicados (18.008 llamadas, 1.970 reemisiones):
+ *   ESTE NUMERO BAJO DE 12.000 A 6.000. Lo que lo habia subido era una curva de ALCANCE.
+ *   Alcance = con la llamada a punto de repetirse, el ledger construido con la historia
+ *   previa todavia nombra la instancia anterior. Sobre 199 sesiones reales de Claude Code
+ *   con duplicados (18.008 llamadas, 1.970 reemisiones):
  *
  *     6.000 B  81,0% de alcance   5.315 B/request de media
  *     9.000 B  88,7%              7.612 B      (+7,8 pp por +2.297 B = 67 casos/KB)
@@ -758,16 +759,47 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *    24.000 B  96,5%             14.761 B      (+1,3 pp por +2.925 B =  9 casos/KB)
  *    sin tope 100,0%             30.091 B      (+1,9 pp por +12.549 B = 3 casos/KB)
  *
- *   La curva se dobla despues de 16.000; 12.000 esta en el tramo empinado y compra 10,4
- *   puntos sobre el default viejo. Subir maxEntries en cambio no compra casi nada: a
- *   12.000 B, pasar de 40 a 60 entradas movio el alcance del 91,4% al 91,8%.
+ *   La tabla sigue siendo cierta y por eso se conserva. Lo que no era cierto es lo que se
+ *   dedujo de ella: el alcance es condicion NECESARIA para que el bloque funcione, no
+ *   evidencia de que funcione. El EFECTO del bloque no se ha medido nunca — no existe un
+ *   brazo con el bloque apagado.
  *
- *   El coste contra el umbral de externalizacion de 90 KiB resulto ser el argumento
- *   debil: medido sobre 25.576 fronteras de request reales, el 71,2% YA estaba por
- *   encima del umbral con el ledger de 6.000 (la conversacion mediana pesa 169 KB), y
- *   subir a 12.000 empuja al otro lado solo a 116 de 25.576 = 0,45% de las peticiones.
- *   Ahi es justo donde hace falta: el 76% de las reemisiones ocurren en peticiones ya
- *   externalizadas, donde el alcance con 6.000 caia al 77,0% y con 12.000 sube al 89,4%.
+ *   Lo que si esta medido es su CLASE de intervencion: poner delante del modelo "esto ya
+ *   lo corriste, reusa el resultado". El corpus trae ese experimento natural. Un hook de
+ *   cliente sustituye el tool_result por «Wasted call — file unchanged since your last
+ *   Read. Refer to that earlier tool_result instead.»: 364 disparos en 79 sesiones. Es una
+ *   version ESTRICTAMENTE MAS FUERTE que este bloque — va dentro del resultado que el
+ *   modelo acaba de pedir, nombra la ofensa concreta, pesa 95 B y es imposible de no leer,
+ *   mientras el ledger es una nota generica muy arriba en el contexto, lejos del punto en
+ *   que el modelo decide. Condicionado
+ *   a la poblacion en la que dispara (Reads que YA son reemisiones), medir si el modelo
+ *   vuelve a repetir da:
+ *
+ *     train    con hook 162/253 = 64,0%   sin hook 185/313 = 59,1%   RR 1,08  IC [0,90, 1,42]
+ *     holdout  con hook  34/79  = 43,0%   sin hook  36/80  = 45,0%   RR 0,96  IC [0,59, 1,86]
+ *
+ *   Signo por sesion: 26 arriba, 12 iguales, 22 abajo — cara o cruz. Una clave llego a
+ *   llevar 32 avisos y el bucle sobrevivio a los 32. El limite superior del IC de train
+ *   (1,42) descarta cualquier beneficio grande. Una version mas debil y mas lejos del
+ *   punto de decision no puede hacer mas que esa.
+ *
+ *   Y el coste si es cierto. En una peticion externalizada el bloque se lleva hasta un
+ *   cuarto del pool inline (LEDGER_POOL_SHARE, utils/request.js): medido sobre la rejilla
+ *   de 48 sobres, ~2,9 renglones de historia reciente (12,0 -> 9,1 de media) a ~2,5 KB de
+ *   resultado crudo por renglon = ~7 KB de resultados de herramienta DE VERDAD desalojados
+ *   para nombrar llamadas a ~333 B. Ahi es donde ocurre el 76% de las reemisiones.
+ *
+ *   6.000 y no 0: hay evidencia de que el beneficio no esta medido y de que su analogo mas
+ *   cercano sale nulo, pero NO hay evidencia de que el bloque haga dano. 6.000 parte por la
+ *   mitad un coste cierto contra un beneficio incierto y conserva el artefacto para poder
+ *   someterlo a un A/B de verdad (aleatorizado POR SESION, no por request). Subirlo otra
+ *   vez pide un efecto medido que sobreviva a un holdout, no una curva de alcance: cuatro
+ *   workflows y ~120 agentes ya mataron tres hipotesis causales por confundir las dos cosas.
+ *
+ *   El coste contra el umbral de externalizacion de 90 KiB resulto ser el argumento debil:
+ *   medido sobre 25.576 fronteras de request reales, el 71,2% YA estaba por encima del
+ *   umbral con el ledger de 6.000 (la conversacion mediana pesa 169 KB). Cruzar el umbral
+ *   nunca fue el problema; el desalojo inline si.
  *
  *   Las cifras de arriba son de ALCANCE DEL BLOQUE: lo que el ledger contiene. No es lo
  *   mismo que lo que el modelo lee. En una peticion externalizada el bloque pasa todavia
@@ -778,32 +810,33 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   el bloque cabia entero en esa cola por casualidad aritmetica; a 12.000 ya no.
  *
  *   Hoy el ledger es su propia seccion alli, con presupuesto reservado antes del reparto
- *   por pesos y recorte propio (truncateToolHistoryLedger). Medido sobre una rejilla de 48
- *   sobres externalizados (94-384 KB crudos, 8-60 herramientas, 30-120 llamadas, system
- *   prompt de 3 a 50 KB): con el ledger dentro del prefijo sobrevivian 23-24 entradas de
- *   30-37 y en 44 de las 48 formas la MAS NUEVA no llegaba; con la seccion propia llegan
- *   las 48 de 48 completas. Con eso el alcance del bloque y lo que el modelo lee vuelven a
- *   ser el mismo numero, que es lo que hace citables las cifras de arriba. Cuesta ~2,9
- *   renglones de historia reciente inline (12,0 -> 9,1 de media en la misma rejilla): son
- *   ~2,5 KB por renglon de resultado crudo a cambio de ~333 B por llamada nombrada.
- *   Lo clava el test de supervivencia inline de tests/tool-repetition.test.js, que es el
- *   unico que mide lo que el modelo ve.
+ *   por pesos y recorte propio (truncateToolHistoryLedger). Esa reparacion es correcta por
+ *   su cuenta y SE QUEDA: hizo que sobrevivieran las entradas MAS NUEVAS en vez de las mas
+ *   viejas, que es lo unico que el bloque no puede permitirse perder. Medido sobre una
+ *   rejilla de 48 sobres externalizados (94-384 KB crudos, 8-60 herramientas, 30-120
+ *   llamadas, system prompt de 3 a 50 KB): con el ledger dentro del prefijo sobrevivian
+ *   23-24 entradas de 30-37 y en 44 de las 48 formas la MAS NUEVA no llegaba; con la
+ *   seccion propia llegan las 48 de 48 completas. Volver a 6.000 no deshace nada de eso:
+ *   el bloque simplemente cabe con mas holgura. Lo clava el test de supervivencia inline
+ *   de tests/tool-repetition.test.js, que es el unico que mide lo que el modelo ve.
  *
  *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
  *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision
  *   se dispara igual. Se conservan las MAS RECIENTES, que son las que el modelo esta a
  *   punto de repetir, y esa propiedad ahora sobrevive al presupuesto inline en vez de
  *   invertirse en el. El floor lo clava tests/tool-repetition.test.js; el tope superior,
- *   el test de al lado. Los dos hacen falta: solo el tope deja bajar el numero a 1.000.
+ *   el test de al lado; y el precio que se paga de verdad —los bytes que salen ensamblados
+ *   hacia upstream en las DOS rutas— el test de wiring que los cuenta ahi y no en la
+ *   constante. Los tres hacen falta: solo el tope deja bajar el numero a 1.000.
  * @returns {string} el bloque, o '' si no hay historia de herramientas
  */
-const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 12000 } = {}) => {
+const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } = {}) => {
   if (!Array.isArray(messages) || messages.length === 0) return '';
   const limit = Number.isFinite(maxEntries) ? Math.max(0, Math.trunc(maxEntries)) : 40;
   if (limit === 0) return '';
   // Sin este guard un maxBytes basura (NaN) hace que toda comparacion sea false y el
   // bloque salga SIN tope — justo lo que no puede pasar en algo que se inyecta siempre.
-  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 12000;
+  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 6000;
 
   const byKey = new Map();   // name + canonicalJson(args) -> entrada
   // id de la llamada -> { clave, ordinal DE ESA llamada }. El ordinal va aqui y no en la
