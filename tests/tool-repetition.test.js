@@ -330,7 +330,12 @@ test('ledger: el bloque nunca pasa su tope de bytes', () => {
 // aritmetica; subirlo a 12.000 lo rompio.
 //
 // Ninguna prueba podia verlo: todas llamaban a buildToolHistoryLedger directamente y
-// ninguna pasaba el bloque por el presupuesto. Esta si.
+// ninguna pasaba el bloque por el presupuesto. Las de aqui abajo si — pero no todas lo
+// VEN. Al tope de 6.000 que se envia hoy el bloque cabe entero en la rebanada de cola del
+// prefijo (~7,1-7,8 KB con el presupuesto de produccion), asi que el primer test PASA
+// tambien con el ledger dentro del prefijo: es ciego a la regresion. Lo que la vigila son
+// los brazos por encima del default —12.000 en «llega intacto», 24.000 en el de
+// degradado— y el diferencial enterrado/seccion, que la mide sin parchear el codigo.
 const { buildAgentContextLivePrompt } = requestModule
 
 const HERRAMIENTAS = [
@@ -435,10 +440,14 @@ const SEPARADOR_DE_COMPACTADO = '...[inline context compacted; complete copy is 
  *               y hasta la cabecera desaparece del prompt
  *
  * O sea: al bajar el tope a 6.000, el brazo de 6.000 dejo de poder ver la regresion que
- * la seccion propia arregla —cabe en la rebanada de cola por casualidad aritmetica—. Por
- * eso el brazo de 12.000 se queda aunque ya no sea el default: es el unico que vigila el
- * mecanismo al presupuesto de produccion. Antes de este test solo lo vigilaba el test de
- * al lado, y solo con un AGENT_CONTEXT_LIVE_PROMPT_BYTES de 12.000, que no es produccion.
+ * la seccion propia arregla. Y no por casualidad de este fixture: la rebanada de cola del
+ * prefijo mide ~7,1-7,8 KB al presupuesto de produccion, asi que cualquier bloque acotado
+ * a 6.000 B cabe entero en ella (lo mide el test de mas abajo, brazo por brazo). Por eso
+ * el brazo de 12.000 se queda aunque ya no sea el default: al presupuesto de produccion
+ * es el unico brazo de ESTE test que ve el mecanismo. No esta solo en el
+ * archivo — el de degradado (24.000) y el diferencial enterrado/seccion tambien lo ven al
+ * mismo presupuesto — pero antes de los tres el unico testigo era el test de al lado, y
+ * solo con un AGENT_CONTEXT_LIVE_PROMPT_BYTES de 12.000, que no es produccion.
  */
 test('ledger: llega intacto aunque el prefijo se recorte, y el tope alto es lo que lo pone en riesgo', () => {
   for (const maxBytes of [LEDGER_DEFAULT_MAX_BYTES, 12000]) {
@@ -475,6 +484,94 @@ test('ledger: llega intacto aunque el prefijo se recorte, y el tope alto es lo q
       `cap ${maxBytes}: el bloque llego recortado — ${enInline.length} de ${enBloque.length} entradas, ` +
       `${enInline.length ? `#${enInline[0]}..#${enInline[enInline.length - 1]}` : '(ninguna)'} ` +
       `de #${enBloque[0]}..#${enBloque[enBloque.length - 1]}`
+    )
+  }
+})
+
+/**
+ * La contraprueba del test de arriba, y la unica forma de mirar la regresion de 258a658
+ * sin parchear el codigo: el bloque se ENTIERRA en el prefijo dentro del propio fixture.
+ * Basta una sangria de un byte — la cabecera deja de estar a principio de linea, asi que
+ * splitAgentLedger no la reclama y el bloque viaja pegado al final de envelope.prefix,
+ * que es exactamente la forma que tenia antes de tener seccion propia.
+ *
+ * Medido con el presupuesto inline de produccion (48 KiB), sobre el fixture de este
+ * archivo:
+ *
+ *   cap  6.000   bloque  5.882 B   seccion 18/18   enterrado 18/18        -> IDENTICOS
+ *   cap 12.000   bloque 11.886 B   seccion 37/37   enterrado 23/37, #46   -> se ve
+ *
+ * Los dos brazos hacen falta, y por razones distintas:
+ *
+ * - El de 6.000 clava POR QUE el brazo alto no se puede borrar por «ya no es el default».
+ *   Al tope que se envia hoy la regresion es invisible, y no por casualidad de este
+ *   fixture: la rebanada de cola del prefijo mide ~7,1-7,8 KB con el presupuesto de
+ *   produccion (medido: un bloque de 7.146 B todavia cabe entero, uno de 7.778 ya no) y
+ *   el tope corta el bloque muy por debajo de eso, asi que CUALQUIER bloque de <=6.000 B
+ *   cabe. Si un dia deja de caber —tope mas alto, presupuesto mas bajo, otros pesos—
+ *   este brazo falla y avisa de que el reparto se movio y los comentarios que dicen «a
+ *   este tope no se ve» han dejado de ser ciertos.
+ * - El de 12.000 es la prueba diferencial del arreglo: con seccion propia llegan las 37;
+ *   enterrado sobrevive la COLA —las 23 mas viejas— y se pierden las 14 MAS NUEVAS, que
+ *   son las unicas que el bloque no puede permitirse perder. Si alguien deshace la
+ *   seccion propia, el brazo «seccion» pasa a comportarse como el «enterrado» y esta
+ *   asercion cae sin que haya que inyectar nada en el codigo.
+ */
+test('ledger: enterrado en el prefijo pierde las MAS NUEVAS, y al tope que se envia eso no se ve', () => {
+  // Una sangria de 1 byte saca la cabecera del principio de linea y splitAgentLedger deja
+  // de reclamar el bloque. El contenido del bloque no cambia.
+  const enterrarEnElPrefijo = (bloque) => ` ${bloque}`
+
+  const inlineDe = (texto) => {
+    const original = peticionExternalizada(texto)
+    assert.ok(
+      Buffer.byteLength(original) > 92160,
+      `la peticion midio ${Buffer.byteLength(original)} B: no llega al umbral de externalizacion ` +
+      'y este test no mide el regimen que dice medir'
+    )
+    const inline = buildAgentContextLivePrompt(original)
+    assert.match(inline, /compacted/, 'nada se recorto: el presupuesto no llego a morder')
+    return inline
+  }
+
+  for (const [maxBytes, seVeLaRegresion] of [[LEDGER_DEFAULT_MAX_BYTES, false], [12000, true]]) {
+    const bloque = buildToolHistoryLedger(historiaPesada(60), { maxBytes })
+    const enBloque = ordinalesDe(bloque)
+    const conSeccion = ordinalesDe(inlineDe(bloque))
+    const enterrado = ordinalesDe(inlineDe(enterrarEnElPrefijo(bloque)))
+
+    assert.deepEqual(
+      conSeccion, enBloque,
+      `cap ${maxBytes}: con seccion propia el bloque tiene que llegar entero, y llegaron ` +
+      `${conSeccion.length} de ${enBloque.length} entradas`
+    )
+    assert.ok(
+      enterrado.length > 0,
+      `cap ${maxBytes}: enterrado no llego ni una entrada — la sangria dejo de enterrar el bloque ` +
+      'o el fixture cambio, y este test dejo de comparar las dos formas'
+    )
+
+    if (!seVeLaRegresion) {
+      assert.deepEqual(
+        enterrado, enBloque,
+        `cap ${maxBytes}: enterrado en el prefijo el bloque YA se recorta (${enterrado.length} de ` +
+        `${enBloque.length}), asi que el brazo del default ha dejado de ser ciego a la regresion. ` +
+        'No es un fallo del codigo: es que el reparto del presupuesto se movio. Remedir la ' +
+        'rebanada de cola y corregir los comentarios que dicen «a este tope no se ve» antes de ' +
+        'tocar nada mas.'
+      )
+      continue
+    }
+
+    assert.ok(
+      !enterrado.includes(enBloque[0]),
+      `cap ${maxBytes}: enterrado en el prefijo la entrada MAS NUEVA (#${enBloque[0]}) sobrevivio, ` +
+      'asi que este brazo ya no vigila la regresion que la seccion propia arregla'
+    )
+    assert.deepEqual(
+      enterrado, enBloque.slice(enBloque.length - enterrado.length),
+      `cap ${maxBytes}: enterrado tiene que sobrevivir la COLA del bloque —las mas VIEJAS—, que es ` +
+      'el modo de fallo concreto que la seccion propia arregla'
     )
   }
 })

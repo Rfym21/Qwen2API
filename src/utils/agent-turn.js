@@ -827,9 +827,14 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   el ledger devuelto al interior del prefijo (la regresion que la seccion propia
  *   arregla), a 6.000 el bloque sigue llegando entero —cabe en la rebanada de cola— y
  *   ninguna asercion se entera; a 12.000 llegan 23 de 37 entradas, se pierden las 14 MAS
- *   NUEVAS y desaparece hasta la cabecera. Por eso el test de supervivencia inline corre
- *   los DOS topes y el brazo de 12.000 se queda aunque ya no sea el default: es el unico
- *   que vigila el mecanismo al presupuesto de produccion.
+ *   NUEVAS y desaparece hasta la cabecera. Y la ceguera del brazo bajo no es casualidad de
+ *   un fixture: la rebanada de cola del prefijo mide ~7,1-7,8 KB al presupuesto de
+ *   produccion, asi que CUALQUIER bloque acotado a 6.000 B cabe entero en ella. Por eso el
+ *   test de supervivencia inline corre los DOS topes y el brazo de 12.000 se queda aunque
+ *   ya no sea el default. No es el unico testigo: el test de degradado (24.000) y el
+ *   diferencial enterrado/seccion tambien ven el mecanismo al presupuesto de produccion.
+ *   Los tres estan en tests/tool-repetition.test.js y ninguno se puede borrar por «ya no
+ *   es el default».
  *
  *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
  *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision
