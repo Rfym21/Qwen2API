@@ -52,15 +52,20 @@ const isRateLimitError = (error) => {
 const CONTEXT_ATTACHMENT_CODE = 'context_externalization_failed';
 const CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS = 10;
 
+const describeContextAttachmentCause = (cause) => {
+  const code = cause?.parseCode;
+  if (code === 'WAF_CAPTCHA') return 'Upstream WAF is challenging document parse; retry shortly';
+  if (code === 'PARSE_RATE_LIMITED') return 'Upstream document parse rate limit reached; retry shortly';
+  return 'Upstream document parse unavailable; retry shortly';
+};
+
 class ContextExternalizationError extends Error {
   constructor(cause) {
     super(`Agent context attachment failed: ${cause?.message || cause}`);
     this.name = 'ContextExternalizationError';
     this.code = CONTEXT_ATTACHMENT_CODE;
     this.cause = cause;
-    this.publicMessage = cause?.parseCode === 'WAF_CAPTCHA'
-      ? 'Upstream WAF is challenging document parse; retry shortly'
-      : 'Upstream document parse unavailable; retry shortly';
+    this.publicMessage = describeContextAttachmentCause(cause);
     // El cortacircuitos de upload.js sabe cuanto va a rechazar sin subir nada; pedir al
     // cliente que vuelva antes solo encadena 529.
     const wait = Number(cause?.retryAfterSeconds);

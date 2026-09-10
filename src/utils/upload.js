@@ -456,10 +456,16 @@ const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
  * tiempo en Retry-After y el primer parse bueno lo cierra. No es evasion del WAF: es
  * dejar de golpearlo.
  */
+// Reloj inyectable: breaker y limitador comparten la fuente de tiempo para que los
+// tests avancen la ventana sin dormir.
+let parseClock = () => Date.now()
+const nowMs = () => parseClock()
+const setParseClockForTests = (fn) => { parseClock = typeof fn === 'function' ? fn : () => Date.now() }
+
 const PARSE_BREAKER_STRIKES = 3
 const parseBreaker = { strikes: 0, openUntil: 0 }
 
-const parseBreakerRemainingSeconds = () => Math.max(0, Math.ceil((parseBreaker.openUntil - Date.now()) / 1000))
+const parseBreakerRemainingSeconds = () => Math.max(0, Math.ceil((parseBreaker.openUntil - nowMs()) / 1000))
 
 const resetParseBreaker = () => {
     parseBreaker.strikes = 0
@@ -476,7 +482,7 @@ const noteParseOutcome = (error) => {
     parseBreaker.strikes += 1
     const cooldownSeconds = Math.max(0, Number(config.agentParseBreakerSeconds) || 0)
     if (cooldownSeconds > 0 && parseBreaker.strikes >= PARSE_BREAKER_STRIKES) {
-        parseBreaker.openUntil = Date.now() + cooldownSeconds * 1000
+        parseBreaker.openUntil = nowMs() + cooldownSeconds * 1000
         error.retryAfterSeconds = cooldownSeconds
         logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传`, 'UPLOAD')
     }
@@ -493,10 +499,49 @@ const assertParseBreakerClosed = () => {
     throw error
 }
 
+/**
+ * Limitador de ritmo del parse. El WAF de Aliyun cuenta POST /files/parse por IP de
+ * origen: el 2026-09-10 12:28-12:31 diez upload+parse en 150 s (un turno de Claude Code
+ * cada ~15 s, 120-195 KB cada uno) bastaron para que empezara a desafiar; ~1/hora nunca
+ * lo hace. El breaker solo reacciona DESPUES del desafio y luego bloquea 300 s. Aqui se
+ * reserva un hueco ANTES de tocar STS/OSS/parse: sin hueco, 529 inmediato con Retry-After
+ * corto (5-20 s) y el cliente agentico se autorregula. Los intentos limitados no llegan
+ * al WAF, asi que no cuentan como strike. `agentParseMaxPerWindow` = 0 lo desactiva.
+ */
+const PARSE_RATE_LIMITED_CODE = 'PARSE_RATE_LIMITED'
+const PARSE_RATE_RETRY_MIN_SECONDS = 5
+const PARSE_RATE_RETRY_MAX_SECONDS = 20
+const parseWindow = []
+
+const resetParseRateLimiter = () => { parseWindow.length = 0 }
+
+const takeParseSlot = () => {
+    const max = Math.max(0, parseInt(config.agentParseMaxPerWindow, 10) || 0)
+    if (max <= 0) return
+    const windowSeconds = Math.max(1, parseInt(config.agentParseWindowSeconds, 10) || 120)
+    const windowMs = windowSeconds * 1000
+    const now = nowMs()
+    while (parseWindow.length > 0 && parseWindow[0] <= now - windowMs) parseWindow.shift()
+    if (parseWindow.length < max) {
+        parseWindow.push(now)
+        return
+    }
+    const untilFree = Math.ceil((parseWindow[0] + windowMs - now) / 1000)
+    const retryAfter = Math.min(PARSE_RATE_RETRY_MAX_SECONDS, Math.max(PARSE_RATE_RETRY_MIN_SECONDS, untilFree))
+    logger.warn(`Agent 上下文解析已达速率上限 (${max}/${windowSeconds}s)，${retryAfter}s 后重试`, 'UPLOAD')
+    const error = new Error(`Qwen 文档解析服务失败: ${PARSE_RATE_LIMITED_CODE} (${max}/${windowSeconds}s reached, upload skipped)`)
+    error.code = 'qwen_parse_rate_limited'
+    error.parseCode = PARSE_RATE_LIMITED_CODE
+    error.retryAfterSeconds = retryAfter
+    error.breakerOpen = false
+    throw error
+}
+
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
     if (content.length === 0) throw new Error('Agent 上下文为空')
     assertParseBreakerClosed()
+    takeParseSlot()
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
     try {
@@ -523,5 +568,8 @@ module.exports = {
     uploadAgentContextFile,
     resetParseBreaker,
     noteParseOutcome,
-    assertParseBreakerClosed
+    assertParseBreakerClosed,
+    takeParseSlot,
+    resetParseRateLimiter,
+    setParseClockForTests
 }

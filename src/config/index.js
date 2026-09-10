@@ -98,6 +98,18 @@ const config = {
         const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
         return Number.isFinite(raw) && raw >= 0 ? raw : 300
     })(),
+    // Limitador de ritmo del parse (src/utils/upload.js): como maximo MAX upload+parse por
+    // ventana de WINDOW segundos por proceso; el resto recibe 529 con Retry-After corto
+    // ANTES de que el WAF (que cuenta por IP) empiece a desafiar. Medido 2026-09-10:
+    // 10 en 150 s disparan el desafio. MAX = 0 lo desactiva.
+    agentParseMaxPerWindow: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_MAX_PER_WINDOW, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 6
+    })(),
+    agentParseWindowSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_WINDOW_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 120
+    })(),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',
