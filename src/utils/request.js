@@ -5,9 +5,10 @@ const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 const { generateUUID, jitter } = require('./tools.js')
-const { uploadAgentContextFile } = require('./upload.js')
+const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
 const { ContextExternalizationError } = require('./upstream-error.js')
+const { contextPrefixCache, prefixMatches, hashText } = require('./context-prefix-cache.js')
 const { TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger } = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
@@ -409,9 +410,59 @@ const compactAgentContextFallback = (original, maxBytes = config.agentContextFal
     return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: false })
 }
 
+// Reutilizacion del prefijo de historial entre turnos (context-prefix-cache.js). En este
+// camino el archivo contiene SOLO el bloque `# Conversation history (JSONL)` tal como se
+// renderizo cuando se subio; system + tools, ledger, mensaje actual y la cola del historial
+// que aun no esta en el archivo van completos inline. Nada se compacta, asi que el
+// separador `[inline context compacted; ...]` no aparece: solo lo emite el camino B2
+// (archivo = sobre entero), donde sigue siendo verdad. La cabecera literal HISTORY_MARKER
+// se conserva para que getMessageTextContent siga encontrando la parte de texto; la linea
+// entre corchetes no es JSON y parseAgentEnvelope ya salta esas lineas.
+const HISTORY_ATTACHMENT_NAME_PREFIX = 'QWEN2API_AGENT_HISTORY_'
+// Margen sobre la prueba de encaje del horneado: el descriptor real difiere del de relleno
+// en unos bytes (timestamps, url) y el sobre exterior escapa el JSONL.
+const BAKE_FIT_MARGIN_BYTES = 2048
+
+const buildHistoryAttachmentLine = (attachmentName, prefixLines) => (
+    `[earlier history: the first ${prefixLines} JSONL messages are in the attachment ${attachmentName}; ` +
+    `the JSONL below continues from message ${prefixLines + 1}]`
+)
+
+const buildPrefixAttachmentNotice = (attachmentName, prefixLines) => [
+    '# Agent context attachment',
+    `The EARLIER part of the conversation history (the first ${prefixLines} JSONL messages) is attached as ${attachmentName}. ` +
+    `The "${HISTORY_MARKER}" section below CONTINUES it verbatim; together they are the complete history.`,
+    'The system instructions, tool schemas, executed-call ledger and current message are complete inline. Read the attachment as the authoritative earlier history before acting.',
+    'Continue from the latest state; do not restart the task, stop after one intermediate action, or claim completion without tool-result verification.',
+    `When an available tool is needed, emit the real \`${TOOL_CALL_OPEN}\` block immediately. Do not replace it with prose such as “I will run...” or “done”.`
+].join('\n')
+
+/** Texto inline al hornear (tail = '') y al reutilizar (tail = lineas que no estan en el archivo). */
+const buildPrefixReusePrompt = (envelope, { attachmentName, prefixLines }, tail) => [
+    buildPrefixAttachmentNotice(attachmentName, prefixLines),
+    envelope.prefix,
+    envelope.ledger,
+    [HISTORY_MARKER, buildHistoryAttachmentLine(attachmentName, prefixLines), tail].filter(Boolean).join('\n'),
+    envelope.current
+].filter(Boolean).join('\n\n')
+
+const countLines = (text) => (text ? String(text).split('\n').length : 0)
+
+// Un horneado en curso por clave. La segunda peticion de la misma sesion (en la practica el
+// reintento tras un 529) espera a que termine y vuelve a probar el prefijo contra SU
+// historial, en vez de subir el suyo en paralelo.
+const bakeInFlight = new Map()
+
+const invalidateContextPrefix = (key) => (key ? contextPrefixCache.delete(String(key)) : false)
+
 /**
  * 超过安全阈值时把完整 Agent 上下文上传为 Qwen 文档。
  * uploader 可注入，便于在无真实账号的测试环境验证整个变换。
+ *
+ * Con `options.contextPrefixKey` (y agentContextPrefixReuse) se intenta antes el prefijo de
+ * historial: reutilizar el adjunto cacheado si el historial de hoy empieza por el (0
+ * parses), o si no hornear uno nuevo con el historial de hoy (1 parse que amortizan los
+ * turnos siguientes). Si ni el diseño horneado cabe en el umbral, camino B2 de siempre.
  */
 const externalizeOversizedAgentContext = async (
     payload,
@@ -428,9 +479,85 @@ const externalizeOversizedAgentContext = async (
     }
 
     const uploader = options.uploader || uploadAgentContextFile
+    const restMessages = payload.messages.slice(1)
+    const withMessage = (candidateMessage) => ({ ...payload, messages: [candidateMessage, ...restMessages] })
+
+    // --- Prefijo de historial reutilizable ---
+    const cache = options.cache || contextPrefixCache
+    const prefixKey = config.agentContextPrefixReuse && options.contextPrefixKey
+        ? String(options.contextPrefixKey)
+        : null
+    const envelope = prefixKey ? parseAgentEnvelope(originalContent) : null
+    const historyLines = envelope ? countLines(envelope.history) : 0
+
+    if (prefixKey && bakeInFlight.has(prefixKey) && options.waitedForBake !== true) {
+        try { await bakeInFlight.get(prefixKey) } catch (_) { /* el primero ya reporto su fallo */ }
+        return externalizeOversizedAgentContext(payload, currentToken, currentAccount, { ...options, waitedForBake: true })
+    }
+
+    const prefixMessage = (file, prefixLines, tail) => {
+        const attachmentName = file?.name || file?.file?.filename || `${HISTORY_ATTACHMENT_NAME_PREFIX}0.txt`
+        const built = replaceMessageTextContent(
+            message,
+            buildPrefixReusePrompt(envelope, { attachmentName, prefixLines }, tail)
+        )
+        built.files = [...(Array.isArray(message.files) ? message.files : []), file]
+        return built
+    }
+
+    if (envelope?.history) {
+        const entry = cache.get(prefixKey)
+        if (entry && prefixMatches(envelope.history, entry)) {
+            const tail = envelope.history.slice(entry.prefixChars).replace(/^\n/, '')
+            const candidate = withMessage(prefixMessage(entry.file, entry.prefixLines, tail))
+            const candidateBytes = byteLength(JSON.stringify(candidate))
+            if (candidateBytes <= thresholdBytes) {
+                logger.info(
+                    `Agent 上下文复用历史附件（附件 ${entry.prefixLines} 行，内联 ${countLines(tail)} 行，${candidateBytes} bytes）`,
+                    'REQUEST',
+                    '📎'
+                )
+                return { payload: candidate, externalized: true, reusedPrefix: true, serializedBytes, prefixKey }
+            }
+            // La cola ya no cabe: se hornea otra vez con el historial completo de hoy.
+        }
+    }
+
+    // ¿Cabe el diseño horneado (cola vacia) ANTES de gastar un parse? Se mide con un
+    // descriptor de relleno del mismo tamaño que el real. Si no cabe (system + tools o el
+    // mensaje actual solos desbordan), camino B2 y la entrada cacheada se queda como esta.
+    let bakeHistory = null
+    if (envelope?.history) {
+        const placeholderId = '00000000-0000-4000-8000-000000000000'
+        const placeholderName = `${HISTORY_ATTACHMENT_NAME_PREFIX}${Date.now()}.txt`
+        const placeholder = buildChatFileDescriptor({
+            fileId: placeholderId,
+            fileUrl: `https://qwen-webui-prod.oss-accelerate.aliyuncs.com/${placeholderId}/${placeholderId}_${placeholderName}`,
+            filename: placeholderName,
+            size: byteLength(envelope.history)
+        })
+        const probe = withMessage(prefixMessage(placeholder, historyLines, ''))
+        if (byteLength(JSON.stringify(probe)) + BAKE_FIT_MARGIN_BYTES <= thresholdBytes) {
+            bakeHistory = envelope.history
+        }
+    }
+
     let file
     try {
-        file = await uploader(originalContent, currentToken, currentAccount, options)
+        if (bakeHistory !== null) {
+            const bake = uploader(bakeHistory, currentToken, currentAccount, {
+                ...options,
+                filename: `${HISTORY_ATTACHMENT_NAME_PREFIX}${Date.now()}.txt`
+            })
+            bakeInFlight.set(prefixKey, bake)
+            try {
+                file = await bake
+            } finally {
+                if (bakeInFlight.get(prefixKey) === bake) bakeInFlight.delete(prefixKey)
+            }
+        } else {
+            file = await uploader(originalContent, currentToken, currentAccount, options)
+        }
     } catch (error) {
         // Sin permiso explicito un adjunto fallido NO se disimula. Un turno con tools que
         // ve una fraccion del historial repite lo ya hecho (3 duplicados y 7 turnos
@@ -452,6 +579,26 @@ const externalizeOversizedAgentContext = async (
             externalized: false,
             compacted: true,
             serializedBytes
+        }
+    }
+
+    if (bakeHistory !== null) {
+        const entry = {
+            accountEmail: currentAccount?.email || null,
+            file,
+            prefixHash: hashText(bakeHistory),
+            prefixChars: bakeHistory.length,
+            prefixBytes: byteLength(bakeHistory),
+            prefixLines: historyLines
+        }
+        cache.set(prefixKey, entry)
+        logger.info(`Agent 上下文历史前缀已外置（${historyLines} 行，${entry.prefixBytes} bytes）`, 'REQUEST', '📎')
+        return {
+            payload: withMessage(prefixMessage(file, historyLines, '')),
+            externalized: true,
+            bakedPrefix: true,
+            serializedBytes,
+            prefixKey
         }
     }
 
@@ -557,10 +704,13 @@ const sendChatRequest = async (body, options = {}) => {
         currentToken,
         currentAccount,
         // Solo quien conoce la peticion (¿lleva tools?) puede permitir compactar.
-        { allowContextCompaction: options.allowContextCompaction === true }
+        {
+            allowContextCompaction: options.allowContextCompaction === true,
+            contextPrefixKey: options.contextPrefixKey || null
+        }
     )
     const payload = contextResult.payload
-    if (contextResult.externalized) {
+    if (contextResult.externalized && !contextResult.reusedPrefix && !contextResult.bakedPrefix) {
         logger.info(`Agent 上下文已外置为 Qwen 文档（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST', '📎')
     } else if (contextResult.compacted) {
         logger.warn(`Agent 上下文附件失败，已保留最近上下文（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST')
@@ -594,6 +744,7 @@ const sendChatRequest = async (body, options = {}) => {
                     // 客户端拿到的是一个「成功」的回答，而模型其实只看到了一小片。
                     contextCompacted: contextResult.compacted === true,
                     contextExternalized: contextResult.externalized === true,
+                    contextPrefixReused: contextResult.reusedPrefix === true,
                     contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
                     response: response.data
@@ -644,6 +795,10 @@ const sendChatRequest = async (body, options = {}) => {
     } else if (lastError) {
         logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
     }
+
+    // Un adjunto reutilizado pudo ser la causa (file_id caducado): se olvida y el reintento
+    // del cliente hornea uno nuevo. Cuesta como mucho un parse de mas.
+    if (contextResult.reusedPrefix) invalidateContextPrefix(contextResult.prefixKey)
 
     return {
         status: false,
@@ -710,5 +865,7 @@ module.exports = {
     generateChatID,
     buildAgentContextLivePrompt,
     compactAgentContextFallback,
-    externalizeOversizedAgentContext
+    externalizeOversizedAgentContext,
+    buildPrefixReusePrompt,
+    invalidateContextPrefix
 }

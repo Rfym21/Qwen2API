@@ -110,6 +110,21 @@ const config = {
         const raw = parseInt(process.env.AGENT_PARSE_WINDOW_SECONDS, 10)
         return Number.isFinite(raw) && raw > 0 ? raw : 120
     })(),
+    // Reutilizacion del prefijo de historial entre turnos (src/utils/context-prefix-cache.js):
+    // el historial ya subido y parseado viaja como el mismo adjunto y solo la cola nueva va
+    // inline — un parse cada 3-10 turnos en vez de uno por turno. 'false' lo apaga.
+    agentContextPrefixReuse: process.env.AGENT_CONTEXT_PREFIX_REUSE !== 'false',
+    // Vida ABSOLUTA de una entrada (desde que se subio). Un file_id caducado en Qwen no da
+    // error: el modelo contesta sin el adjunto (medido 2026-09-10), asi que el TTL es la
+    // unica cota contra un historial fantasma.
+    agentContextPrefixTtlSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_TTL_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 1800
+    })(),
+    agentContextPrefixMaxEntries: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_MAX_ENTRIES, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 200
+    })(),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',

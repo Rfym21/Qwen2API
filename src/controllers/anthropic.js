@@ -1,6 +1,7 @@
 const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
-const { sendChatRequest } = require('../utils/request.js');
+const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
+const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
 const accountManager = require('../utils/account.js');
 const {
   isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
@@ -57,7 +58,8 @@ const {
   assertNoUpstreamFailure,
   describeUpstreamFailure,
   noteRateLimitedAccount,
-  RATE_LIMIT_ANTHROPIC_TYPE
+  RATE_LIMIT_ANTHROPIC_TYPE,
+  UpstreamResponseError
 } = require('../utils/upstream-error.js');
 const {
   analyzeAnthropicCompatibility,
@@ -926,6 +928,18 @@ const buildInternalRequest = async (anthropicReq) => {
     toolSchemas[name] = tool.function.parameters;
   }
 
+  // Clave de sesion para reutilizar el prefijo de historial ya subido a Qwen
+  // (utils/context-prefix-cache.js). Claude Code mete su session id en metadata.user_id;
+  // su auto-compact reescribe messages[0] y con ello la clave, y la entrada vieja muere
+  // por TTL. Sin user_id no hay clave y todo sigue como antes.
+  const contextPrefixKey = buildContextPrefixKey({
+    userId: anthropicReq.metadata?.user_id,
+    model,
+    system,
+    tools,
+    firstMessage: Array.isArray(messages) ? messages[0] : null
+  });
+
   return {
     body,
     hasTools,
@@ -934,7 +948,8 @@ const buildInternalRequest = async (anthropicReq) => {
     allowedToolNames: normalizedTools.map(tool => tool.function.name).filter(Boolean),
     toolSchemas,
     enable_thinking: thinkingCfg.thinking_enabled,
-    model: parsedModel
+    model: parsedModel,
+    contextPrefixKey
   };
 };
 
@@ -1209,7 +1224,8 @@ const runWithAnthropicPing = async (res, work, intervalMs) => {
 const handleAnthropicStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = []
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
+    upstreamOptions = {}
   } = ctx;
 
   res.set({
@@ -1853,7 +1869,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     let retryResp = null;
     try {
       await runWithAnthropicPing(res, async () => {
-        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)));
+        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)), upstreamOptions);
       });
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
@@ -2015,7 +2031,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = []
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
+    upstreamOptions = {}
   } = ctx;
 
   let thinkingContent = '';
@@ -2401,7 +2418,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
     let retryResp;
     try {
-      retryResp = await sendRequest(appendRetryHint(requestBody, hint));
+      retryResp = await sendRequest(appendRetryHint(requestBody, hint), upstreamOptions);
     } catch (e) {
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
@@ -2616,6 +2633,9 @@ const handleAnthropicMessages = async (req, res) => {
   // Fuera del try a proposito: el catch necesita saber QUE cuenta sirvio la peticion para
   // poder sacarla de la rotacion cuando el fallo es "sin cuota". Dentro del bloque no la ve.
   let currentAccount = null;
+  // Tambien fuera: el catch decide si olvidar un prefijo de historial reutilizado.
+  let upstreamResp = null;
+  let contextPrefixKey = null;
   try {
     const compatibility = analyzeAnthropicCompatibility(req.body || {});
     const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
@@ -2629,10 +2649,15 @@ const handleAnthropicMessages = async (req, res) => {
 
     const built = await buildInternalRequest(req.body || {});
     const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
+    contextPrefixKey = built.contextPrefixKey || null;
 
     // Sin tools el contexto puede compactarse si el adjunto falla; con tools NO: un agente
     // que ve una fraccion del historial repite lo hecho, asi que sale 529 reintentable.
-    const upstreamResp = await sendChatRequest(body, { allowContextCompaction: !hasTools });
+    // Las MISMAS opciones viajan en los reenvios de correccion (ctx.upstreamOptions): con
+    // la clave de sesion el reintento reutiliza el prefijo de historial ya subido en vez
+    // de subir y parsear el historial entero otra vez (hasta 3 parses por turno HTTP).
+    const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey };
+    upstreamResp = await sendChatRequest(body, upstreamOptions);
     currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
       return res.status(500).json({
@@ -2659,7 +2684,8 @@ const handleAnthropicMessages = async (req, res) => {
       allowedToolNames,
       toolSchemas,
       requestBody: body,
-      currentAccount
+      currentAccount,
+      upstreamOptions
     };
 
     if (req.body?.stream) {
@@ -2679,6 +2705,12 @@ const handleAnthropicMessages = async (req, res) => {
     // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
     // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
     noteRateLimitedAccount(error, currentAccount);
+    // Un prefijo de historial reutilizado pudo ser la causa (file_id que Qwen ya no
+    // reconoce): se olvida y el reintento del cliente hornea uno nuevo. Un 529 por
+    // ContextExternalizationError nunca llega aqui con contextPrefixReused.
+    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError) {
+      invalidateContextPrefix(contextPrefixKey);
+    }
     if (!res.headersSent) {
       // Retry-After solo con una espera que mando el upstream de verdad.
       if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });

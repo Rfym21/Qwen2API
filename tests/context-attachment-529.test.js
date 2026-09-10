@@ -105,6 +105,21 @@ test('/v1/messages with tools: attachment failure is HTTP 529 overloaded_error +
   assert.equal(res.headers['Retry-After'], '10')
 })
 
+test('/v1/messages: the session key for history-prefix reuse travels in the upstream options (null without metadata.user_id) and the 529 mapping is unchanged', async () => {
+  attachmentDown = true
+  const anonymous = fakeRes()
+  await handleAnthropicMessages({ body: anthropicBody(true) }, anonymous)
+  assert.equal(sentOptions.contextPrefixKey, null)
+  assert.equal(anonymous.statusCode, 529)
+
+  const session = fakeRes()
+  await handleAnthropicMessages({ body: { ...anthropicBody(true), metadata: { user_id: 'session-1' } } }, session)
+  assert.match(sentOptions.contextPrefixKey, /^[0-9a-f]{64}$/)
+  assert.equal(sentOptions.allowContextCompaction, false)
+  assert.equal(session.statusCode, 529)
+  assert.equal(session.headers['Retry-After'], '10')
+})
+
 test('/v1/messages without tools: compaction is allowed', async () => {
   attachmentDown = false
   const res = fakeRes()
