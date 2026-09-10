@@ -817,8 +817,19 @@ const writeToolResultMediaNote = (message, existingText, count, noun = 'image', 
  *   llamadas, system prompt de 3 a 50 KB): con el ledger dentro del prefijo sobrevivian
  *   23-24 entradas de 30-37 y en 44 de las 48 formas la MAS NUEVA no llegaba; con la
  *   seccion propia llegan las 48 de 48 completas. Volver a 6.000 no deshace nada de eso:
- *   el bloque simplemente cabe con mas holgura. Lo clava el test de supervivencia inline
- *   de tests/tool-repetition.test.js, que es el unico que mide lo que el modelo ve.
+ *   el bloque simplemente cabe con mas holgura, y ahora esta medida: con el presupuesto
+ *   inline de produccion (48 KiB) y un sobre externalizado de forma Claude Code, la
+ *   seccion del ledger tope en ~12,8 KB. A 6.000 el bloque ocupa 5.882 B —menos de la
+ *   mitad de ese techo— y llega INTACTO; a 12.000 ocupa 11.886 B y lo roza; a 24.000 ya
+ *   no cabe y se recorta. Subir el tope acerca el recorte, no lo aleja.
+ *
+ *   Con un efecto lateral que hay que decir: bajar a 6.000 CEGO al brazo del default. Con
+ *   el ledger devuelto al interior del prefijo (la regresion que la seccion propia
+ *   arregla), a 6.000 el bloque sigue llegando entero —cabe en la rebanada de cola— y
+ *   ninguna asercion se entera; a 12.000 llegan 23 de 37 entradas, se pierden las 14 MAS
+ *   NUEVAS y desaparece hasta la cabecera. Por eso el test de supervivencia inline corre
+ *   los DOS topes y el brazo de 12.000 se queda aunque ya no sea el default: es el unico
+ *   que vigila el mecanismo al presupuesto de produccion.
  *
  *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
  *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision

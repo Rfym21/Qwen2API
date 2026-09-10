@@ -409,6 +409,117 @@ test('ledger: la entrada MAS NUEVA sobrevive al presupuesto inline de una petici
   }
 })
 
+// La escribe buildBudgetedAgentPrompt (utils/request.js) al compactar una seccion. Se
+// copia el literal a proposito: si alla cambia, la guarda de abajo deja de encontrarlo y
+// `corte >= 0` FALLA en vez de pasar en vacio, que es exactamente lo que tiene que pasar.
+const SEPARADOR_DE_COMPACTADO = '...[inline context compacted; complete copy is in the attachment]...'
+
+/**
+ * El regimen donde viven los duplicados de verdad: la peticion YA cruzo el umbral de
+ * externalizacion y el prefijo —system del cliente + protocolo de herramientas— no cabe
+ * en su cuota (peso 34, headRatio 0.55), asi que se recorta por cabeza y cola. Las dos
+ * guardas de abajo comprueban que se esta EN ese regimen; sin ellas el test pasaria
+ * midiendo una peticion que nunca se recorto.
+ *
+ * Lo que se clava no es el ALCANCE del bloque (lo que el ledger contiene) sino lo que el
+ * modelo LEE: el bloque llega byte a byte. Se prueban DOS topes y hace falta el segundo.
+ *
+ *   cap  6.000 (el que se envia)   bloque  5.882 B / 18 entradas
+ *   cap 12.000 (el revertido)      bloque 11.886 B / 37 entradas
+ *
+ * Medido devolviendo el ledger al interior del prefijo (la forma anterior a que tuviera
+ * seccion propia, con este mismo fixture y el presupuesto inline de produccion):
+ *
+ *   cap  6.000  llegan las 18 de 18, intacto      -> la regresion es INVISIBLE
+ *   cap 12.000  llegan 23 de 37, #46..#24         -> se pierden las 14 MAS NUEVAS
+ *               y hasta la cabecera desaparece del prompt
+ *
+ * O sea: al bajar el tope a 6.000, el brazo de 6.000 dejo de poder ver la regresion que
+ * la seccion propia arregla —cabe en la rebanada de cola por casualidad aritmetica—. Por
+ * eso el brazo de 12.000 se queda aunque ya no sea el default: es el unico que vigila el
+ * mecanismo al presupuesto de produccion. Antes de este test solo lo vigilaba el test de
+ * al lado, y solo con un AGENT_CONTEXT_LIVE_PROMPT_BYTES de 12.000, que no es produccion.
+ */
+test('ledger: llega intacto aunque el prefijo se recorte, y el tope alto es lo que lo pone en riesgo', () => {
+  for (const maxBytes of [LEDGER_DEFAULT_MAX_BYTES, 12000]) {
+    const ledger = buildToolHistoryLedger(historiaPesada(60), { maxBytes })
+    const original = peticionExternalizada(ledger)
+
+    assert.ok(
+      Buffer.byteLength(original) > 92160,
+      `cap ${maxBytes}: la peticion midio ${Buffer.byteLength(original)} B, no llega al umbral de ` +
+      'externalizacion y este test no mide el regimen que dice medir'
+    )
+
+    const inline = buildAgentContextLivePrompt(original)
+    const corte = inline.indexOf(SEPARADOR_DE_COMPACTADO)
+    const bloque = inline.indexOf(LEDGER_CAPTION)
+
+    assert.ok(corte >= 0, `cap ${maxBytes}: no hay separador de compactado, no se recorto nada`)
+    assert.ok(
+      bloque >= 0,
+      `cap ${maxBytes}: el bloque desaparecio ENTERO del prompt inline — el modelo no lee ni la cabecera`
+    )
+    assert.ok(
+      corte < bloque,
+      `cap ${maxBytes}: el unico recorte cae DESPUES del ledger; el prefijo no se recorto y ` +
+      'este test no esta midiendo supervivencia a la truncacion'
+    )
+
+    // EL PIN, y es byte a byte: no «sobrevive la entrada mas nueva» sino «llega el bloque».
+    // Con el ledger dentro del prefijo esto falla a 12.000 y pasa a 6.000.
+    const enBloque = ordinalesDe(ledger)
+    const enInline = ordinalesDe(inline)
+    assert.ok(
+      inline.includes(ledger),
+      `cap ${maxBytes}: el bloque llego recortado — ${enInline.length} de ${enBloque.length} entradas, ` +
+      `${enInline.length ? `#${enInline[0]}..#${enInline[enInline.length - 1]}` : '(ninguna)'} ` +
+      `de #${enBloque[0]}..#${enBloque[enBloque.length - 1]}`
+    )
+  }
+})
+
+/**
+ * El otro lado del mismo knob. La seccion del ledger tiene su propio techo dentro del
+ * presupuesto inline (LEDGER_POOL_SHARE = un cuarto del pool, utils/request.js): con el
+ * presupuesto de produccion y esta forma de peticion son ~12,8 KB. Por debajo el bloque
+ * llega entero; por encima lo recorta la seccion y lo unico que importa es COMO degrada.
+ *
+ * Esto es lo que hace concreto «subir el tope acerca el recorte, no lo aleja»: a 6.000 el
+ * bloque usa 5.882 B, menos de la mitad del techo; a 12.000 lo roza (11.886 de ~12.834);
+ * a 24.000 ya no cabe. Cualquier futuro que quiera volver a subir el tope pasa por aqui.
+ */
+test('ledger: por encima del techo de su seccion degrada por renglones y por las mas nuevas', () => {
+  const ledger = buildToolHistoryLedger(historiaPesada(60), { maxBytes: 24000 })
+  const inline = buildAgentContextLivePrompt(peticionExternalizada(ledger))
+  const enBloque = ordinalesDe(ledger)
+  const enInline = ordinalesDe(inline)
+
+  assert.ok(enInline.length > 0, 'el bloque desaparecio entero del prompt inline')
+  assert.ok(
+    enInline.length < enBloque.length,
+    `el techo de la seccion no mordio (llegaron ${enInline.length} de ${enBloque.length}): ` +
+    'este test dejo de medir el recorte y su contrato de degradado no esta vigilado'
+  )
+  assert.deepEqual(
+    enInline,
+    enBloque.slice(0, enInline.length),
+    'lo que sobrevive tiene que ser la cabecera MAS NUEVA del bloque, no una ventana interior'
+  )
+
+  const lineasDelBloque = new Set(ledger.split('\n'))
+  for (const linea of inline.split('\n')) {
+    if (!/^#\d+ /.test(linea)) continue
+    assert.ok(lineasDelBloque.has(linea), `renglon del ledger cortado a la mitad: ${JSON.stringify(linea)}`)
+  }
+
+  assert.match(
+    inline.slice(inline.indexOf(LEDGER_CAPTION)),
+    /omitted/,
+    'lista recortada y sin avisar: "no esta en el ledger" pasaria a leerse como "no se llamo"'
+  )
+})
+
 test('ledger: con el presupuesto inline muy apretado se recorta por renglones y avisa', () => {
   // El default de produccion (48 KiB) le deja sitio de sobra. Este es el otro extremo,
   // alcanzable con AGENT_CONTEXT_LIVE_PROMPT_BYTES: el bloque tiene que degradar sin

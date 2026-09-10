@@ -82,7 +82,12 @@ const truncateUtf8HeadTail = (
 // sobre 48 sobres externalizados
 // (94-384 KB, 8-60 herramientas, 30-120 llamadas): dentro del prefijo sobrevivian 23-24
 // entradas de las 30-37 del bloque y en 44 de los 48 la MAS NUEVA no llegaba; en seccion
-// propia llegan los 48 de 48 enteros. tests/tool-repetition.test.js lo clava.
+// propia llegan los 48 de 48 enteros. tests/tool-repetition.test.js lo clava, y lo hace
+// con DOS topes de ledger porque con el de 6.000 que se envia hoy esta regresion es
+// invisible al presupuesto de produccion: el bloque cabe en la rebanada de cola y llega
+// entero igual. El brazo de 12.000 de ese test es el unico que la ve (23 de 37 entradas,
+// perdidas las 14 mas nuevas, cabecera incluida) y por eso no se borra por «ya no es el
+// default».
 //
 // Se reconocen las DOS primeras lineas del bloque, no solo la cabecera, y a principio de
 // linea. La cabecera sola es una frase corriente: un system prompt del cliente que
