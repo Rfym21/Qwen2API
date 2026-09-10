@@ -91,6 +91,13 @@ const config = {
         8 * 1024,
         parseInt(process.env.AGENT_CONTEXT_FALLBACK_PROMPT_BYTES, 10) || 84 * 1024
     ),
+    // Cortacircuitos del parse de adjuntos (src/utils/upload.js): tras 3 desafios WAF
+    // seguidos no se sube nada durante estos segundos y el 529 lleva ese Retry-After.
+    // 0 lo desactiva.
+    agentParseBreakerSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 300
+    })(),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',

@@ -58,8 +58,13 @@ class ContextExternalizationError extends Error {
     this.name = 'ContextExternalizationError';
     this.code = CONTEXT_ATTACHMENT_CODE;
     this.cause = cause;
-    this.publicMessage = 'Upstream document parse unavailable; retry shortly';
-    this.retryAfter = CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS;
+    this.publicMessage = cause?.parseCode === 'WAF_CAPTCHA'
+      ? 'Upstream WAF is challenging document parse; retry shortly'
+      : 'Upstream document parse unavailable; retry shortly';
+    // El cortacircuitos de upload.js sabe cuanto va a rechazar sin subir nada; pedir al
+    // cliente que vuelva antes solo encadena 529.
+    const wait = Number(cause?.retryAfterSeconds);
+    this.retryAfter = Number.isFinite(wait) && wait > 0 ? Math.ceil(wait) : CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS;
   }
 }
 

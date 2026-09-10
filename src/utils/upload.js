@@ -5,6 +5,7 @@ const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
 const { buildRequestHeaders } = require('./header-profile')
+const config = require('../config/index.js')
 
 // 配置常量
 const UPLOAD_CONFIG = {
@@ -331,8 +332,23 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
  * @param {import('axios').AxiosResponse} response
  * @returns {string|null} 故障码；正常或未知时为 null
  */
+/**
+ * Segunda forma, medida en vivo 2026-09-10 04:29-04:54 con un probe desde el VPS:
+ * getstsToken y OSS van bien, pero POST /api/v2/files/parse contesta HTTP 200 con la
+ * pagina `aliyun_waf_captcha` (16 KiB de HTML, `<meta name="aliyun_waf_captcha">`).
+ * axios entrega el HTML como string; para el parser JSON de arriba era "sin codigo",
+ * asi que se hacian 30 sondeos y luego un "解析超时" que tampoco era timeout.
+ */
+const WAF_CAPTCHA_CODE = 'WAF_CAPTCHA'
+const WAF_BODY_RE = /aliyun_waf|AliyunCaptcha|<!doctype html|<html[\s>]/i
+
 const parseServiceFailureCode = (response) => {
     const body = response?.data
+    const contentType = String(response?.headers?.['content-type'] || '')
+    if (typeof body === 'string') {
+        if (/text\/html/i.test(contentType) || WAF_BODY_RE.test(body.slice(0, 4096))) return WAF_CAPTCHA_CODE
+        return 'non_json_body'
+    }
     if (!body || typeof body !== 'object') return null
     const code = body.data && typeof body.data === 'object' ? body.data.code : undefined
     if (body.success === false) return String(code || body.code || body.message || 'unknown')
@@ -344,7 +360,7 @@ const throwIfParseServiceFailed = (response, fileId) => {
     const code = parseServiceFailureCode(response)
     if (code === null) return
     const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId})`)
-    error.code = 'qwen_parse_unavailable'
+    error.code = code === WAF_CAPTCHA_CODE ? 'qwen_parse_waf_challenge' : 'qwen_parse_unavailable'
     error.parseCode = code
     throw error
 }
@@ -431,12 +447,65 @@ const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
 /**
  * 上传并解析 Agent 长上下文，返回可直接放入 message.files 的描述符。
  */
+/**
+ * Cortacircuitos del parse. Con el WAF desafiando /files/parse cada intento cuesta un
+ * upload a OSS + un parse (~2-3 s) y otra pagina captcha contra la cuenta, y el cliente
+ * agentico vuelve cada Retry-After: 20 turnos en 5 min el 2026-09-10 04:32-04:37 (prod y
+ * qwen-next, identico), 0 respuestas utiles. Tras PARSE_BREAKER_STRIKES desafios seguidos
+ * se deja de subir durante `agentParseBreakerSeconds`; el 529 sale al instante con ese
+ * tiempo en Retry-After y el primer parse bueno lo cierra. No es evasion del WAF: es
+ * dejar de golpearlo.
+ */
+const PARSE_BREAKER_STRIKES = 3
+const parseBreaker = { strikes: 0, openUntil: 0 }
+
+const parseBreakerRemainingSeconds = () => Math.max(0, Math.ceil((parseBreaker.openUntil - Date.now()) / 1000))
+
+const resetParseBreaker = () => {
+    parseBreaker.strikes = 0
+    parseBreaker.openUntil = 0
+}
+
+/** @param {Error|null} error - null cuando el parse termino bien */
+const noteParseOutcome = (error) => {
+    if (!error) {
+        resetParseBreaker()
+        return
+    }
+    if (error.code !== 'qwen_parse_waf_challenge') return
+    parseBreaker.strikes += 1
+    const cooldownSeconds = Math.max(0, Number(config.agentParseBreakerSeconds) || 0)
+    if (cooldownSeconds > 0 && parseBreaker.strikes >= PARSE_BREAKER_STRIKES) {
+        parseBreaker.openUntil = Date.now() + cooldownSeconds * 1000
+        error.retryAfterSeconds = cooldownSeconds
+        logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传`, 'UPLOAD')
+    }
+}
+
+const assertParseBreakerClosed = () => {
+    const remaining = parseBreakerRemainingSeconds()
+    if (remaining <= 0) return
+    const error = new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (breaker open, ${remaining}s left, upload skipped)`)
+    error.code = 'qwen_parse_waf_challenge'
+    error.parseCode = WAF_CAPTCHA_CODE
+    error.retryAfterSeconds = remaining
+    error.breakerOpen = true
+    throw error
+}
+
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
     if (content.length === 0) throw new Error('Agent 上下文为空')
+    assertParseBreakerClosed()
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
-    await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    try {
+        await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    } catch (error) {
+        noteParseOutcome(error)
+        throw error
+    }
+    noteParseOutcome(null)
     return buildChatFileDescriptor({
         fileId: uploaded.file_id,
         fileUrl: uploaded.file_url,
@@ -451,5 +520,8 @@ module.exports = {
     uploadFileToQwenOss,
     parseUploadedTextFile,
     buildChatFileDescriptor,
-    uploadAgentContextFile
+    uploadAgentContextFile,
+    resetParseBreaker,
+    noteParseOutcome,
+    assertParseBreakerClosed
 }
