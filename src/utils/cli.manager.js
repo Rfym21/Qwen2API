@@ -86,7 +86,7 @@ class CliAuthManager {
             body: bodyData,
         }
 
-        applyProxyToFetchOptions(fetchOptions, account)
+        await applyProxyToFetchOptions(fetchOptions, account)
 
         try {
             const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/device/code`, fetchOptions)
@@ -147,7 +147,7 @@ class CliAuthManager {
                 })
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
+            await applyProxyToFetchOptions(fetchOptions, account)
 
             const response = await fetch(`${chatBaseUrl}/api/v2/oauth2/authorize`, fetchOptions)
 
@@ -200,7 +200,7 @@ class CliAuthManager {
                 body: bodyData,
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
+            await applyProxyToFetchOptions(fetchOptions, account)
 
             try {
                 const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
@@ -317,7 +317,7 @@ class CliAuthManager {
                 body: bodyData
             }
 
-            applyProxyToFetchOptions(fetchOptions, account)
+            await applyProxyToFetchOptions(fetchOptions, account)
 
             const response = await fetch(`${chatBaseUrl}/api/v1/oauth2/token`, fetchOptions)
 

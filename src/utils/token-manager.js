@@ -33,7 +33,7 @@ class TokenManager {
      */
     async login(email, password, account) {
         try {
-            const proxyAgent = getProxyAgent(account)
+            const proxyAgent = await getProxyAgent(account)
             // Use per-account fingerprint UA when available; fall back to legacy Edge UA
             const ua = (account && account.fingerprint) ? buildUserAgent(account.fingerprint) : this.defaultHeaders['User-Agent']
             const requestConfig = {
