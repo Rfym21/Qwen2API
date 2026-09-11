@@ -2450,7 +2450,11 @@ test('loop 2 (P14): 8000 llaves de inicio de linea sin "name" en ~127 KB no son 
   assert.equal(whole.toolCalls.length, 0)
   assert.equal(streamed.calls.length, 0)
   assert.equal(whole.cleanedText, text)
-  assert.ok(elapsed < 400, `8000 llaves de inicio de linea tardaron ${elapsed} ms (era ~2 s)`)
+  // Umbral medido, no adivinado (2026-09-11): 50 ms en un M-series, 210-225 ms en un
+  // VPS de 4 cores sin carga, 445 ms con 6 hogs de CPU. La regresion cuadratica que
+  // guarda era ~2 s aqui (~8 s en ese VPS): 1500 ms la sigue cazando de sobra y deja
+  // de parpadear en un runner de CI compartido, donde 400 era ~2x el tiempo idle.
+  assert.ok(elapsed < 1500, `8000 llaves de inicio de linea tardaron ${elapsed} ms (era ~2 s)`)
 })
 
 test('loop 2 (P15): cada reparacion del salvage es punto fijo de su propio producto, y el producto solo se acepta si parsea ESTRICTO', () => {

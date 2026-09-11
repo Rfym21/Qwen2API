@@ -25,14 +25,26 @@
  * reached through `src/utils/chat-helpers.js`, keep the loop alive), so the run
  * hangs forever instead of finishing short.
  *
- * So instead: run the suite, then check the reported counts against a committed
- * baseline. A run that comes back short is retried — the loss is a race, so a
- * genuinely deleted test is short on EVERY attempt while a truncated one is not
- * — and if it is still short, the gate exits non-zero and says so loudly.
+ * So the gate does not use the parent runner at all. Every test file runs in
+ * its own node process with `--test-isolation=none` (the tests execute in that
+ * very process — there is no runner child underneath whose pipe could be cut)
+ * plus `--test-force-exit`; the gate reads each process's stdout to EOF before
+ * it counts anything, and the per-file summaries are summed. That sum is then
+ * checked against a committed baseline: short is a failure, never a pass. A
+ * short attempt is still retried — a genuinely deleted test is short on EVERY
+ * attempt while a flake is not — and if it stays short the gate exits non-zero
+ * and says so loudly.
+ *
+ * Why the parent runner had to go (2026-09-11): on GitHub's 2-vCPU runner it
+ * came back short on 3 of 3 attempts for a tree that was whole (1035 of 1074,
+ * fail 0, exit 0), each time missing the TAIL of different files. Reproduced
+ * on a 4-core VPS by adding CPU load (1069, then 1074 on the retry). The loss
+ * is load-dependent, and CI is always loaded.
  */
 
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const ROOT = path.resolve(__dirname, '..')
@@ -41,12 +53,12 @@ const BASELINE_FILE = path.join(TESTS_DIR, 'expected-counts.json')
 
 const SUMMARY_KEYS = ['tests', 'suites', 'pass', 'fail', 'cancelled', 'skipped', 'todo']
 
-// The independent check on this gate: it never goes through the parent runner,
-// so the truncation race cannot touch it. `-a` is load-bearing — some test files
-// emit bytes that make grep declare the stream binary and suppress the summary
-// line, silently subtracting that whole file from the sum.
+// The manual cross-check: the same per-file sum the gate computes, in shell.
+// `-a` is load-bearing — some test files emit bytes that make grep declare the
+// stream binary and suppress the summary line, silently subtracting that whole
+// file from the sum.
 const PER_FILE_SUM =
-  'for f in tests/*.test.js; do node --test --test-force-exit "$f"; done | ' +
+  'for f in tests/*.test.js; do node --test --test-isolation=none --test-force-exit "$f"; done | ' +
   'grep -aE \'^. tests [0-9]+$\' | awk \'{s+=$3}END{print s}\''
 
 // Matches both reporters: spec ("ℹ tests 972") and tap ("# tests 972").
@@ -75,7 +87,24 @@ function parseSummary (output) {
   return found
 }
 
-const verdict = (ok, reason, code, retryable, message, summary) =>
+/**
+ * Add up one summary per test file. A single file without a summary makes the
+ * whole attempt count for nothing (null → NO_SUMMARY): a file whose process
+ * died before reporting must never be silently subtracted from the total.
+ * @param {(ReturnType<typeof parseSummary>)[]} summaries
+ */
+function sumSummaries (summaries) {
+  if (!Array.isArray(summaries) || summaries.length === 0) return null
+  const total = {}
+  for (const key of SUMMARY_KEYS) total[key] = 0
+  for (const s of summaries) {
+    if (!s) return null
+    for (const key of SUMMARY_KEYS) total[key] += s[key]
+  }
+  return total
+}
+
+const verdict =(ok, reason, code, retryable, message, summary) =>
   ({ ok, reason, code, retryable, message, summary: summary || null })
 
 /**
@@ -183,29 +212,80 @@ function readBaseline () {
   return null
 }
 
+/**
+ * One attempt over `files`. Each file gets its own node process
+ * (`--test --test-isolation=none --test-force-exit <file>`): the tests run in
+ * that process itself, so there is no runner-to-child pipe to lose data on.
+ * The gate buffers each process's stdout+stderr until 'close' — which fires
+ * only after BOTH pipes have ended — and only then parses its summary. A
+ * bounded pool keeps the box from thrashing; one watchdog covers the whole
+ * attempt and, on expiry, kills whatever is still running and reports TIMEOUT.
+ *
+ * @returns {Promise<{output:string,exitCode:number|null,timedOut:boolean,summary:ReturnType<typeof parseSummary>}>}
+ *   `exitCode` is 0 only if every file's process exited 0; `summary` is the
+ *   per-file sum, or null if any file produced none.
+ */
 function runOnce (files, watchdogMs) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath,
-      ['--test', '--test-force-exit', ...files],
-      { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
+    if (files.length === 0) {
+      resolve({ output: '', exitCode: 0, timedOut: false, summary: null })
+      return
+    }
+    const concurrency = Math.max(1, Number(process.env.TEST_GATE_CONCURRENCY) ||
+      Math.min(4, os.availableParallelism() - 1))
 
-    let output = ''
+    const results = []
+    const running = new Set()
+    let next = 0
     let timedOut = false
-    const capture = (chunk) => { output += chunk; process.stdout.write(chunk) }
-    child.stdout.setEncoding('utf8'); child.stdout.on('data', capture)
-    child.stderr.setEncoding('utf8'); child.stderr.on('data', capture)
+    let output = ''
 
-    // Nothing here may hang: if the runner stops making progress we kill it and
-    // report a TIMEOUT, which is a failure, never a pass.
+    // Nothing here may hang: if the attempt stops making progress we kill what
+    // is left and report a TIMEOUT, which is a failure, never a pass.
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGKILL')
+      for (const child of running) child.kill('SIGKILL')
     }, watchdogMs)
 
-    child.on('close', (code) => {
+    const finish = () => {
       clearTimeout(timer)
-      resolve({ output, exitCode: timedOut ? null : code, timedOut })
-    })
+      const badExit = results.find((r) => r.exitCode !== 0)
+      resolve({
+        output,
+        exitCode: timedOut ? null : (badExit ? badExit.exitCode : 0),
+        timedOut,
+        summary: sumSummaries(results.map((r) => r.summary))
+      })
+    }
+
+    const launch = () => {
+      while (!timedOut && running.size < concurrency && next < files.length) {
+        const file = files[next++]
+        const child = spawn(process.execPath,
+          ['--test', '--test-isolation=none', '--test-force-exit', file],
+          { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
+        running.add(child)
+
+        let buf = ''
+        const capture = (chunk) => { buf += chunk }
+        child.stdout.setEncoding('utf8'); child.stdout.on('data', capture)
+        child.stderr.setEncoding('utf8'); child.stderr.on('data', capture)
+
+        child.on('close', (code) => {
+          running.delete(child)
+          const summary = parseSummary(buf)
+          process.stdout.write(buf)
+          output += buf
+          if (!summary && !timedOut) {
+            console.error(`[gate] ${file}: no summary block (exit ${code}) — its process ended before reporting`)
+          }
+          results.push({ file, exitCode: code, summary })
+          if (running.size === 0 && (timedOut || next >= files.length)) finish()
+          else launch()
+        })
+      }
+    }
+    launch()
   })
 }
 
@@ -220,8 +300,7 @@ async function main () {
   // won and the whole suite ran anyway. Here the filter is honoured, and the
   // count gate is skipped because a partial run cannot meet a whole-suite count.
   if (filters.length > 0) {
-    const { output, exitCode, timedOut } = await runOnce(filters, watchdogMs)
-    const summary = parseSummary(output)
+    const { summary, exitCode, timedOut } = await runOnce(filters, watchdogMs)
     if (timedOut) { console.error(formatVerdict(evaluate({ summary, exitCode, expected: { tests: 0, suites: 0 }, timedOut }))); process.exit(4) }
     console.error(`${BAR}\nTEST GATE: SKIPPED — filtered run of ${filters.length} file(s); ` +
       'the whole-suite count gate does not apply. Run `npm test` with no arguments before claiming a green suite.\n' +
@@ -246,8 +325,7 @@ async function main () {
 
   let last = null
   for (let attempt = 1; attempt <= attemptsAllowed; attempt++) {
-    const { output, exitCode, timedOut } = await runOnce(files, watchdogMs)
-    const summary = parseSummary(output)
+    const { summary, exitCode, timedOut } = await runOnce(files, watchdogMs)
 
     if (bless) {
       const health = evaluate({ summary, exitCode, expected: NO_BASELINE, timedOut })
@@ -282,8 +360,9 @@ async function main () {
     if (last.ok) {
       if (attempt > 1) {
         console.error(`${BAR}\nNOTE: attempt(s) 1..${attempt - 1} came back SHORT and were retried.\n` +
-          'That is node dropping a child\'s buffered stdout on --test-force-exit, not a broken test.\n' +
-          `This attempt reported the full ${expected.tests}.\n${BAR}`)
+          'Each file runs in its own process and is read to EOF, so this is no longer expected:\n' +
+          'look at the short attempt(s) above (a "[gate] <file>: no summary" line, or a file that\n' +
+          `registered fewer tests) before trusting this one. This attempt reported the full ${expected.tests}.\n${BAR}`)
       }
       console.error(formatVerdict(last))
       process.exit(0)
@@ -300,7 +379,7 @@ async function main () {
   if (last.reason === 'SHORT_RUN' || last.reason === 'SHORT_SUITES') {
     console.error(`Short on all ${attemptsAllowed} attempts. A truncation flake does not survive that many\n` +
       'retries, so treat this as real: a test file threw at load, was deleted, or stopped registering tests.\n' +
-      'Confirm with the per-file sum, which does not go through the parent runner:\n' +
+      'Confirm by hand with the same per-file sum the gate computes:\n' +
       `  ${PER_FILE_SUM}\n` +
       'Keep the -a: without it grep calls tool-prompt.test.js\'s output binary and drops its\n' +
       'summary line, quietly subtracting 133 tests from the number you are trusting.')
@@ -308,7 +387,7 @@ async function main () {
   process.exit(last.code)
 }
 
-module.exports = { parseSummary, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM }
+module.exports = { parseSummary, sumSummaries, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM }
 
 if (require.main === module) {
   main().catch((err) => {

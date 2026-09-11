@@ -1,5 +1,5 @@
 {
-  "tests": 1074,
+  "tests": 1077,
   "suites": 128,
   "note": "Authoritative count. Verify with the per-file sum in AGENTS.md (\"The test gate\"). The -a on that grep is load-bearing: tool-prompt.test.js emits bytes that make grep call the stream binary, and without -a its whole summary line — 133 tests — is silently dropped from the sum.",
   "updated": "2026-09-11"
