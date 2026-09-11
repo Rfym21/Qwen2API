@@ -632,7 +632,7 @@ const sendOpenAIErrorResponse = (res, error) => {
  * @returns {Promise<string>} Base64 内容
  */
 const downloadAssetAsBase64 = async (contentUrl, account) => {
-    const proxyAgent = getProxyAgent(account)
+    const proxyAgent = await getProxyAgent(account)
     const requestConfig = {
         responseType: 'arraybuffer',
         timeout: 1000 * 60 * 2
@@ -1003,7 +1003,7 @@ const getChatDetail = async (chatID, token) => {
         const chatBaseUrl = getChatBaseUrl()
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
+        const proxyAgent = await getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {
@@ -1334,7 +1334,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
+        const proxyAgent = await getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {
@@ -1695,7 +1695,7 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
+        const proxyAgent = await getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {

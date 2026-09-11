@@ -103,7 +103,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 
         const requestId = generateUUID()
         const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
-        const proxyAgent = getProxyAgent(account)
+        const proxyAgent = await getProxyAgent(account)
 
         // Antidetect: per-account fingerprint headers replace static UA
         const baseHeaders = buildRequestHeaders(account, {
@@ -369,7 +369,7 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
 
     const baseUrl = getChatBaseUrl()
-    const requestConfig = applyProxyToAxiosConfig({
+    const requestConfig = await applyProxyToAxiosConfig({
         headers: createAuthorizedHeaders(authToken, account),
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)

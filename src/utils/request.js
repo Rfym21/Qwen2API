@@ -667,7 +667,7 @@ const sendChatRequest = async (body, options = {}) => {
     }
 
     const chatBaseUrl = getChatBaseUrl()
-    const proxyAgent = getProxyAgent(currentAccount)
+    const proxyAgent = await getProxyAgent(currentAccount)
 
     // Antidetect: per-account fingerprint headers replace static block
     const ssxmod = getSsxmodForAccount(currentAccount)
@@ -843,7 +843,7 @@ const sendChatRequest = async (body, options = {}) => {
 const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
+        const proxyAgent = await getProxyAgent(account)
 
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)

@@ -30,7 +30,7 @@ const getLatestModels = async (force = false) => {
     const chatBaseUrl = getChatBaseUrl()
     // 一次取出账户对象，token 与 proxy 走同一个账号，避免 round-robin 错位
     const account = accountManager.getAccount()
-    const proxyAgent = getProxyAgent(account)
+    const proxyAgent = await getProxyAgent(account)
 
     // Antidetect: per-account fingerprint headers replace static block
     const ssxmod = getSsxmodForAccount(account)

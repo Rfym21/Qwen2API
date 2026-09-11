@@ -1,5 +1,6 @@
 const config = require('../config/index.js')
 const { HttpsProxyAgent } = require('https-proxy-agent')
+const { ensureSocksBridge } = require('./socks-bridge')
 
 // Per-account agent cache keyed by `${proxyUrl}::${email}`.
 // LRU eviction when cache exceeds MAX_AGENT_CACHE_SIZE.
@@ -68,16 +69,22 @@ const buildAgentCacheKey = (url, account) => {
  * Separate TCP pools per account even when sharing the same proxy.
  * @param {string|null} url
  * @param {Object} [account]
- * @returns {HttpsProxyAgent|undefined}
+ * @returns {Promise<HttpsProxyAgent|undefined>}
  */
-const getOrCreateAgent = (url, account) => {
+const getOrCreateAgent = async (url, account) => {
     if (!url) return undefined
     const key = buildAgentCacheKey(url, account)
     let agent = proxyAgents.get(key)
     if (!agent) {
-        agent = new HttpsProxyAgent(url)
-        proxyAgents.set(key, agent)
-        evictOldestAgent()
+        // socks5 goes through the loopback CONNECT bridge (Bun's fetch only speaks http(s) proxies).
+        const agentUrl = /^socks5:/i.test(url) ? await ensureSocksBridge(url) : url
+        // A concurrent caller may have created the agent while the bridge was starting.
+        agent = proxyAgents.get(key)
+        if (!agent) {
+            agent = new HttpsProxyAgent(agentUrl)
+            proxyAgents.set(key, agent)
+            evictOldestAgent()
+        }
     } else {
         // Move to end (most recently used) by deleting and re-inserting
         proxyAgents.delete(key)
@@ -89,9 +96,9 @@ const getOrCreateAgent = (url, account) => {
 /**
  * Get proxy agent for an account.
  * @param {Object} [account] - Account object (optional). Falls back to global PROXY_URL
- * @returns {HttpsProxyAgent|undefined}
+ * @returns {Promise<HttpsProxyAgent|undefined>}
  */
-const getProxyAgent = (account) => {
+const getProxyAgent = async (account) => {
     return getOrCreateAgent(resolveProxyUrl(account), account)
 }
 
@@ -133,10 +140,10 @@ const getCliBaseUrl = () => config.qwenCliProxyUrl
  * Note: account as second optional param for backward compatibility.
  * @param {Object} [requestConfig]
  * @param {Object} [account]
- * @returns {Object}
+ * @returns {Promise<Object>}
  */
-const applyProxyToAxiosConfig = (requestConfig = {}, account) => {
-    const proxyAgent = getProxyAgent(account)
+const applyProxyToAxiosConfig = async (requestConfig = {}, account) => {
+    const proxyAgent = await getProxyAgent(account)
     if (proxyAgent) {
         requestConfig.httpsAgent = proxyAgent
         requestConfig.proxy = false
@@ -148,10 +155,10 @@ const applyProxyToAxiosConfig = (requestConfig = {}, account) => {
  * Apply proxy settings to fetch options.
  * @param {Object} [fetchOptions]
  * @param {Object} [account]
- * @returns {Object}
+ * @returns {Promise<Object>}
  */
-const applyProxyToFetchOptions = (fetchOptions = {}, account) => {
-    const proxyAgent = getProxyAgent(account)
+const applyProxyToFetchOptions = async (fetchOptions = {}, account) => {
+    const proxyAgent = await getProxyAgent(account)
     if (proxyAgent) {
         fetchOptions.agent = proxyAgent
     }

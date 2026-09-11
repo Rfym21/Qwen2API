@@ -295,7 +295,7 @@ const handleCliChatCompletion = async (req, res) => {
         req.account.cli_info.request_number++
 
         const cliBaseUrl = getCliBaseUrl()
-        const proxyAgent = getProxyAgent(req.account)
+        const proxyAgent = await getProxyAgent(req.account)
 
         // 设置请求配置
         const axiosConfig = {

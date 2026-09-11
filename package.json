@@ -37,6 +37,7 @@
     "mime-types": "^3.0.1",
     "multer": "^2.3.0",
     "proxy-agent": "^5.0.0",
+    "socks": "^2.8.9",
     "tiktoken": "^1.0.21"
   },
   "devDependencies": {
