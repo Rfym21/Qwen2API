@@ -1,33 +1,31 @@
-FROM node:lts-alpine
+# syntax=docker/dockerfile:1
 
-# 全局安装PM2
-RUN npm install -g pm2
-
+FROM node:lts-alpine AS base
 WORKDIR /app
 
-# 复制package文件
-COPY package*.json ./
+FROM base AS frontend-build
+WORKDIR /app/public
+COPY public/package.json public/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --include=dev --no-audit --no-fund
+COPY public/ ./
+RUN npm run build
 
-# 安装依赖
-RUN npm install
+FROM base AS production-dependencies
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
 
-# 复制应用代码
-COPY . .
+FROM base AS runtime
+ENV NODE_ENV=production
 
-# 构建前端应用
-RUN cd public && npm install && npm run build
+# Copy only runtime files; build dependencies and npm caches stay out of the image.
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY package.json ecosystem.config.js ./
+COPY src/ ./src/
+COPY --from=frontend-build /app/public/dist ./public/dist
 
-# 删除前端不必要文件
-RUN rm -rf public/src public/node_modules public/package*.json
+RUN chmod 777 /app && mkdir -p logs data caches
 
-# 设置权限
-RUN chmod 777 /app
-
-# 创建日志目录
-RUN mkdir -p logs
-
-# 暴露端口（通过环境变量SERVICE_PORT控制）
 EXPOSE 3000
-
-# 使用PM2启动应用，并保持容器运行
 CMD ["npm", "start"]

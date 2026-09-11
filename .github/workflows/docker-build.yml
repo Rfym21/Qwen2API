@@ -1,18 +1,53 @@
 name: Build Multi-Architecture Docker Image
 
 on:
+  workflow_dispatch:
   push:
     branches: [ main, develop ]
-    tags: [ 'v*' ]
-    paths:
-      - 'package.json'  
-  pull_request:
-    branches: [ main ]
     paths:
       - 'package.json'
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.version-check.outputs.should_build }}
+    steps:
+      - name: Checkout version history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check version change or manual request
+        id: version-check
+        shell: node {0}
+        run: |
+          const { execFileSync } = require('node:child_process')
+          const { appendFileSync, readFileSync } = require('node:fs')
+          let shouldBuild = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch'
+
+          if (shouldBuild) {
+            console.log('Manual run: build regardless of version changes.')
+          } else {
+            const pushEvent = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'))
+            const previousCommit = pushEvent.before
+
+            if (!previousCommit || /^0+$/.test(previousCommit)) {
+              console.log('New branch: use a manual run for the initial image build.')
+            } else {
+              const previousPackage = execFileSync('git', ['show', `${previousCommit}:package.json`], { encoding: 'utf8' })
+              const previousVersion = JSON.parse(previousPackage).version
+              const currentVersion = JSON.parse(readFileSync('package.json', 'utf8')).version
+              shouldBuild = previousVersion !== currentVersion
+              console.log(`Package version: ${previousVersion} -> ${currentVersion}`)
+            }
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, `should_build=${shouldBuild}\n`)
+          if (!shouldBuild) console.log('No version change detected; skipping Docker build.')
+
   build:
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     
     steps:

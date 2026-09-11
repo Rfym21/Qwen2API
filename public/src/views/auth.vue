@@ -5,7 +5,7 @@
   <div class="flex flex-col items-center justify-center w-screen h-screen">
     <transition name="fade-slide">
       <div
-        class="flex flex-col items-center w-4/5 h-1/2 bg-opacity-50 bg-white rounded-3xl shadow-xl border-2 border-gray-200 animate-panel"
+        class="flex flex-col items-center w-4/5 max-w-md h-1/2 bg-opacity-50 bg-white rounded-3xl shadow-xl border-2 border-gray-200 animate-panel"
         v-if="showPanel">
         <h1 class="block mt-24 mb-10 text-2xl font-bold">{{ t('auth.title') }}</h1>
         <input type="text"
