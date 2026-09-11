@@ -122,7 +122,6 @@ test('bake: the file holds exactly the history block; inline keeps system, ledge
 
   const entry = cache.get('k')
   assert.equal(entry.prefixLines, 20)
-  assert.equal(entry.prefixChars, history.join('\n').length)
   assert.equal(entry.prefixHash, hashText(history.join('\n')))
   assert.equal(entry.accountEmail, 'a@x')
 })
@@ -235,6 +234,16 @@ test('bake failure: 529 with tools, compaction without; the cache keeps the prev
   assert.equal(good.calls.length, 2)
 })
 
+test('compaction fallback lands under the wire threshold even when the text budget is larger than it', async () => {
+  // Presupuesto de TEXTO (86016 por defecto) > umbral del JSON (8192 aqui): sin el bucle de
+  // recorte el fallback saldria por encima del umbral y volveria a disparar el WAF.
+  const bad = makeUploader({ fail: new Error('Qwen 文档解析服务失败: WAF_CAPTCHA') })
+  const result = await run(envelopeText(lines(60)), { uploader: bad.uploader, cache: newCache(), allow: true, threshold: 12 * 1024 })
+  assert.equal(result.compacted, true)
+  assert.ok(Buffer.byteLength(JSON.stringify(result.payload)) <= 12 * 1024)
+  assert.ok(inlineOf(result).includes('# Agent context recovery'))
+})
+
 test('TTL is absolute: past it the entry is gone and the next turn bakes again', async () => {
   const { uploader, calls } = makeUploader()
   const cache = newCache()
@@ -289,24 +298,53 @@ test('without a session key, or with the kill switch off, the path is B2 (whole 
 
 // ---------------------------------------------------------------- unidades del modulo
 
-test('prefixMatches: same hash on a line boundary only', () => {
+test('prefixMatches: the first prefixLines lines must hash equal in canonical form; what follows is free', () => {
   const prefix = lines(3).join('\n')
-  const entry = { prefixHash: hashText(prefix), prefixChars: prefix.length }
+  const entry = { prefixHash: hashText(prefix), prefixLines: 3 }
   assert.equal(prefixMatches(prefix, entry), true)
   assert.equal(prefixMatches(`${prefix}\n${line(4)}`, entry), true)
   assert.equal(prefixMatches(`${prefix}${line(4)}`, entry), false)
-  assert.equal(prefixMatches(prefix.slice(0, -1), entry), false)
+  assert.equal(prefixMatches(lines(2).join('\n'), entry), false)
   assert.equal(prefixMatches(`${prefix.slice(0, -1)}y\n${line(4)}`, entry), false)
   assert.equal(prefixMatches('', entry), false)
   assert.equal(prefixMatches(prefix, null), false)
+  // Forma canonica: lo que el canonicalizador quita de una linea no cuenta para el hash.
+  const decorated = lines(3).map(l => `${l}#x`).join('\n')
+  assert.equal(prefixMatches(decorated, entry), false)
+  assert.equal(prefixMatches(decorated, entry, l => l.replace(/#x$/, '')), true)
 })
 
-test('buildContextPrefixKey: null without a user id; stable for the same session; different per session/model/system/tools/opener', () => {
+test('hit: retained thinking that later falls out of the budget on an already-baked line keeps the prefix valid', async () => {
+  const { uploader, calls } = makeUploader()
+  const cache = newCache()
+  // Mensaje 18 (assistant) lleva razonamiento retenido delante del texto al hornear...
+  const body18 = `message 18 ${'x'.repeat(400)}`
+  const withThinking = lines(20)
+  withThinking[17] = JSON.stringify({ role: 'assistant', content: `[THINKING]\nwhy 18\n[END THINKING]\n${body18}` })
+  const baked = await run(envelopeText(withThinking), { uploader, cache })
+  assert.equal(baked.bakedPrefix, true)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].text, withThinking.join('\n'))   // el archivo lleva la linea tal cual
+
+  // ...y al turno siguiente el presupuesto ya no lo cubre: la linea vuelve a su texto.
+  const later = [...lines(20), ...lines(2, 21)]
+  const result = await run(envelopeText(later), { uploader, cache })
+  assert.equal(result.reusedPrefix, true)
+  assert.equal(calls.length, 1)
+  assert.ok(inlineOf(result).includes(later[20]))
+  assert.equal(inlineOf(result).includes(later[17]), false)
+})
+
+test('buildContextPrefixKey: keyed by the opener even without a user id; stable for the same session; different per session/model/system/tools/opener', () => {
   const base = { userId: 'session-1', model: 'qwen3-max', system: 'rules', tools: [{ name: 'Read' }], firstMessage: { role: 'user', content: 'hi' } }
-  assert.equal(buildContextPrefixKey({ ...base, userId: undefined }), null)
-  assert.equal(buildContextPrefixKey({ ...base, userId: '' }), null)
+  // Sin user id (clientes OpenAI, Anthropic sin metadata.user_id) la clave sale del
+  // arranque; prefixMatches sigue verificando el historial entero, asi que no hay fuga.
+  const anonymous = buildContextPrefixKey({ ...base, userId: undefined })
+  assert.match(anonymous, /^[0-9a-f]{64}$/)
+  assert.equal(buildContextPrefixKey({ ...base, userId: '' }), anonymous)
   const key = buildContextPrefixKey(base)
   assert.match(key, /^[0-9a-f]{64}$/)
+  assert.notEqual(key, anonymous)
   assert.equal(buildContextPrefixKey({ ...base }), key)
   for (const change of [
     { userId: 'session-2' },

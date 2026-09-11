@@ -22,14 +22,15 @@ const config = require('../config/index.js')
 const hashText = (text) => createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex')
 
 /**
- * Clave de sesion. null sin user id: dos sesiones con el mismo arranque (mismo system,
- * mismas tools, mismo primer mensaje) compartirian clave y una veria el historial de la
- * otra. Claude Code manda su session id dentro de metadata.user_id.
+ * Clave de sesion. Claude Code manda su session id dentro de metadata.user_id; sin user id
+ * la clave sale solo del arranque (modelo, system, tools, primer mensaje). Dos sesiones asi
+ * comparten clave, pero NO se ven el historial: prefixMatches verifica el hash de las
+ * lineas enteras, asi que un historial ajeno nunca encaja; como mucho se pisan la entrada
+ * y re-hornean, que es lo que pasaba siempre sin clave.
  */
 const buildContextPrefixKey = ({ userId, model, system, tools, firstMessage }) => {
-    if (!userId) return null
     return hashText(JSON.stringify([
-        String(userId),
+        userId ? String(userId) : '',
         String(model || ''),
         hashText(JSON.stringify(system ?? '')),
         hashText(JSON.stringify(tools ?? [])),
@@ -38,8 +39,9 @@ const buildContextPrefixKey = ({ userId, model, system, tools, firstMessage }) =
 }
 
 /**
- * entry = { accountEmail, file, prefixHash, prefixChars, prefixBytes, prefixLines,
- *           createdAt, lastUsedAt }
+ * entry = { accountEmail, file, prefixHash, prefixBytes, prefixLines, createdAt, lastUsedAt }
+ * prefixHash es el hash de la forma CANONICA de las prefixLines primeras lineas (ver
+ * prefixMatches); el archivo subido lleva las lineas tal como estaban al hornear.
  * `now` inyectable para que los tests avancen el reloj sin dormir.
  */
 const createContextPrefixCache = ({ ttlMs, maxEntries, now = Date.now } = {}) => {
@@ -71,13 +73,26 @@ const createContextPrefixCache = ({ ttlMs, maxEntries, now = Date.now } = {}) =>
     }
 }
 
-/** true cuando `history` empieza por el prefijo cacheado y el corte cae en un salto de linea. */
-const prefixMatches = (history, entry) => {
-    const text = String(history || '')
-    const chars = Number(entry?.prefixChars) || 0
-    if (chars <= 0 || text.length < chars) return false
-    if (text.length !== chars && text[chars] !== '\n') return false
-    return hashText(text.slice(0, chars)) === entry.prefixHash
+const identity = (line) => line
+
+/** Hash del prefijo: las lineas en su forma canonica, unidas por salto de linea. */
+const canonicalHistoryHash = (lines, canonicalizeLine = identity) => (
+    hashText(lines.map(canonicalizeLine).join('\n'))
+)
+
+/**
+ * true cuando las `prefixLines` primeras lineas de `history` (bloque JSONL) tienen el mismo
+ * hash canonico que la entrada. Se compara por lineas y en forma canonica
+ * (`canonicalizeLine`, identidad por defecto) para que un adorno que el emisor añade o
+ * quita a una linea vieja — el razonamiento retenido de controllers/anthropic.js, que sale
+ * del presupuesto conforme crece el historial — no invalide el prefijo ya subido.
+ */
+const prefixMatches = (history, entry, canonicalizeLine = identity) => {
+    const count = Number(entry?.prefixLines) || 0
+    if (count <= 0 || !entry?.prefixHash) return false
+    const lines = String(history || '').split('\n')
+    if (lines.length < count) return false
+    return canonicalHistoryHash(lines.slice(0, count), canonicalizeLine) === entry.prefixHash
 }
 
 const contextPrefixCache = createContextPrefixCache({
@@ -90,5 +105,6 @@ module.exports = {
     buildContextPrefixKey,
     createContextPrefixCache,
     contextPrefixCache,
+    canonicalHistoryHash,
     prefixMatches
 }

@@ -857,6 +857,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     // con llamadas se acepta arriba y no llega aquí —: el reintento abre chat nuevo.
     const chatBusy = attempt.textChannelCut === true || attempt.upstreamStopped === true
     const retryResponse = await requestSender(retryBody, {
+      // Opciones de contexto de la peticion original (compactar / clave del prefijo de
+      // historial): sin ellas el reenvio no puede reutilizar el adjunto y quema un parse.
+      ...(options.upstreamOptions || {}),
       chatId: chatBusy ? null : (upstreamContext.chatId || null),
       parentId: chatBusy ? null : (upstreamContext.responseId || null),
       currentAccount: options.currentAccount || null,

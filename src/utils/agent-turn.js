@@ -487,6 +487,17 @@ const THINKING_MARKER_RE = /\[(?=[ \t]{0,4}(?:END[ \t\r\n_-]{1,2}|\/[ \t]{0,4})?
  */
 const defuseThinkingMarkers = (value) => String(value).replace(THINKING_MARKER_RE, '(');
 
+// Bloque de razonamiento retenido que controllers/anthropic.js cuelga DELANTE del texto de
+// un mensaje assistant: `[THINKING]\n…\n[END THINKING]\n<texto defusado>`. Quitarlo y
+// defusar lo que queda da la forma CANONICA del mensaje, la misma tenga o no razonamiento
+// colgado. La usa la reutilizacion del prefijo de historial (utils/request.js) para el
+// hash de las lineas ya subidas: el bloque entra y sale del presupuesto de un turno a
+// otro, y con el hash sobre el texto literal cada turno con thinking re-horneaba (26/26
+// turnos medidos el 2026-09-11). El delimitador interior ya viene defusado por
+// renderThinkingParts, asi que el primer `[END THINKING]` de verdad cierra el bloque.
+const RETAINED_THINKING_RE = /^\[THINKING\]\n[\s\S]*?\n\[END THINKING\](?:\n|$)/;
+const stripRetainedThinking = (value) => defuseThinkingMarkers(String(value).replace(RETAINED_THINKING_RE, ''));
+
 /**
  * Un corte por unidades UTF-16 (`slice`) puede partir un par subrogado por la mitad.
  * `JSON.stringify` escapa la mitad huerfana sin quejarse, asi que no revienta aqui:
@@ -1287,6 +1298,9 @@ module.exports = {
   // (controllers/anthropic.js) tiene que poder defusar el texto HERMANO del mismo
   // mensaje sin pasarlo por el resto de la neutralizacion, que es para otro canal.
   defuseThinkingMarkers,
+  // Forma canonica de un texto de assistant con razonamiento retenido delante: para el
+  // hash del prefijo de historial (utils/request.js) el bloque no cuenta.
+  stripRetainedThinking,
   neutraliseUntrustedBody,
   // Cortar por unidades UTF-16 parte pares subrogados. Exportado porque el tope de
   // razonamiento de anthropic.js corta igual que el digest del ledger de aqui.

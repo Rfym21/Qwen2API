@@ -121,14 +121,15 @@ const rateLimitRetryAfterSeconds = (error) => {
  * repetir la deteccion; el `type` de cable lo pone cada uno con su constante de arriba.
  * @param {unknown} error - Error capturado
  * @param {number} [fallbackStatus] - Status cuando NO es cuota (500 Anthropic / 502 OpenAI)
+ * @param {number} [overloadedStatus] - Status del adjunto de contexto caido (529 Anthropic / 503 OpenAI)
  * @returns {{ rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null }}
  */
-const describeUpstreamFailure = (error, fallbackStatus = 502) => {
+const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus = 529) => {
   if (isContextAttachmentError(error)) {
     return {
       rateLimited: false,
       overloaded: true,
-      status: 529,
+      status: overloadedStatus,
       retryAfter: Number(error.retryAfter) || CONTEXT_ATTACHMENT_RETRY_AFTER_SECONDS
     };
   }

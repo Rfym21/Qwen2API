@@ -8,8 +8,10 @@ const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
 const { ContextExternalizationError } = require('./upstream-error.js')
-const { contextPrefixCache, prefixMatches, hashText } = require('./context-prefix-cache.js')
-const { TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger } = require('./agent-turn.js')
+const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
+const {
+    TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
+} = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -448,6 +450,22 @@ const buildPrefixReusePrompt = (envelope, { attachmentName, prefixLines }, tail)
 
 const countLines = (text) => (text ? String(text).split('\n').length : 0)
 
+// Forma canonica de una linea JSONL del historial para el hash del prefijo. El razonamiento
+// retenido que controllers/anthropic.js cuelga delante del texto del assistant entra y sale
+// del presupuesto conforme crece el historial; con el hash sobre el texto literal, cada
+// turno con thinking re-horneaba (26/26 medidos el 2026-09-11). Solo se quita para
+// comparar: el archivo subido lleva las lineas tal cual. Una linea que no es JSON se
+// compara literal.
+const canonicalHistoryLine = (raw) => {
+    try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && typeof parsed.content === 'string') {
+            return JSON.stringify({ ...parsed, content: stripRetainedThinking(parsed.content) })
+        }
+    } catch (_) { /* no JSON */ }
+    return raw
+}
+
 // Un horneado en curso por clave. La segunda peticion de la misma sesion (en la practica el
 // reintento tras un 529) espera a que termine y vuelve a probar el prefijo contra SU
 // historial, en vez de subir el suyo en paralelo.
@@ -507,8 +525,8 @@ const externalizeOversizedAgentContext = async (
 
     if (envelope?.history) {
         const entry = cache.get(prefixKey)
-        if (entry && prefixMatches(envelope.history, entry)) {
-            const tail = envelope.history.slice(entry.prefixChars).replace(/^\n/, '')
+        if (entry && prefixMatches(envelope.history, entry, canonicalHistoryLine)) {
+            const tail = envelope.history.split('\n').slice(entry.prefixLines).join('\n')
             const candidate = withMessage(prefixMessage(entry.file, entry.prefixLines, tail))
             const candidateBytes = byteLength(JSON.stringify(candidate))
             if (candidateBytes <= thresholdBytes) {
@@ -569,25 +587,34 @@ const externalizeOversizedAgentContext = async (
             throw new ContextExternalizationError(error)
         }
         logger.error('Agent 长上下文附件上传/解析失败，回退到最近上下文', 'REQUEST', '', error)
-        const fallbackMessage = replaceMessageTextContent(
-            message,
-            compactAgentContextFallback(originalContent, options.fallbackPromptBytes)
-        )
-        fallbackMessage.files = Array.isArray(message.files) ? [...message.files] : []
-        return {
-            payload: { ...payload, messages: [fallbackMessage, ...payload.messages.slice(1)] },
-            externalized: false,
-            compacted: true,
-            serializedBytes
+        const compactedWith = (budget) => {
+            const built = replaceMessageTextContent(message, compactAgentContextFallback(originalContent, budget))
+            built.files = Array.isArray(message.files) ? [...message.files] : []
+            return { ...payload, messages: [built, ...payload.messages.slice(1)] }
         }
+        // El presupuesto del fallback es de TEXTO y el umbral es del JSON serializado
+        // (escapes, envoltorio, cuerpos con muchas comillas): 86016 de texto pueden ser
+        // mas de 92160 en el cable y volver a disparar el WAF. Si no cabe, se recorta en
+        // proporcion hasta que quepa (medido 2026-09-11: contexto ~20 KB tras el fallback).
+        let budget = Number(options.fallbackPromptBytes) || config.agentContextFallbackPromptBytes
+        // Suelo del recorte: nunca por debajo de 8 KiB ni del presupuesto pedido si era menor.
+        const floorBudget = Math.min(8 * 1024, budget)
+        let compacted = compactedWith(budget)
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const bytes = byteLength(JSON.stringify(compacted))
+            if (bytes <= thresholdBytes || budget <= floorBudget) break
+            // Escala sobre lo que de verdad ocupa (el presupuesto puede ser mayor que el texto).
+            budget = Math.max(floorBudget, Math.floor(Math.min(budget, bytes) * thresholdBytes / bytes) - 1024)
+            compacted = compactedWith(budget)
+        }
+        return { payload: compacted, externalized: false, compacted: true, serializedBytes }
     }
 
     if (bakeHistory !== null) {
         const entry = {
             accountEmail: currentAccount?.email || null,
             file,
-            prefixHash: hashText(bakeHistory),
-            prefixChars: bakeHistory.length,
+            prefixHash: canonicalHistoryHash(bakeHistory.split('\n'), canonicalHistoryLine),
             prefixBytes: byteLength(bakeHistory),
             prefixLines: historyLines
         }

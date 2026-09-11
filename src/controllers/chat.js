@@ -1,6 +1,7 @@
 const { isJson, generateUUID } = require('../utils/tools.js')
 const { createUsageObject } = require('../utils/precise-tokenizer.js')
 const { sendChatRequest } = require('../utils/request.js')
+const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js')
 const {
     createToolCallStreamParser,
     parseToolCallsFromText,
@@ -221,13 +222,17 @@ const writeOpenAIHttpError = (res, error = {}) => {
  * @returns {{status: number, message: string, code: string, type?: string, retry_after?: number}}
  */
 const upstreamErrorShape = (error, fallbackMessage, fallbackCode = 'upstream_error') => {
-    const failure = describeUpstreamFailure(error, 502)
+    // 529 es un status de Anthropic; en el cable OpenAI el adjunto caido es 503.
+    const failure = describeUpstreamFailure(error, 502, 503)
     const shape = {
         status: failure.status,
         message: error?.publicMessage || fallbackMessage,
-        code: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : (error?.code || fallbackCode)
+        code: failure.rateLimited
+            ? RATE_LIMIT_OPENAI_TYPE
+            : (failure.overloaded ? 'upstream_unavailable' : (error?.code || fallbackCode))
     }
     if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE
+    else if (failure.overloaded) shape.type = 'server_error'
     if (failure.retryAfter !== null) shape.retry_after = failure.retryAfter
     return shape
 }
@@ -970,7 +975,9 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                 'CHAT'
             )
             try {
-                const retryResp = await requestSender(retryBody)
+                // Mismas opciones que la peticion original: sin ellas el reenvio no puede
+                // compactar ni reutilizar el prefijo de historial y quema un parse mas.
+                const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
                     // 与非流式分支同一条：重试是新的回合，解析器与累积器都重建，第一轮的残片
                     // 不能漂进第二轮（其余消费者本来就按 attempt 重建）。
@@ -1084,9 +1091,10 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.end()
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
-        // Cuota agotada -> 429 `insufficient_quota`; cualquier otro fallo conserva su
-        // etiqueta de siempre. Deteccion unica en utils/upstream-error.js.
-        const failure = describeUpstreamFailure(error, 502)
+        // Cuota agotada -> 429 `insufficient_quota`; adjunto caido -> 503 (529 es de
+        // Anthropic); cualquier otro fallo conserva su etiqueta de siempre. Deteccion
+        // unica en utils/upstream-error.js.
+        const failure = describeUpstreamFailure(error, 502, 503)
         noteRateLimitedAccount(error, options.currentAccount)
         if (res.headersSent) {
             if (!res.writableEnded) {
@@ -1330,7 +1338,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 'CHAT'
             )
             try {
-                const retryResp = await requestSender(retryBody)
+                const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
                     const before = fullContent
                     nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
@@ -1450,7 +1458,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         res.json(bodyTemplate)
     } catch (error) {
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
-        const failure = describeUpstreamFailure(error, 502)
+        const failure = describeUpstreamFailure(error, 502, 503)
         noteRateLimitedAccount(error, options.currentAccount)
         if (!res.headersSent) {
             if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
@@ -1479,8 +1487,22 @@ const handleChatCompletion = async (req, res) => {
 
     try {
         // Gemelo de anthropic.js: compactar solo sin tools; con tools el fallo del
-        // adjunto sale como 503 reintentable (catch de abajo).
-        const response_data = await sendChatRequest(req.body, { allowContextCompaction: req.has_tools !== true })
+        // adjunto sale como 503 reintentable (catch de abajo). La clave de sesion permite
+        // reutilizar el prefijo de historial ya subido (utils/context-prefix-cache.js);
+        // sin ella cada turno largo sube y parsea el historial entero. Las MISMAS opciones
+        // viajan en los reenvios de correccion (upstreamOptions).
+        const requestMessages = Array.isArray(req.body.messages) ? req.body.messages : []
+        const upstreamOptions = {
+            allowContextCompaction: req.has_tools !== true,
+            contextPrefixKey: buildContextPrefixKey({
+                userId: req.body.user,
+                model,
+                system: requestMessages.find(message => message?.role === 'system')?.content ?? '',
+                tools: req.body.tools,
+                firstMessage: requestMessages.find(message => message?.role !== 'system') ?? null
+            })
+        }
+        const response_data = await sendChatRequest(req.body, upstreamOptions)
 
         if (!response_data.status || !response_data.response) {
             res.status(500)
@@ -1510,6 +1532,7 @@ const handleChatCompletion = async (req, res) => {
                 // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
                 tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
+                upstreamOptions,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1528,6 +1551,7 @@ const handleChatCompletion = async (req, res) => {
                 // Semilla del ledger de deduplicacion (chat-middleware.js). Informa, no suprime.
                 tool_history_calls: req.tool_history_calls,
                 currentAccount: response_data.currentAccount,
+                upstreamOptions,
                 upstream_request_body: response_data.requestBody,
                 upstream_context: {
                     chatId: response_data.chatId,
@@ -1540,10 +1564,10 @@ const handleChatCompletion = async (req, res) => {
         logger.error('聊天处理错误', 'CHAT', '', error)
         // Adjunto de contexto caido con tools: 503 reintentable (gemelo del 529 de
         // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.
-        const failure = describeUpstreamFailure(error, 500)
+        const failure = describeUpstreamFailure(error, 500, 503)
         if (failure.overloaded) {
             return writeOpenAIHttpError(res, {
-                status: 503,
+                status: failure.status,
                 message: error.publicMessage || 'Upstream context attachment unavailable; retry',
                 type: 'server_error',
                 code: 'upstream_unavailable',
