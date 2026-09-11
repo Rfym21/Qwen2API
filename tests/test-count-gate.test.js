@@ -1,7 +1,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { parseSummary, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM } = require('../tools/test-gate.js')
+const { parseSummary, sumSummaries, evaluate, formatVerdict, computeBlessed, PER_FILE_SUM } = require('../tools/test-gate.js')
 
 const SPEC_TAIL = [
   '✔ some passing test (1.2ms)',
@@ -289,4 +289,29 @@ test('DEFECT 4: the per-file sum the gate hands you keeps grep -a', () => {
     'silently loses 133 tests — the exact class of quiet under-count this gate exists to stop')
   assert.match(PER_FILE_SUM, /--test-force-exit/)
   assert.match(PER_FILE_SUM, /s\+=\$3/, 'it must still sum the third column')
+})
+
+/* ---------------------------------------------------- per-file sum (2026-09-11) -- */
+// The gate no longer goes through node's parent runner (it dropped file tails
+// under CI load: 1035 of 1074, fail 0, exit 0). One process per file, summed.
+
+const fileSummary = (tests, suites, fail = 0) =>
+  parseSummary(`ℹ tests ${tests}\nℹ suites ${suites}\nℹ pass ${tests - fail}\nℹ fail ${fail}\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n`)
+
+test('sumSummaries adds one summary per file, key by key', () => {
+  assert.deepEqual(sumSummaries([fileSummary(3, 1), fileSummary(5, 2, 1)]),
+    { tests: 8, suites: 3, pass: 7, fail: 1, cancelled: 0, skipped: 0, todo: 0 })
+})
+
+test('sumSummaries: a file with no summary voids the attempt — it is never subtracted quietly', () => {
+  assert.equal(sumSummaries([fileSummary(3, 1), null]), null)
+  assert.equal(sumSummaries([]), null)
+})
+
+test('a dead file in a per-file attempt fails the gate as NO_SUMMARY, not as a shorter pass', () => {
+  const summary = sumSummaries([fileSummary(3, 1), null])
+  const v = evaluate({ summary, exitCode: 0, expected: { tests: 3, suites: 1 } })
+  assert.equal(v.ok, false)
+  assert.equal(v.reason, 'NO_SUMMARY')
+  assert.equal(v.retryable, false)
 })
