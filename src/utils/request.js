@@ -5,9 +5,13 @@ const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
 const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
 const { generateUUID, jitter } = require('./tools.js')
-const { uploadAgentContextFile } = require('./upload.js')
+const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { TOOL_CALL_OPEN } = require('./agent-turn.js')
+const { ContextExternalizationError } = require('./upstream-error.js')
+const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
+const {
+    TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
+} = require('./agent-turn.js')
 
 // 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
 const RETRYABLE_ERROR_CODES = new Set([
@@ -31,6 +35,8 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 const HISTORY_MARKER = '# Conversation history (JSONL)'
 const CURRENT_MESSAGE_MARKER = '# Current message'
+// Techo del ledger dentro del presupuesto inline. Ver buildBudgetedAgentPrompt.
+const LEDGER_POOL_SHARE = 0.25
 
 const byteLength = (value) => Buffer.byteLength(String(value || ''), 'utf8')
 
@@ -64,6 +70,69 @@ const truncateUtf8HeadTail = (
     return `${truncateUtf8(text, headBytes)}${separator}${truncateUtf8(text, tailBytes, true)}`
 }
 
+// El ledger de llamadas ya ejecutadas (buildToolHistoryLedger) viaja pegado al FINAL del
+// prefijo: lo montan asi controllers/anthropic.js#buildInternalRequest y
+// middlewares/chat-middleware.js#processRequestBody, en ese orden fijo.
+//
+// Se separa del prefijo aqui, y no es cosmetico. El prefijo se recorta por CABEZA Y COLA
+// (headRatio 0.55) y el bloque va del mas NUEVO al mas VIEJO, asi que dentro del prefijo
+// la rebanada de cola conserva sus entradas mas viejas y el hueco compactado se lleva las
+// mas nuevas — justo la llamada que el modelo esta a punto de repetir, que es la unica
+// razon por la que el bloque existe. Con el tope en 6000 B el bloque cabia entero en esa
+// cola por casualidad aritmetica; a 12000 ya no. El tope volvio a 6000 (ver el porque en
+// agent-turn.js#buildToolHistoryLedger), pero la seccion propia SE QUEDA: la casualidad
+// aritmetica no es una garantia, y lo que arregla es el ORDEN de lo que sobrevive — las
+// entradas MAS NUEVAS, que es la unica propiedad que el bloque no puede perder. Medido
+// sobre 48 sobres externalizados
+// (94-384 KB, 8-60 herramientas, 30-120 llamadas): dentro del prefijo sobrevivian 23-24
+// entradas de las 30-37 del bloque y en 44 de los 48 la MAS NUEVA no llegaba; en seccion
+// propia llegan los 48 de 48 enteros. tests/tool-repetition.test.js lo clava, y lo hace
+// con topes POR ENCIMA del que se envia, porque con el de 6.000 de hoy esta regresion es
+// invisible al presupuesto de produccion: la rebanada de cola mide ~7,1-7,8 KB y el
+// bloque, acotado a 6.000 B, cabe entero en ella. La ven el brazo de 12.000 de la prueba
+// de supervivencia (23 de 37 entradas, perdidas las 14 mas nuevas, cabecera incluida), el
+// de degradado a 24.000, y el diferencial enterrado/seccion, que la reproduce sangrando
+// el bloque un byte en el fixture en vez de parchear este archivo. Ninguno de los tres se
+// borra por «ya no es el default».
+//
+// Se reconocen las DOS primeras lineas del bloque, no solo la cabecera, y a principio de
+// linea. La cabecera sola es una frase corriente: un system prompt del cliente que
+// empezara una linea con ella se llevaba el trato del ledger y, si no cabia en su cuota,
+// desaparecia entero — 11,8 KB de reglas borradas del prompt inline, medido. La leyenda
+// es una frase fija y larga, y un renglon del propio bloque no puede forjar ninguna de
+// las dos: van colapsados a una linea y prefijados con `#n `. Se toma la ULTIMA aparicion
+// porque el bloque es la ultima parte del prefijo.
+const LEDGER_BLOCK_START = `${LEDGER_HEADER}\n${LEDGER_CAPTION}`
+
+// Tercer requisito, ademas de las dos lineas: el renglon siguiente tiene que ser una
+// ENTRADA (`#<n> `), que es lo que buildToolHistoryLedger emite siempre — devuelve ''
+// antes que un bloque sin ninguna. Sin esta comprobacion, un texto del cliente que
+// reprodujera cabecera + leyenda —copiar el prompt del proxy en las propias reglas no es
+// raro— se llevaba el trato del ledger, y como no tiene ningun renglon `#n ` el recorte
+// por renglones lo dejaba en ''. Medido: 11,9 KB de reglas del cliente BORRADAS del
+// prompt inline. Con las tres condiciones forjarlo pide la leyenda literal de 137 bytes y
+// ademas una linea con forma de entrada, y aun asi solo se auto-recorta.
+const startsLedgerBlock = (candidate) => (
+    candidate.startsWith(LEDGER_BLOCK_START) &&
+    /^#\d+ /.test(candidate.slice(LEDGER_BLOCK_START.length + 1).split('\n', 1)[0])
+)
+
+const splitAgentLedger = (prefix) => {
+    const text = String(prefix || '')
+    // Se toma la ULTIMA aparicion porque el bloque es la ultima parte del prefijo; si el
+    // cliente tuviera una copia mas arriba, la de verdad sigue ganando.
+    let at = -1
+    if (text.startsWith(LEDGER_BLOCK_START)) at = 0
+    else {
+        const found = text.lastIndexOf(`\n${LEDGER_BLOCK_START}`)
+        if (found >= 0) at = found + 1
+    }
+    if (at < 0) return { prefix: text, ledger: '' }
+    const candidate = text.slice(at).trim()
+    if (!startsLedgerBlock(candidate)) return { prefix: text, ledger: '' }
+    return { prefix: text.slice(0, at).trim(), ledger: candidate }
+}
+
 const parseAgentEnvelope = (value) => {
     const text = String(value || '')
     const historyIndex = text.indexOf(HISTORY_MARKER)
@@ -71,13 +140,13 @@ const parseAgentEnvelope = (value) => {
     if (historyIndex < 0) {
         if (currentIndex >= 0) {
             return {
-                prefix: text.slice(0, currentIndex).trim(),
+                ...splitAgentLedger(text.slice(0, currentIndex).trim()),
                 history: '',
                 current: text.slice(currentIndex).trim(),
                 entries: []
             }
         }
-        return { prefix: text, history: '', current: '', entries: [] }
+        return { ...splitAgentLedger(text), history: '', current: '', entries: [] }
     }
 
     const historyStart = historyIndex + HISTORY_MARKER.length
@@ -103,7 +172,7 @@ const parseAgentEnvelope = (value) => {
         }
     }
     return {
-        prefix: text.slice(0, historyIndex).trim(),
+        ...splitAgentLedger(text.slice(0, historyIndex).trim()),
         history,
         current: hasCurrent ? text.slice(currentIndex).trim() : '',
         entries
@@ -145,17 +214,29 @@ const buildRecentAgentHistory = (
     }
 
     const latest = entries[entries.length - 1].raw
-    const previous = entries.slice(Math.max(0, entries.length - 4), -1)
-        .map(entry => entry.raw)
-        .join('\n')
-    if (!previous) return truncateUtf8HeadTail(latest, limit, 0.4, compactionSeparator)
 
-    const previousBudget = Math.floor(limit * 0.32)
-    const latestBudget = Math.max(0, limit - previousBudget - 1)
-    return [
-        truncateUtf8HeadTail(previous, previousBudget, 0.45, compactionSeparator),
-        truncateUtf8HeadTail(latest, latestBudget, 0.4, compactionSeparator)
-    ].filter(Boolean).join('\n')
+    // 从最新往回**填满**预算，而不是固定留 5 条。
+    //
+    // 旧写法写死 `slice(length - 4, -1)` + 最后一条 = 恒定 5 条，预算给多少都一样。
+    // 于是上面那套按权重分配的预算对这一段毫无作用：49152 字节的上限只用掉个位数百分比，
+    // 而模型丢掉的是它继续任务所需要的历史。整条保留，不做半截截断 —— JSONL 的一行被
+    // 拦腰砍断既不可解析，也比没有更容易误导。
+    const chosen = []
+    let used = 0
+    for (let i = entries.length - 1; i >= 0; i--) {
+        const raw = entries[i].raw
+        const cost = byteLength(raw) + (chosen.length > 0 ? 1 : 0)
+        if (used + cost > limit) break
+        chosen.unshift(raw)
+        used += cost
+    }
+    // 连最新的一条都放不下时退回旧行为：把它头尾截断塞进整个预算，绝不返回空。
+    if (chosen.length === 0) return truncateUtf8HeadTail(latest, limit, 0.4, compactionSeparator)
+    // 有内容被丢掉时留个记号，模型才知道自己看到的不是全部。
+    const dropped = entries.length - chosen.length
+    return dropped > 0
+        ? `${compactionSeparator.trim()}\n${chosen.join('\n')}`
+        : chosen.join('\n')
 }
 
 const buildBudgetedAgentPrompt = (
@@ -168,6 +249,8 @@ const buildBudgetedAgentPrompt = (
     const essential = buildEssentialAgentHistory(envelope.entries)
     const sections = [
         { header: '', value: envelope.prefix, weight: 34, headRatio: 0.55, kind: 'text' },
+        // Peso 0: no entra en el reparto por pesos, se reserva antes (ver abajo).
+        { header: '', value: envelope.ledger, weight: 0, headRatio: 1, kind: 'ledger' },
         {
             header: '# Essential Agent state retained inline',
             value: essential,
@@ -194,18 +277,65 @@ const buildBudgetedAgentPrompt = (
         ), 0)
     if (fixedBytes >= max) return truncateUtf8(notice, max)
 
-    let remainingBytes = max - fixedBytes
-    let remainingWeight = sections.reduce((sum, section) => sum + section.weight, 0)
+    const pool = max - fixedBytes
     const compactionSeparator = attachmentAvailable
         ? '\n...[inline context compacted; complete copy is in the attachment]...\n'
         : '\n...[older inline context compacted after attachment recovery failed]...\n'
+
+    // 两趟分配。
+    //
+    // 旧写法是一趟：`remainingBytes -= budget` 减掉的是**配额**而不是实际用量，所以一个
+    // 内容很小的 section 会把自己没用完的额度一并吞掉；而剩下的字节最后落在**最后一个**
+    // section（current，不可伸缩、通常很短）上，直接死掉。真正能无限吸收历史的 recent
+    // 排在第三位，永远吃不到这些剩余。实测：49152 字节的上限只用掉 19.8%。
+    //
+    // 第一趟：每个 section 拿「按权重的配额」和「它实际需要的量」里更小的那个。
+    // 第二趟：把剩余按**弹性顺序**发出去 —— recent 先拿，它能把更多历史留在行内。
+    const naturalBytes = sections.map(section => byteLength(section.value))
+
+    // El ledger se sirve ANTES del reparto por pesos, y por una razon distinta a las demas
+    // secciones: es pequeno, esta acotado en origen (6000 B) y ya sabe degradar solo, con
+    // renglones enteros y su nota de omision. Darle un peso lo dejaria a merced del reparto
+    // — con el pool tipico, un 8% son 3872 B y el bloque saldria recortado siempre — y
+    // meterlo en el prefijo es lo que rompio la version anterior de esto.
+    //
+    // El tope de un cuarto del pool no es para produccion: con los 48 KiB por defecto el
+    // pool son ~48400 B y el bloque entero (<=6000) cabe con holgura. Existe para que un
+    // AGENT_CONTEXT_LIVE_PROMPT_BYTES pequeno no deje al resto sin sitio; ahi el bloque se
+    // recorta por renglones, conservando los MAS NUEVOS, que es lo que se pedia.
+    const ledgerIndex = sections.findIndex(section => section.kind === 'ledger')
+    const ledgerBudget = ledgerIndex >= 0
+        ? Math.min(naturalBytes[ledgerIndex], Math.floor(pool * LEDGER_POOL_SHARE))
+        : 0
+    const weightedPool = pool - ledgerBudget
+
+    // `|| 1` solo para el caso degenerado en que el ledger sea la unica seccion viva: sin
+    // el, `x / 0` meteria un NaN en un presupuesto.
+    const totalWeight = sections.reduce((sum, section) => sum + section.weight, 0) || 1
+    const budgets = sections.map((section, index) => (
+        section.kind === 'ledger'
+            ? ledgerBudget
+            : Math.min(
+                Math.floor(weightedPool * section.weight / totalWeight),
+                naturalBytes[index]
+            )
+    ))
+    let surplus = pool - budgets.reduce((sum, value) => sum + value, 0)
+    const byElasticity = sections
+        .map((section, index) => index)
+        .sort((a, b) => (sections[b].kind === 'recent' ? 1 : 0) - (sections[a].kind === 'recent' ? 1 : 0))
+    for (const index of byElasticity) {
+        if (surplus <= 0) break
+        const want = naturalBytes[index] - budgets[index]
+        if (want <= 0) continue
+        const give = Math.min(want, surplus)
+        budgets[index] += give
+        surplus -= give
+    }
+
     const rendered = sections.map((section, index) => {
-        const isLast = index === sections.length - 1
-        const budget = isLast
-            ? remainingBytes
-            : Math.floor(remainingBytes * section.weight / remainingWeight)
-        remainingBytes -= budget
-        remainingWeight -= section.weight
+        const budget = budgets[index]
+        if (section.kind === 'ledger') return truncateToolHistoryLedger(section.value, budget)
         const content = section.kind === 'recent'
             ? buildRecentAgentHistory(envelope, budget, compactionSeparator)
             : truncateUtf8HeadTail(
@@ -217,7 +347,7 @@ const buildBudgetedAgentPrompt = (
         return section.header ? `${section.header}\n${content}` : content
     })
 
-    return [notice, ...rendered].join(joinSeparator)
+    return [notice, ...rendered].filter(Boolean).join(joinSeparator)
 }
 
 const getMessageTextContent = (message) => {
@@ -272,7 +402,7 @@ const buildAgentContextLivePrompt = (
     return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: true })
 }
 
-const compactAgentContextFallback = (original, maxBytes = config.agentContextLivePromptBytes) => {
+const compactAgentContextFallback = (original, maxBytes = config.agentContextFallbackPromptBytes) => {
     const notice = [
         '# Agent context recovery',
         'The upstream document attachment failed, so older context was compacted to stay below the Qwen Web request limit.',
@@ -282,9 +412,75 @@ const compactAgentContextFallback = (original, maxBytes = config.agentContextLiv
     return buildBudgetedAgentPrompt(original, maxBytes, notice, { attachmentAvailable: false })
 }
 
+// Reutilizacion del prefijo de historial entre turnos (context-prefix-cache.js). En este
+// camino el archivo contiene SOLO el bloque `# Conversation history (JSONL)` tal como se
+// renderizo cuando se subio; system + tools, ledger, mensaje actual y la cola del historial
+// que aun no esta en el archivo van completos inline. Nada se compacta, asi que el
+// separador `[inline context compacted; ...]` no aparece: solo lo emite el camino B2
+// (archivo = sobre entero), donde sigue siendo verdad. La cabecera literal HISTORY_MARKER
+// se conserva para que getMessageTextContent siga encontrando la parte de texto; la linea
+// entre corchetes no es JSON y parseAgentEnvelope ya salta esas lineas.
+const HISTORY_ATTACHMENT_NAME_PREFIX = 'QWEN2API_AGENT_HISTORY_'
+// Margen sobre la prueba de encaje del horneado: el descriptor real difiere del de relleno
+// en unos bytes (timestamps, url) y el sobre exterior escapa el JSONL.
+const BAKE_FIT_MARGIN_BYTES = 2048
+
+const buildHistoryAttachmentLine = (attachmentName, prefixLines) => (
+    `[earlier history: the first ${prefixLines} JSONL messages are in the attachment ${attachmentName}; ` +
+    `the JSONL below continues from message ${prefixLines + 1}]`
+)
+
+const buildPrefixAttachmentNotice = (attachmentName, prefixLines) => [
+    '# Agent context attachment',
+    `The EARLIER part of the conversation history (the first ${prefixLines} JSONL messages) is attached as ${attachmentName}. ` +
+    `The "${HISTORY_MARKER}" section below CONTINUES it verbatim; together they are the complete history.`,
+    'The system instructions, tool schemas, executed-call ledger and current message are complete inline. Read the attachment as the authoritative earlier history before acting.',
+    'Continue from the latest state; do not restart the task, stop after one intermediate action, or claim completion without tool-result verification.',
+    `When an available tool is needed, emit the real \`${TOOL_CALL_OPEN}\` block immediately. Do not replace it with prose such as “I will run...” or “done”.`
+].join('\n')
+
+/** Texto inline al hornear (tail = '') y al reutilizar (tail = lineas que no estan en el archivo). */
+const buildPrefixReusePrompt = (envelope, { attachmentName, prefixLines }, tail) => [
+    buildPrefixAttachmentNotice(attachmentName, prefixLines),
+    envelope.prefix,
+    envelope.ledger,
+    [HISTORY_MARKER, buildHistoryAttachmentLine(attachmentName, prefixLines), tail].filter(Boolean).join('\n'),
+    envelope.current
+].filter(Boolean).join('\n\n')
+
+const countLines = (text) => (text ? String(text).split('\n').length : 0)
+
+// Forma canonica de una linea JSONL del historial para el hash del prefijo. El razonamiento
+// retenido que controllers/anthropic.js cuelga delante del texto del assistant entra y sale
+// del presupuesto conforme crece el historial; con el hash sobre el texto literal, cada
+// turno con thinking re-horneaba (26/26 medidos el 2026-09-11). Solo se quita para
+// comparar: el archivo subido lleva las lineas tal cual. Una linea que no es JSON se
+// compara literal.
+const canonicalHistoryLine = (raw) => {
+    try {
+        const parsed = JSON.parse(raw)
+        if (parsed && typeof parsed === 'object' && typeof parsed.content === 'string') {
+            return JSON.stringify({ ...parsed, content: stripRetainedThinking(parsed.content) })
+        }
+    } catch (_) { /* no JSON */ }
+    return raw
+}
+
+// Un horneado en curso por clave. La segunda peticion de la misma sesion (en la practica el
+// reintento tras un 529) espera a que termine y vuelve a probar el prefijo contra SU
+// historial, en vez de subir el suyo en paralelo.
+const bakeInFlight = new Map()
+
+const invalidateContextPrefix = (key) => (key ? contextPrefixCache.delete(String(key)) : false)
+
 /**
  * 超过安全阈值时把完整 Agent 上下文上传为 Qwen 文档。
  * uploader 可注入，便于在无真实账号的测试环境验证整个变换。
+ *
+ * Con `options.contextPrefixKey` (y agentContextPrefixReuse) se intenta antes el prefijo de
+ * historial: reutilizar el adjunto cacheado si el historial de hoy empieza por el (0
+ * parses), o si no hornear uno nuevo con el historial de hoy (1 parse que amortizan los
+ * turnos siguientes). Si ni el diseño horneado cabe en el umbral, camino B2 de siempre.
  */
 const externalizeOversizedAgentContext = async (
     payload,
@@ -301,21 +497,135 @@ const externalizeOversizedAgentContext = async (
     }
 
     const uploader = options.uploader || uploadAgentContextFile
+    const restMessages = payload.messages.slice(1)
+    const withMessage = (candidateMessage) => ({ ...payload, messages: [candidateMessage, ...restMessages] })
+
+    // --- Prefijo de historial reutilizable ---
+    const cache = options.cache || contextPrefixCache
+    const prefixKey = config.agentContextPrefixReuse && options.contextPrefixKey
+        ? String(options.contextPrefixKey)
+        : null
+    const envelope = prefixKey ? parseAgentEnvelope(originalContent) : null
+    const historyLines = envelope ? countLines(envelope.history) : 0
+
+    if (prefixKey && bakeInFlight.has(prefixKey) && options.waitedForBake !== true) {
+        try { await bakeInFlight.get(prefixKey) } catch (_) { /* el primero ya reporto su fallo */ }
+        return externalizeOversizedAgentContext(payload, currentToken, currentAccount, { ...options, waitedForBake: true })
+    }
+
+    const prefixMessage = (file, prefixLines, tail) => {
+        const attachmentName = file?.name || file?.file?.filename || `${HISTORY_ATTACHMENT_NAME_PREFIX}0.txt`
+        const built = replaceMessageTextContent(
+            message,
+            buildPrefixReusePrompt(envelope, { attachmentName, prefixLines }, tail)
+        )
+        built.files = [...(Array.isArray(message.files) ? message.files : []), file]
+        return built
+    }
+
+    if (envelope?.history) {
+        const entry = cache.get(prefixKey)
+        if (entry && prefixMatches(envelope.history, entry, canonicalHistoryLine)) {
+            const tail = envelope.history.split('\n').slice(entry.prefixLines).join('\n')
+            const candidate = withMessage(prefixMessage(entry.file, entry.prefixLines, tail))
+            const candidateBytes = byteLength(JSON.stringify(candidate))
+            if (candidateBytes <= thresholdBytes) {
+                logger.info(
+                    `Agent 上下文复用历史附件（附件 ${entry.prefixLines} 行，内联 ${countLines(tail)} 行，${candidateBytes} bytes）`,
+                    'REQUEST',
+                    '📎'
+                )
+                return { payload: candidate, externalized: true, reusedPrefix: true, serializedBytes, prefixKey }
+            }
+            // La cola ya no cabe: se hornea otra vez con el historial completo de hoy.
+        }
+    }
+
+    // ¿Cabe el diseño horneado (cola vacia) ANTES de gastar un parse? Se mide con un
+    // descriptor de relleno del mismo tamaño que el real. Si no cabe (system + tools o el
+    // mensaje actual solos desbordan), camino B2 y la entrada cacheada se queda como esta.
+    let bakeHistory = null
+    if (envelope?.history) {
+        const placeholderId = '00000000-0000-4000-8000-000000000000'
+        const placeholderName = `${HISTORY_ATTACHMENT_NAME_PREFIX}${Date.now()}.txt`
+        const placeholder = buildChatFileDescriptor({
+            fileId: placeholderId,
+            fileUrl: `https://qwen-webui-prod.oss-accelerate.aliyuncs.com/${placeholderId}/${placeholderId}_${placeholderName}`,
+            filename: placeholderName,
+            size: byteLength(envelope.history)
+        })
+        const probe = withMessage(prefixMessage(placeholder, historyLines, ''))
+        if (byteLength(JSON.stringify(probe)) + BAKE_FIT_MARGIN_BYTES <= thresholdBytes) {
+            bakeHistory = envelope.history
+        }
+    }
+
     let file
     try {
-        file = await uploader(originalContent, currentToken, currentAccount, options)
+        if (bakeHistory !== null) {
+            const bake = uploader(bakeHistory, currentToken, currentAccount, {
+                ...options,
+                filename: `${HISTORY_ATTACHMENT_NAME_PREFIX}${Date.now()}.txt`
+            })
+            bakeInFlight.set(prefixKey, bake)
+            try {
+                file = await bake
+            } finally {
+                if (bakeInFlight.get(prefixKey) === bake) bakeInFlight.delete(prefixKey)
+            }
+        } else {
+            file = await uploader(originalContent, currentToken, currentAccount, options)
+        }
     } catch (error) {
+        // Sin permiso explicito un adjunto fallido NO se disimula. Un turno con tools que
+        // ve una fraccion del historial repite lo ya hecho (3 duplicados y 7 turnos
+        // desbocados en 6 min el 2026-09-09, todos tras caer el parse de Qwen; cero antes).
+        // El error sale como 529/503 reintentable; solo el chat sin tools opta por
+        // compactar, y los reenvios de correccion (sin opciones) nunca.
+        if (options.allowContextCompaction !== true) {
+            logger.error('Agent 长上下文附件上传/解析失败，带工具的请求拒绝削减上下文', 'REQUEST', '', error)
+            throw new ContextExternalizationError(error)
+        }
         logger.error('Agent 长上下文附件上传/解析失败，回退到最近上下文', 'REQUEST', '', error)
-        const fallbackMessage = replaceMessageTextContent(
-            message,
-            compactAgentContextFallback(originalContent, options.livePromptBytes)
-        )
-        fallbackMessage.files = Array.isArray(message.files) ? [...message.files] : []
+        const compactedWith = (budget) => {
+            const built = replaceMessageTextContent(message, compactAgentContextFallback(originalContent, budget))
+            built.files = Array.isArray(message.files) ? [...message.files] : []
+            return { ...payload, messages: [built, ...payload.messages.slice(1)] }
+        }
+        // El presupuesto del fallback es de TEXTO y el umbral es del JSON serializado
+        // (escapes, envoltorio, cuerpos con muchas comillas): 86016 de texto pueden ser
+        // mas de 92160 en el cable y volver a disparar el WAF. Si no cabe, se recorta en
+        // proporcion hasta que quepa (medido 2026-09-11: contexto ~20 KB tras el fallback).
+        let budget = Number(options.fallbackPromptBytes) || config.agentContextFallbackPromptBytes
+        // Suelo del recorte: nunca por debajo de 8 KiB ni del presupuesto pedido si era menor.
+        const floorBudget = Math.min(8 * 1024, budget)
+        let compacted = compactedWith(budget)
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const bytes = byteLength(JSON.stringify(compacted))
+            if (bytes <= thresholdBytes || budget <= floorBudget) break
+            // Escala sobre lo que de verdad ocupa (el presupuesto puede ser mayor que el texto).
+            budget = Math.max(floorBudget, Math.floor(Math.min(budget, bytes) * thresholdBytes / bytes) - 1024)
+            compacted = compactedWith(budget)
+        }
+        return { payload: compacted, externalized: false, compacted: true, serializedBytes }
+    }
+
+    if (bakeHistory !== null) {
+        const entry = {
+            accountEmail: currentAccount?.email || null,
+            file,
+            prefixHash: canonicalHistoryHash(bakeHistory.split('\n'), canonicalHistoryLine),
+            prefixBytes: byteLength(bakeHistory),
+            prefixLines: historyLines
+        }
+        cache.set(prefixKey, entry)
+        logger.info(`Agent 上下文历史前缀已外置（${historyLines} 行，${entry.prefixBytes} bytes）`, 'REQUEST', '📎')
         return {
-            payload: { ...payload, messages: [fallbackMessage, ...payload.messages.slice(1)] },
-            externalized: false,
-            compacted: true,
-            serializedBytes
+            payload: withMessage(prefixMessage(file, historyLines, '')),
+            externalized: true,
+            bakedPrefix: true,
+            serializedBytes,
+            prefixKey
         }
     }
 
@@ -419,10 +729,15 @@ const sendChatRequest = async (body, options = {}) => {
     const contextResult = await externalizeOversizedAgentContext(
         rawPayload,
         currentToken,
-        currentAccount
+        currentAccount,
+        // Solo quien conoce la peticion (¿lleva tools?) puede permitir compactar.
+        {
+            allowContextCompaction: options.allowContextCompaction === true,
+            contextPrefixKey: options.contextPrefixKey || null
+        }
     )
     const payload = contextResult.payload
-    if (contextResult.externalized) {
+    if (contextResult.externalized && !contextResult.reusedPrefix && !contextResult.bakedPrefix) {
         logger.info(`Agent 上下文已外置为 Qwen 文档（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST', '📎')
     } else if (contextResult.compacted) {
         logger.warn(`Agent 上下文附件失败，已保留最近上下文（原请求 ${contextResult.serializedBytes} bytes）`, 'REQUEST')
@@ -451,6 +766,13 @@ const sendChatRequest = async (body, options = {}) => {
                     // 返回真正提交给 Qwen 的请求体。严格 Agent 回合纠正可直接复用
                     // 已外置的上下文附件，避免每次纠正都重新上传同一份长历史。
                     requestBody: payload,
+                    // 上下文被静默削减时，调用方必须能告诉客户端。附件失败的回退把
+                    // ~1MB 的上下文压成几十 KB 却照样返回 200：没有这两个字段，
+                    // 客户端拿到的是一个「成功」的回答，而模型其实只看到了一小片。
+                    contextCompacted: contextResult.compacted === true,
+                    contextExternalized: contextResult.externalized === true,
+                    contextPrefixReused: contextResult.reusedPrefix === true,
+                    contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
                     response: response.data
                 }
@@ -500,6 +822,10 @@ const sendChatRequest = async (body, options = {}) => {
     } else if (lastError) {
         logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
     }
+
+    // Un adjunto reutilizado pudo ser la causa (file_id caducado): se olvida y el reintento
+    // del cliente hornea uno nuevo. Cuesta como mucho un parse de mas.
+    if (contextResult.reusedPrefix) invalidateContextPrefix(contextResult.prefixKey)
 
     return {
         status: false,
@@ -566,5 +892,7 @@ module.exports = {
     generateChatID,
     buildAgentContextLivePrompt,
     compactAgentContextFallback,
-    externalizeOversizedAgentContext
+    externalizeOversizedAgentContext,
+    buildPrefixReusePrompt,
+    invalidateContextPrefix
 }

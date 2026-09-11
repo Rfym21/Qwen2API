@@ -30,6 +30,63 @@ const NON_RETRYABLE_FINISH_REASONS = new Set([
   'refusal'
 ])
 
+/**
+ * Rebasa los spans de residuo de coordenadas de `cleanedText` a las de `visibleText`.
+ *
+ * `stripToolCallResidue` pela por POSICIÓN, nunca por búsqueda: `at` es el punto que el
+ * parser anotó sobre `cleanedText`, y `parseAgentControlText` recorta y — en una ronda
+ * final/blocked — desenvuelve el `<agent_final>`, así que entre ambos hay un desplazamiento.
+ * Rebasar no es un detalle: envuelto es la ÚNICA forma en la que un residuo llega a
+ * entregarse en este camino (el gate rechaza la prosa desnuda con agentTurnAcceptBareFinal
+ * en false), o sea que sin esto el pelado no encontraría un solo span y no pelaría nada.
+ *
+ * DOS MODOS, y el segundo existe por una fuga reproducida:
+ *
+ * 1. Con `segments` (los que devuelve el desenvoltorio tolerante de agent-turn.js): el texto
+ *    entregable NO es un tramo contiguo del original —los tags se quitan de EN MEDIO—, así
+ *    que se rebasa segmento a segmento, aritmética pura. Cuando esto no existía, el `indexOf`
+ *    del modo 2 devolvía -1 para toda ronda tolerada y se descartaban TODOS los spans: un
+ *    `[END TOOL CALL]` huérfano volvía a salir como texto del asistente (la fuga medida en
+ *    20 de 29.352 turnos que cerró la spec T7). Verificado por tres revisores adversarios
+ *    de forma independiente y pinchado en tests/openai-agent-gate-429.test.js.
+ * 2. Sin `segments` (envoltorio exacto, `bare`, `invalid_control`): el texto sí es contiguo;
+ *    se exige además que sea NO ambiguo (un `indexOf` a secas elegiría el primero de dos
+ *    tramos idénticos y borraría en el sitio equivocado).
+ *
+ * Fail closed en los dos modos: cada span se revalida contra el destino con la misma regla
+ * que aplicará stripToolCallResidue — coincidencia exacta, o cola recortada que sea prefijo
+ * del span. Lo que no cuadra se descarta: mejor entregar un residuo que morder la respuesta.
+ */
+const rebaseResidueSpans = (cleanedText, visibleText, spans, segments = null) => {
+  if (!Array.isArray(spans) || spans.length === 0) return []
+  const source = String(cleanedText || '')
+  const target = String(visibleText || '')
+  if (!target) return []
+  const usable = spans.filter(span =>
+    span && typeof span.text === 'string' && span.text && Number.isInteger(span.at))
+
+  let moved
+  if (Array.isArray(segments)) {
+    moved = usable
+      .map(span => {
+        const segment = segments.find(item => span.at >= item.from && span.at < item.to)
+        return segment ? { ...span, at: span.at - segment.from + segment.at } : null
+      })
+      .filter(Boolean)
+  } else {
+    const offset = source.indexOf(target)
+    if (offset === -1 || source.indexOf(target, offset + 1) !== -1) return []
+    moved = usable.map(span => ({ ...span, at: span.at - offset }))
+  }
+
+  return moved.filter(span => {
+    if (span.at < 0 || span.at >= target.length) return false
+    const slice = target.slice(span.at, span.at + span.text.length)
+    if (slice === span.text) return true
+    return slice.length < span.text.length && span.text.startsWith(slice)
+  })
+}
+
 const normalizeCreatedMetadata = (payload) => {
   const created = payload?.['response.created'] || payload?.response?.created
   if (!created || typeof created !== 'object') return null
@@ -461,7 +518,9 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
       'AGENT'
     )
   }
-  const admitToolCall = createToolCallLedger()
+  // Sembrado con las llamadas ya ejecutadas (chat-middleware.js#processRequestBody).
+  // Una entrada sembrada NO suprime — solo deja un warn con nombre y ordinal.
+  const admitToolCall = createToolCallLedger({ seed: options.tool_history_calls })
   const toolCalls = [
     ...nativeToolCalls,
     ...(nativeToolCalls.length > 0 ? [] : textChannelCalls)
@@ -485,6 +544,14 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     ...(nativeTools?.getErrors?.() || [])
   ]
   const control = parseAgentControlText(textTools.cleanedText)
+  // Registro del residuo condenado, ya rebasado a coordenadas de `visibleText`: la capa de
+  // entrega (chat.js#prepareAgentOutput) lo pela por posición, gemela de anthropic.js:1501.
+  // La DETECCIÓN no se toca — `visibleText` sigue byte a byte como salió del parser, porque
+  // containsOrphanProtocolResidue decide malformed_protocol sobre él y pelarlo aquí apagaría
+  // el reintento que hoy recupera la ronda.
+  const residueSpans = hasTools
+    ? rebaseResidueSpans(textTools.cleanedText, control.text, textTools.residueSpans, control.segments)
+    : []
   const metadata = (acceptedResponseId && createdByResponseId.get(acceptedResponseId)) || primaryCreated || lastCreated || {
     chatId: null,
     parentId: null,
@@ -496,6 +563,11 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     rawAnswer: answer,
     visibleText: control.text,
     controlKind: control.kind,
+    // Residuo de protocolo condenado por el parser, en coordenadas de `visibleText`.
+    // Hasta esta spec se calculaba y se tiraba al suelo: stripToolCallResidue tenía cuatro
+    // llamadores en anthropic.js y CERO aquí, y por eso un `[END TOOL CALL]` huérfano salía
+    // como texto del asistente (20 casos medidos sobre 192 sesiones reales).
+    residueSpans,
     streamedVisibleText,
     recoveredContent,
     recoveredReasoning,
@@ -650,7 +722,12 @@ const exhaustedError = (attempt, retryReason) => {
     malformed_protocol: '上游持续返回残缺的工具调用协议，未能恢复为可执行调用'
   }
   return {
-    status: 429,
+    // 502, no 429. Nada de esto fue un límite de tasa: es un desacuerdo de protocolo con el
+    // upstream. Con 429, chat.js#writeOpenAIHttpError lo etiquetaba `rate_limit_error`, y un
+    // cliente agéntico lee eso como "te están limitando, échate atrás y reintenta el turno
+    // entero" — multiplicando el gasto de cuota de la cuenta contra la que ya se falló.
+    // El 429 real (Qwen RateLimited) sigue saliendo por chat.image.video.js.
+    status: 502,
     message: messages[retryReason] || '上游未能生成有效的 Agent 回合',
     code: retryReason === 'invalid_tool_call' ? 'invalid_tool_call' : 'upstream_agent_turn_incomplete'
   }
@@ -780,6 +857,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     // con llamadas se acepta arriba y no llega aquí —: el reintento abre chat nuevo.
     const chatBusy = attempt.textChannelCut === true || attempt.upstreamStopped === true
     const retryResponse = await requestSender(retryBody, {
+      // Opciones de contexto de la peticion original (compactar / clave del prefijo de
+      // historial): sin ellas el reenvio no puede reutilizar el adjunto y quema un parse.
+      ...(options.upstreamOptions || {}),
       chatId: chatBusy ? null : (upstreamContext.chatId || null),
       parentId: chatBusy ? null : (upstreamContext.responseId || null),
       currentAccount: options.currentAccount || null,
@@ -804,6 +884,25 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     })
   }
 
+  // NO hay cupo de rendición para `invalid_control`, y es deliberado.
+  //
+  // Se probó darle uno (entregar el texto pelado con finish_reason=stop tras agotar los
+  // intentos) y la verificación adversaria lo tumbó por tres motivos, los tres reproducidos:
+  //  - Su justificación era "el modelo SÍ declaró el cierre, sólo escribió mal el envoltorio".
+  //    Falso para casi todo lo que le llegaba: tras anclar el cierre al final, las formas que
+  //    siguen cayendo en invalid_control son exactamente las que NO declaran un cierre legible
+  //    —desbalanceadas («<agent_final>respuesta a medio envolver», sin cierre), invertidas,
+  //    dobles, y las dos familias a la vez— es decir el mismo caso que `bare` y `empty` tienen
+  //    vetado. Entregaba «terminé» y «necesito tu contraseña» como un turno completo.
+  //  - No estaba atado al agotamiento real: el `break` de arriba también salta cuando no hay
+  //    requestSender, así que la PRIMERA ronda malformada se entregaba como stop con
+  //    attempts=1, sin un solo reintento.
+  //  - En SSE ni siquiera se alcanzaba para su propio caso de prueba: con on_content_delta
+  //    cableado (chat.js), el texto ya emitido dispara antes el 422 de stream invalidado.
+  //
+  // Regla que manda, config/index.js:58: 耗尽后必须显式失败，绝不能伪装成 finish_reason=stop.
+  // El arreglo real de la fuga de 429 es el desenvoltorio tolerante de arriba, que acepta la
+  // forma medida en vivo al PRIMER intento; cuando eso no aplica, agotar es agotar.
   return {
     ok: false,
     error: exhaustedError(lastAttempt, lastEvaluation?.retryReason),

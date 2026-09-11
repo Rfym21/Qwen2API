@@ -32,6 +32,139 @@ const unwrapExactTag = (value, openTag, closeTag) => {
   return matched ? matched[1].trim() : null
 }
 
+const countOccurrences = (haystackLower, needle) => {
+  const needleLower = needle.toLowerCase()
+  let count = 0
+  let index = 0
+  while ((index = haystackLower.indexOf(needleLower, index)) !== -1) {
+    count += 1
+    index += needleLower.length
+  }
+  return count
+}
+
+/**
+ * Aplica recortes sobre `source` y devuelve el texto resultante MÁS los segmentos que
+ * sobrevivieron: cada uno dice de dónde viene (`from`/`to`, coordenadas del original) y
+ * dónde cae (`at`, coordenadas de la salida).
+ *
+ * Existe por un fallo concreto y medido: openai-agent-runtime.js#rebaseResidueSpans
+ * localizaba el texto entregable dentro de `cleanedText` con un `indexOf`, lo que sólo
+ * funciona si la salida es un tramo CONTIGUO del original. Quitar un par de tags de EN
+ * MEDIO rompe esa premisa, `indexOf` devolvía -1 y se descartaban TODOS los spans de
+ * residuo — así que un `[END TOOL CALL]` huérfano volvía a llegar crudo al cliente,
+ * justo la fuga que la spec T7 había cerrado. Con los segmentos el rebase es aritmético
+ * y no busca nada.
+ */
+const spliceWithSegments = (source, cuts) => {
+  const ordered = cuts
+    .filter(cut => cut && cut.len > 0 && cut.at >= 0)
+    .sort((a, b) => a.at - b.at)
+  const segments = []
+  let text = ''
+  let cursor = 0
+  for (const cut of ordered) {
+    if (cut.at > cursor) {
+      segments.push({ from: cursor, to: cut.at, at: text.length })
+      text += source.slice(cursor, cut.at)
+    }
+    cursor = Math.max(cursor, cut.at + cut.len)
+  }
+  if (cursor < source.length) {
+    segments.push({ from: cursor, to: source.length, at: text.length })
+    text += source.slice(cursor)
+  }
+  return { text, segments }
+}
+
+/** Recorta los extremos en blanco manteniendo los segmentos alineados con el original. */
+const trimWithSegments = ({ text, segments }) => {
+  const lead = text.length - text.trimStart().length
+  const trimmed = text.trim()
+  const end = lead + trimmed.length
+  const kept = []
+  for (const segment of segments) {
+    const from = Math.max(segment.at, lead)
+    const to = Math.min(segment.at + (segment.to - segment.from), end)
+    if (to <= from) continue
+    kept.push({
+      from: segment.from + (from - segment.at),
+      to: segment.from + (to - segment.at),
+      at: from - lead
+    })
+  }
+  return { text: trimmed, segments: kept }
+}
+
+/**
+ * Prosa delante + un único par bien formado que CIERRA el mensaje: se acepta y se conserva
+ * todo, sin tags.
+ *
+ * Medido en vivo (2026-09-08, qwen3.8-max, celda F de probe-matrix con LOG_LEVEL=INFO para
+ * que el warn del gate fuera visible): en una tanda de 5 rechazos, 3 fueron `invalid_control`
+ * y los 3 tenían la misma forma — prosa de razonamiento filtrada al canal de respuesta y,
+ * detrás, un `<agent_final>Magenta</agent_final>` perfectamente bien formado. La respuesta era
+ * correcta y completa; el ancla `^` de unwrapExactTag la tiraba, y esa familia quemaba los 3
+ * intentos y salía como error HTTP (~1 de cada 4 peticiones).
+ *
+ * Se conservan las dos mitades en vez de quedarse sólo con el cuerpo porque el propio proxy
+ * antepone markdown de imagen al `answer` antes de este parse (openai-agent-runtime.js, el
+ * volcado de `pendingImages` en cuanto arranca el canal de respuesta): quedarse con el cuerpo
+ * borraría la imagen. Es además lo que el gemelo Anthropic ya entrega hoy
+ * (createAgentTagStripper).
+ *
+ * EL CIERRE TIENE QUE SER LO ÚLTIMO. Un tag con texto detrás no es un cierre: es una mención
+ * incidental, y el modelo siguió escribiendo después de "terminar". Sin este ancla, cualquier
+ * prosa con un par balanceado dentro —«luego emito <agent_final>el resumen</agent_final>
+ * cuando acabe»— se promovía de `bare` (vetado) a `final` y se entregaba como turno completo
+ * al primer intento: exactamente la conclusión fabricada que prohíbe config/index.js:58.
+ * Verificado por el revisor adversario, reproducido, y cerrado aquí.
+ *
+ * Lo que NO se tolera, porque es ambiguo de verdad: tags desbalanceados, más de un par, las
+ * dos familias a la vez, y texto después del cierre. Todo eso sigue en `invalid_control`.
+ */
+const unwrapSinglePairWithSurroundings = (raw) => {
+  const trimmed = raw.trim()
+  const lead = raw.length - raw.trimStart().length
+  const lower = trimmed.toLowerCase()
+  const families = [
+    { kind: 'final', open: AGENT_FINAL_OPEN, close: AGENT_FINAL_CLOSE },
+    { kind: 'blocked', open: AGENT_BLOCKED_OPEN, close: AGENT_BLOCKED_CLOSE }
+  ].map(family => ({
+    ...family,
+    opens: countOccurrences(lower, family.open),
+    closes: countOccurrences(lower, family.close)
+  }))
+
+  const present = families.filter(family => family.opens > 0 || family.closes > 0)
+  // Las dos familias a la vez: el turno declara "terminé" y "estoy bloqueado" en la misma
+  // respuesta. No hay lectura correcta, así que se regenera.
+  if (present.length !== 1) return null
+
+  const [family] = present
+  if (family.opens !== 1 || family.closes !== 1) return null
+
+  const openIndex = lower.indexOf(family.open.toLowerCase())
+  const closeIndex = lower.indexOf(family.close.toLowerCase())
+  if (openIndex > closeIndex) return null
+  // Terminal, no incidental: nada puede venir después del cierre.
+  if (closeIndex + family.close.length !== trimmed.length) return null
+  // Los índices vienen del lowercase, y toLowerCase puede cambiar la LONGITUD de algún
+  // carácter (U+0130 se convierte en dos), con lo que dejarían de valer sobre el original.
+  // Se comprueba antes de cortar: ahora esos offsets no sólo recortan el texto, también
+  // rebasan los spans de residuo, así que un desfase mordería la respuesta. Fail closed.
+  if (trimmed.slice(openIndex, openIndex + family.open.length).toLowerCase() !== family.open) return null
+  if (trimmed.slice(closeIndex, closeIndex + family.close.length).toLowerCase() !== family.close) return null
+
+  const spliced = trimWithSegments(spliceWithSegments(raw, [
+    { at: 0, len: lead },
+    { at: lead + openIndex, len: family.open.length },
+    // Del cierre hasta el final del original: el tag y el blanco de cola de una vez.
+    { at: lead + closeIndex, len: raw.length - lead - closeIndex }
+  ]))
+  return { kind: family.kind, text: spliced.text, segments: spliced.segments }
+}
+
 /**
  * Agent 请求的可见输出必须明确声明本回合是“已完成”还是“需要用户输入”。
  * 工具调用由 tool-prompt 解析器先行抽取，因此这里仅处理剩余文本。
@@ -46,6 +179,9 @@ const parseAgentControlText = (value) => {
 
   const blockedText = unwrapExactTag(trimmed, AGENT_BLOCKED_OPEN, AGENT_BLOCKED_CLOSE)
   if (blockedText !== null) return { kind: 'blocked', text: blockedText }
+
+  const tolerated = unwrapSinglePairWithSurroundings(raw)
+  if (tolerated) return tolerated
 
   if (/<\/?agent_(?:final|blocked)>/i.test(trimmed)) {
     return { kind: 'invalid_control', text: trimmed }
@@ -283,7 +419,12 @@ const buildAgentTurnDirective = ({ afterToolResult = false } = {}) => {
     `2. Only when every requested outcome is complete and supported by tool-result evidence: emit ${AGENT_FINAL_OPEN}a concise final report${AGENT_FINAL_CLOSE}.`,
     `3. Only when progress is impossible without new user input or authority: emit ${AGENT_BLOCKED_OPEN}the exact blocker and required input${AGENT_BLOCKED_CLOSE}.`,
     'Bare prose, a plan, a progress update, hidden reasoning without visible output, or a claim such as “done” without the completion wrapper is an invalid Agent turn and will be regenerated.',
-    'Never use the completion wrapper merely because one tool call finished. If verification has not run or any requested work remains, call the next tool.'
+    'Never use the completion wrapper merely because one tool call finished. If verification has not run or any requested work remains, call the next tool.',
+    // Contrapeso a las tres lineas de arriba, que solo empujan a emitir MAS llamadas.
+    // Medido: 526 de 1.451 duplicados no tenian colision de nombre — el modelo reemitio
+    // una llamada que ya habia hecho. No es una prohibicion: releer un archivo despues
+    // de editarlo es la conducta correcta, y por eso la excepcion va en la misma linea.
+    'Do not re-issue a call whose result is already in this context; read that result instead, unless a preceding action could have changed it.'
   ].join('\n')
 }
 
@@ -291,7 +432,11 @@ const buildAgentRetryHint = (reason = 'incomplete') => {
   const reasonText = {
     empty: 'The previous attempt ended without a visible answer or executable tool call.',
     bare: 'The previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.',
-    invalid_control: 'The previous attempt used a malformed or mixed Agent completion wrapper.',
+    // El desanclaje de unwrapSinglePairWithSurroundings dejó a invalid_control significando
+    // una sola cosa: tags desbalanceados, duplicados o de las dos familias a la vez. El hint
+    // tiene que nombrar ESA restricción — el texto anterior ("malformed or mixed wrapper") no
+    // le decía al modelo qué arreglar, y por eso los 3 intentos fallaban idénticos.
+    invalid_control: `The previous attempt left the completion wrapper unbalanced, or emitted more than one. Use exactly one ${AGENT_FINAL_OPEN}...${AGENT_FINAL_CLOSE} pair (or exactly one ${AGENT_BLOCKED_OPEN}...${AGENT_BLOCKED_CLOSE}), never both and never two of either — both tags of the pair must be present.`,
     invalid_tool_call: 'The previous attempt contained an invalid, truncated, or unknown tool call.',
     required_tool: 'The previous attempt violated tool_choice and did not call the required tool.',
     intercepted: `Your tool call did not reach the client. Re-emit it now using EXACTLY the \`${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE}\` format as the first content of your answer — never any other format.`,
@@ -320,27 +465,694 @@ const canonicalJson = (value) => {
   return JSON.stringify(value);
 };
 
+// `[THINKING]` / `[END THINKING]` es la tercera familia de delimitadores que el proxy
+// escribe en el prompt (controllers/anthropic.js). Vive AQUI, en la regla compartida, y
+// no en el sitio que lo emite, porque el texto no confiable entra al prompt por cuatro
+// puertas — el cuerpo del propio `thinking`, el texto hermano del mismo mensaje, el
+// cuerpo de un `tool_result` y el digest del ledger — y las cuatro tienen que fallar
+// igual. Con la neutralizacion solo en el emisor, un fichero leido que contuviera
+// `[END THINKING]` volvia crudo a la historia y cerraba un bloque que no era suyo.
+//
+// Se aceptan las variantes que un modelo escribiria de verdad (`[/THINKING]`,
+// `[END_THINKING]`, `[END\nTHINKING]`, `[THINKING: por que]`), pero se exige `]` o `:`
+// tras la palabra: sin ese ancla, prosa legitima como `[thinking about lunch]` quedaria
+// mutilada, y mutilar prosa por un delimitador que nadie estaba forjando es peor negocio.
+const THINKING_MARKER_RE = /\[(?=[ \t]{0,4}(?:END[ \t\r\n_-]{1,2}|\/[ \t]{0,4})?THINKING[ \t]*[\]:])/gi;
+
+/**
+ * Rompe el corchete de cualquier delimitador de razonamiento incrustado en el texto.
+ * Un caracter ASCII por otro: nunca alarga, asi que los topes de bytes siguen exactos.
+ * @param {string} value - texto no confiable
+ * @returns {string} texto con los delimitadores de thinking inertes
+ */
+const defuseThinkingMarkers = (value) => String(value).replace(THINKING_MARKER_RE, '(');
+
+// Bloque de razonamiento retenido que controllers/anthropic.js cuelga DELANTE del texto de
+// un mensaje assistant: `[THINKING]\n…\n[END THINKING]\n<texto defusado>`. Quitarlo y
+// defusar lo que queda da la forma CANONICA del mensaje, la misma tenga o no razonamiento
+// colgado. La usa la reutilizacion del prefijo de historial (utils/request.js) para el
+// hash de las lineas ya subidas: el bloque entra y sale del presupuesto de un turno a
+// otro, y con el hash sobre el texto literal cada turno con thinking re-horneaba (26/26
+// turnos medidos el 2026-09-11). El delimitador interior ya viene defusado por
+// renderThinkingParts, asi que el primer `[END THINKING]` de verdad cierra el bloque.
+const RETAINED_THINKING_RE = /^\[THINKING\]\n[\s\S]*?\n\[END THINKING\](?:\n|$)/;
+const stripRetainedThinking = (value) => defuseThinkingMarkers(String(value).replace(RETAINED_THINKING_RE, ''));
+
+/**
+ * Un corte por unidades UTF-16 (`slice`) puede partir un par subrogado por la mitad.
+ * `JSON.stringify` escapa la mitad huerfana sin quejarse, asi que no revienta aqui:
+ * revienta arriba, como U+FFFD o como error de parseo segun quien lo lea. Se tira la
+ * mitad suelta de cada punta. Solo acorta, asi que ningun tope se rompe.
+ * @param {string} value - texto ya recortado
+ * @returns {string} texto sin subrogados sueltos en los extremos
+ */
+const trimLoneSurrogates = (value) => {
+  let out = String(value);
+  const first = out.charCodeAt(0);
+  if (first >= 0xDC00 && first <= 0xDFFF) out = out.slice(1);
+  const last = out.charCodeAt(out.length - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) out = out.slice(0, -1);
+  return out;
+};
+
+/**
+ * 结果正文必须对它自己封闭。工具结果是**不可信内容** —— 文件、网页、命令输出 —— 里面
+ * 完全可能出现 `[END TOOL RESULT]`。原样写出去，块就在那里提前结束，后面的内容就变成了
+ * 对模型说的话。把正文里的标记打断，让它再也关不掉这个块。
+ *
+ * 住在这里（依赖图的叶子）而不是 tool-prompt.js：折叠回写（foldToolMessages）和
+ * 执行过的调用清单（buildToolHistoryLedger）都要把同一批不可信文本重新塞回提示词，
+ * 两边必须用**同一份**失效规则。tool-prompt.js 以同名导入它。
+ * @param {string} value - 原始结果正文
+ * @returns {string} 标记已失效的正文
+ */
+const neutraliseResultMarkers = (value) => String(value)
+  .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
+  // 只打断头字符，不重写整段。结果头现在可能带序号（`[TOOL RESULT #3: X]`），旧写法
+  // 要求 RESULT 后面**紧跟冒号**，认不出编号形式 —— 于是不可信正文可以伪造一个编号头，
+  // 冒充某次真实调用的答复。这里不再要求冒号：`[` 后面是 TOOL RESULT 就失效。
+  .replace(/\[(?=[ \t]*TOOL[ \t]+RESULT\b)/gi, '(')
+  // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
+  // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
+  // 触发器正则（tool-prompt.js 的 TOOL_CALL_TRIGGER_RE，与这里锁步）就永远匹配不上。
+  .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
+  .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
+  // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
+  // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
+  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(')
+  // Las dos cabeceras del sobre (utils/request.js#parseAgentEnvelope) tambien son
+  // marcadores de protocolo, y desde que el ledger vive en el PREFIJO hay texto derivado
+  // de herramientas por DELANTE de la cabecera real. parseAgentEnvelope parte por
+  // `indexOf` en la historia (gana la PRIMERA) y por `lastIndexOf` en el mensaje actual
+  // (gana la ULTIMA), asi que un resultado que contenga la cadena literal mueve el corte:
+  // la cola del prefijo se reclasifica como historia y sus lineas se parsean como JSONL
+  // legitimo. Se rompe el `#` de cabecera, igual que arriba se rompe el `[` o el `<`.
+  // Un solo caracter ASCII por otro: la neutralizacion nunca alarga, asi que los topes
+  // de bytes del ledger se mantienen exactos.
+  .replace(/#(?=[ \t]{0,4}Conversation[ \t]+history[ \t]*\(JSONL\))/gi, '(')
+  .replace(/#(?=[ \t]{0,4}Current[ \t]+message\b)/gi, '(');
+
+/**
+ * Un cuerpo del que NADA es nuestro: un fichero, una pagina, la salida de un comando.
+ *
+ * Es `neutraliseResultMarkers` mas el brazo THINKING, y existe separado por una razon
+ * concreta: `neutraliseResultMarkers` tambien se aplica al contenido de un mensaje
+ * `assistant` (tool-prompt.js, la rama con tool_calls y `neutraliseMessageMarkers`), y
+ * ese contenido SI lleva delimitadores nuestros — el bloque `[THINKING]` que escribe
+ * controllers/anthropic.js. Meter el brazo en la regla general defusaba el delimitador
+ * REAL junto con los forjados y dejaba el razonamiento sin marcar.
+ *
+ * Regla: si el texto lo escribio integramente algo de fuera, pasa por aqui.
+ * @param {string} value - cuerpo no confiable
+ * @returns {string} cuerpo con todos los marcadores de protocolo inertes
+ */
+const neutraliseUntrustedBody = (value) => defuseThinkingMarkers(neutraliseResultMarkers(value));
+
+const LEDGER_HEADER = '# Already executed this task';
+// La leyenda es lo unico que hace el bloque legible por si solo: llega al modelo lejos
+// del prompt de herramientas y sin ella es una lista de numeros sin contrato.
+const LEDGER_CAPTION = 'These calls already ran and their results are above. Reuse a result instead of repeating its call, unless a later action could have changed it.';
+// Sin esta nota, una lista recortada se lee como exhaustiva: "no esta en el ledger" pasaria
+// a significar "no se llamo nunca", que es justo la conclusion falsa que dispara el duplicado.
+const LEDGER_TRUNCATED_NOTE = '(older calls omitted)';
+const LEDGER_DIGEST_CHARS = 120;
+// Los argumentos IDENTIFICAN la llamada, asi que se recortan mucho mas tarde que el digest.
+// Un heredoc de 10 KB en un Bash igual no puede comerse el bloque entero; cuando se recorta,
+// el ordinal sigue distinguiendo dos llamadas que quedaron renderizadas igual.
+const LEDGER_ARGS_CHARS = 200;
+
+/** Una linea, sin saltos: el ledger es una entrada por linea y el contenido no es confiable. */
+const collapseToOneLine = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+
+const truncateChars = (value, limit) =>
+  value.length <= limit ? value : `${trimLoneSurrogates(value.slice(0, limit - 1))}…`;
+
+/**
+ * El contenido de un mensaje de resultado, resumido para el digest del ledger.
+ *
+ * Existe porque el resultado de una herramienta **no siempre es texto**: el Read de
+ * Claude Code devuelve la imagen dentro de `tool_result.content`, y cada ruta la mueve a
+ * un sitio distinto antes de llegar aqui — la Anthropic la saca a `message.media` y deja
+ * `content: ''`; la OpenAI la deja como item dentro del array de `content`. Con
+ * `JSON.stringify(content)` como unica regla las dos rutas rendian textos DISTINTOS para
+ * la misma llamada (`(empty)` contra `[]`) y las dos mentian: decirle al modelo que un
+ * Read no devolvio nada, bajo una leyenda que le pide reusar el resultado en vez de
+ * repetir la llamada, es el empujon mas fuerte posible hacia el duplicado — y Read es la
+ * herramienta mas repetida de la medicion (802 de 1.451).
+ *
+ * Los items que no son texto se CUENTAN, nunca se serializan: un item de imagen lleva el
+ * data URI base64 completo y `JSON.stringify` lo metia crudo en el prompt (recortado a
+ * 120 caracteres, o sea base64 partido a la mitad haciendose pasar por el resultado).
+ *
+ * @param {Object} message - mensaje con role tool/function, en cualquiera de las dos formas
+ * @returns {{ text: string, attachments: number }}
+ */
+const summariseToolResultContent = (message) => {
+  const raw = message?.content;
+  // Lo que ESTE servidor escribio en el cuerpo, apuntado fuera del contenido por quien lo
+  // escribio (writeToolResultMediaNote). Es la unica fuente del contador: antes se sacaba
+  // de una regex sobre el cuerpo, que es salida de herramienta —— una pagina web o un
+  // fichero que contuviera la frase inflaba el contador a voluntad y ademas perdia esa
+  // linea del digest. Ahora un cuerpo no confiable que la imite se queda tal cual, visible
+  // y sin contar.
+  const written = message?.[MEDIA_NOTE_KEY];
+  // El bypass de medios de la ruta Anthropic (anthropic.js#flattenAnthropicMessages).
+  let attachments = written ? written.count : (Array.isArray(message?.media) ? message.media.length : 0);
+  // Sin nota nuestra no hay forma de saberlo: la ruta OpenAI arma el ledger ANTES de la
+  // cosecha, con el medio todavia como item del array, y ahi siempre viaja.
+  const delivered = written ? written.delivered !== false : true;
+  let text = '';
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (Array.isArray(raw)) {
+    const texts = [];
+    for (const item of raw) {
+      if (typeof item === 'string') texts.push(item);
+      else if (item?.type === 'text' && typeof item.text === 'string') texts.push(item.text);
+      else if (item !== null && item !== undefined) attachments += 1;
+    }
+    text = texts.join('\n');
+  } else if (raw !== null && raw !== undefined) {
+    // Un objeto de verdad (resultado estructurado) sigue siendo su JSON.
+    text = JSON.stringify(raw);
+  }
+  // La nota de medios se convierte en el contador, no en prosa del digest —— pero SOLO la
+  // que escribimos nosotros, y por igualdad EXACTA de linea. Cualquier otra cosa que el
+  // cuerpo diga es contenido y se queda donde esta.
+  if (text && written?.line) {
+    // Solo la ULTIMA aparicion: writeToolResultMediaNote la anade al final, y si el cuerpo
+    // ya traia una linea identica esa es contenido de la herramienta y se queda.
+    const lines = text.split('\n');
+    const at = lines.lastIndexOf(written.line);
+    if (at !== -1) {
+      lines.splice(at, 1);
+      text = lines.join('\n');
+    }
+  }
+  return { text, attachments, delivered };
+};
+
+/**
+ * `(1 image)` / `(3 images)`: el digest DICE que hubo adjunto, sin poder cargarlo.
+ * `(1 image, not included)` cuando el medio pertenece a un turno anterior y por tanto NO
+ * viaja en esta peticion: el cuerpo del resultado y el digest tienen que decir lo mismo,
+ * o el modelo cree la mitad optimista de las dos.
+ */
+const attachmentNote = (count, delivered = true) => {
+  const noun = count === 1 ? '1 image' : `${count} images`;
+  return delivered ? `(${noun})` : `(${noun}, not included)`;
+};
+
+/**
+ * Lo que el CUERPO del resultado dice cuando la herramienta devolvio medios.
+ *
+ * Medido 2026-09-08 contra Qwen real: un tool_result que solo trae un bloque image (lo
+ * EXACTO que manda Claude Code al hacer Read de una imagen) dejaba `resultContent` vacio,
+ * y foldToolMessages lo renderizaba como `(empty)`. La imagen SI llegaba a files[] —el
+ * cuerpo upstream era identico byte a byte al de un control que funciona, salvo ese texto—
+ * asi que el modelo leia «el Read no devolvio nada» con una imagen sin explicar al lado, y
+ * contestaba NO_IMAGE. El prompt ademas se contradecia: el ledger de agent-turn ya decia
+ * `-> (1 image)` para esa misma llamada.
+ *
+ * CORRECCION 2026-09-08: la version anterior de este comentario justificaba no decir
+ * «adjunta» diciendo que la deduplicacion por URL o HARVEST_MEDIA_CAP podian descartar el
+ * medio. Las dos razones son falsas: nadie recorta el array cosechado (chat-helpers.js:828
+ * y anthropic.js:667 adjuntan todo lo cosechado; el tope solo corta el RECORRIDO), y un
+ * acierto de deduplicacion significa que esa MISMA URL ya esta en el ultimo mensaje. La
+ * unica razon real y suficiente es la otra: los medios de turnos ANTERIORES no se suben, a
+ * proposito (los dos escaneos gemelos paran en la ultima respuesta final del asistente).
+ *
+ * Por eso la nota tiene dos formas, y la que se elige depende de la POSICION:
+ *   - turno en curso  -> `[1 image returned by this tool]`
+ *   - turno anterior  -> `[1 image returned by this tool, not included in this request]`
+ * Medido contra Qwen real (2026-09-08, dos ejecuciones por celda): con la forma positiva
+ * en un resultado de turno ANTERIOR —donde files[] va vacio— el modelo se inventaba un
+ * color 2/2, mientras que el `(empty)` que la nota sustituyo acertaba NO_IMAGE 2/2. Una
+ * nota positiva incondicional cambia «te miento diciendo que no devolvio nada» por «te
+ * miento diciendo que puedes verla», y esa forma es ~94x mas frecuente en el corpus real
+ * (37 tool_results con imagen contra 3.482 turnos que vienen despues de uno).
+ *
+ * @param {number} count - cuantos medios traia el resultado
+ * @param {string} [noun] - 'image' salvo que el resultado traiga algo que no sea imagen
+ * @param {Object} [options]
+ * @param {boolean} [options.delivered=true] - si el medio viaja en ESTA peticion
+ * @returns {string} la linea que sustituye/acompana al cuerpo del resultado
+ */
+const toolResultMediaNote = (count, noun = 'image', { delivered = true } = {}) =>
+  `[${count} ${noun}${count === 1 ? '' : 's'} returned by this tool` +
+  `${delivered ? '' : ', not included in this request'}]`;
+
+/** Donde se apunta la nota que escribimos, fuera del contenido. No enumerable: nunca
+ *  aparece en Object.keys ni en JSON.stringify, asi que no puede viajar upstream. */
+const MEDIA_NOTE_KEY = '__qwen2apiToolResultMediaNote';
+
+/**
+ * Escribe la nota en el cuerpo del resultado y la deja apuntada fuera de el.
+ *
+ * Los DOS caminos pasan por aqui (controllers/anthropic.js#flattenAnthropicMessages y
+ * utils/chat-helpers.js#harvestCurrentTurnMedia). Antes cada uno componia la linea por su
+ * cuenta y el «escriben la MISMA nota» vivia solo en un comentario; ahora la igualdad es
+ * estructural. El apunte fuera del contenido es lo que permite al ledger distinguir su
+ * propia nota de una frase identica escrita por la herramienta.
+ *
+ * @param {Object} message - mensaje role=tool/function, **se modifica**
+ * @param {string} existingText - lo que ya decia el cuerpo (puede ser '')
+ * @param {number} count - cuantos medios traia el resultado
+ * @param {string} [noun] - 'image', o 'attachment' si no todo era imagen
+ * @param {boolean} [delivered] - si el medio viaja en ESTA peticion
+ * @returns {string} la linea escrita
+ */
+const writeToolResultMediaNote = (message, existingText, count, noun = 'image', delivered = true) => {
+  const line = toolResultMediaNote(count, noun, { delivered });
+  message.content = existingText ? `${existingText}\n${line}` : line;
+  Object.defineProperty(message, MEDIA_NOTE_KEY, {
+    value: { line, count, delivered }, enumerable: false, configurable: true, writable: true
+  });
+  return line;
+};
+
+/**
+ * Las llamadas ya ejecutadas que viven en la historia, como bloque de texto.
+ *
+ * Por que existe: medido sobre 192 sesiones reales de Claude Code (15.337 bloques
+ * tool_use), 1.451 llamadas eran duplicados entre turnos, y en 526 (36,3%) no habia
+ * ninguna otra llamada a la misma herramienta entre la original y la copia — no era
+ * confusion de correlacion (eso lo arregla la numeracion de foldToolMessages), era que
+ * nada en el prompt desalentaba repetir. Nada en el servidor sabia del pasado tampoco:
+ * los tres createToolCallLedger() son por-intento.
+ *
+ * Esto NO suprime: la decision sigue siendo del modelo, porque repetir es a veces
+ * correcto (releer un archivo despues de editarlo). Solo hace visible lo que ya corrio.
+ *
+ * La numeracion es la MISMA que escribe foldToolMessages (tool-prompt.js): ordinal
+ * monotono por request, en orden de llamada, contando cada tool_call de cada mensaje
+ * assistant. Si las dos se desincronizan, el ledger dice `#3` y la historia llama `#3`
+ * a otra llamada — peor que no numerar. tests/tool-repetition.test.js las clava juntas.
+ *
+ * @param {Array<Object>} messages - mensajes en forma OpenAI, ANTES de foldToolMessages
+ *   (con assistant.tool_calls y role=tool estructurados, no ya convertidos a texto)
+ * @param {Object} [options]
+ * @param {number} [options.maxEntries=40] - tope de entradas, las mas recientes primero
+ * @param {number} [options.maxBytes=6000] - tope duro del bloque completo, y el knob que
+ *   REALMENTE gobierna: una entrada ASCII realista (Read con ruta absoluta + digest lleno)
+ *   pesa ~223 B y una pesada ~333 B, asi que los bytes muerden antes que maxEntries en
+ *   todos los recortes reales — el ledger nunca llega a sus 40 entradas anunciadas.
+ *
+ *   ESTE NUMERO BAJO DE 12.000 A 6.000. Lo que lo habia subido era una curva de ALCANCE.
+ *   Alcance = con la llamada a punto de repetirse, el ledger construido con la historia
+ *   previa todavia nombra la instancia anterior. Sobre 199 sesiones reales de Claude Code
+ *   con duplicados (18.008 llamadas, 1.970 reemisiones):
+ *
+ *     6.000 B  81,0% de alcance   5.315 B/request de media
+ *     9.000 B  88,7%              7.612 B      (+7,8 pp por +2.297 B = 67 casos/KB)
+ *    12.000 B  91,4%              9.276 B      (+2,6 pp por +1.664 B = 31 casos/KB)
+ *    16.000 B  95,3%             11.836 B      (+3,9 pp por +2.560 B = 30 casos/KB)
+ *    24.000 B  96,5%             14.761 B      (+1,3 pp por +2.925 B =  9 casos/KB)
+ *    sin tope 100,0%             30.091 B      (+1,9 pp por +12.549 B = 3 casos/KB)
+ *
+ *   La tabla sigue siendo cierta y por eso se conserva. Lo que no era cierto es lo que se
+ *   dedujo de ella: el alcance es condicion NECESARIA para que el bloque funcione, no
+ *   evidencia de que funcione. El EFECTO del bloque no se ha medido nunca — no existe un
+ *   brazo con el bloque apagado.
+ *
+ *   Lo que si esta medido es su CLASE de intervencion: poner delante del modelo "esto ya
+ *   lo corriste, reusa el resultado". El corpus trae ese experimento natural. Un hook de
+ *   cliente sustituye el tool_result por «Wasted call — file unchanged since your last
+ *   Read. Refer to that earlier tool_result instead.»: 364 disparos en 79 sesiones. Es una
+ *   version ESTRICTAMENTE MAS FUERTE que este bloque — va dentro del resultado que el
+ *   modelo acaba de pedir, nombra la ofensa concreta, pesa 95 B y es imposible de no leer,
+ *   mientras el ledger es una nota generica muy arriba en el contexto, lejos del punto en
+ *   que el modelo decide. Condicionado
+ *   a la poblacion en la que dispara (Reads que YA son reemisiones), medir si el modelo
+ *   vuelve a repetir da:
+ *
+ *     train    con hook 162/253 = 64,0%   sin hook 185/313 = 59,1%   RR 1,08  IC [0,90, 1,42]
+ *     holdout  con hook  34/79  = 43,0%   sin hook  36/80  = 45,0%   RR 0,96  IC [0,59, 1,86]
+ *
+ *   Signo por sesion: 26 arriba, 12 iguales, 22 abajo — cara o cruz. Una clave llego a
+ *   llevar 32 avisos y el bucle sobrevivio a los 32. El limite superior del IC de train
+ *   (1,42) descarta cualquier beneficio grande. Una version mas debil y mas lejos del
+ *   punto de decision no puede hacer mas que esa.
+ *
+ *   Y el coste si es cierto. En una peticion externalizada el bloque se lleva hasta un
+ *   cuarto del pool inline (LEDGER_POOL_SHARE, utils/request.js): medido sobre la rejilla
+ *   de 48 sobres, ~2,9 renglones de historia reciente (12,0 -> 9,1 de media) a ~2,5 KB de
+ *   resultado crudo por renglon = ~7 KB de resultados de herramienta DE VERDAD desalojados
+ *   para nombrar llamadas a ~333 B. Ahi es donde ocurre el 76% de las reemisiones.
+ *
+ *   6.000 y no 0: hay evidencia de que el beneficio no esta medido y de que su analogo mas
+ *   cercano sale nulo, pero NO hay evidencia de que el bloque haga dano. 6.000 parte por la
+ *   mitad un coste cierto contra un beneficio incierto y conserva el artefacto para poder
+ *   someterlo a un A/B de verdad (aleatorizado POR SESION, no por request). Subirlo otra
+ *   vez pide un efecto medido que sobreviva a un holdout, no una curva de alcance: cuatro
+ *   workflows y ~120 agentes ya mataron tres hipotesis causales por confundir las dos cosas.
+ *
+ *   El coste contra el umbral de externalizacion de 90 KiB resulto ser el argumento debil:
+ *   medido sobre 25.576 fronteras de request reales, el 71,2% YA estaba por encima del
+ *   umbral con el ledger de 6.000 (la conversacion mediana pesa 169 KB). Cruzar el umbral
+ *   nunca fue el problema; el desalojo inline si.
+ *
+ *   Las cifras de arriba son de ALCANCE DEL BLOQUE: lo que el ledger contiene. No es lo
+ *   mismo que lo que el modelo lee. En una peticion externalizada el bloque pasa todavia
+ *   por el presupuesto inline de buildBudgetedAgentPrompt (utils/request.js), y ahi vivia
+ *   el fallo que costo la primera version de este cambio: el ledger viajaba al final de
+ *   `envelope.prefix`, que se recorta por cabeza y cola, asi que la rebanada de cola
+ *   conservaba las entradas VIEJAS y el hueco compactado se comia las NUEVAS. Con 6.000 B
+ *   el bloque cabia entero en esa cola por casualidad aritmetica; a 12.000 ya no.
+ *
+ *   Hoy el ledger es su propia seccion alli, con presupuesto reservado antes del reparto
+ *   por pesos y recorte propio (truncateToolHistoryLedger). Esa reparacion es correcta por
+ *   su cuenta y SE QUEDA: hizo que sobrevivieran las entradas MAS NUEVAS en vez de las mas
+ *   viejas, que es lo unico que el bloque no puede permitirse perder. Medido sobre una
+ *   rejilla de 48 sobres externalizados (94-384 KB crudos, 8-60 herramientas, 30-120
+ *   llamadas, system prompt de 3 a 50 KB): con el ledger dentro del prefijo sobrevivian
+ *   23-24 entradas de 30-37 y en 44 de las 48 formas la MAS NUEVA no llegaba; con la
+ *   seccion propia llegan las 48 de 48 completas. Volver a 6.000 no deshace nada de eso:
+ *   el bloque simplemente cabe con mas holgura, y ahora esta medida: con el presupuesto
+ *   inline de produccion (48 KiB) y un sobre externalizado de forma Claude Code, la
+ *   seccion del ledger tope en ~12,8 KB. A 6.000 el bloque ocupa 5.882 B —menos de la
+ *   mitad de ese techo— y llega INTACTO; a 12.000 ocupa 11.886 B y lo roza; a 24.000 ya
+ *   no cabe y se recorta. Subir el tope acerca el recorte, no lo aleja.
+ *
+ *   Con un efecto lateral que hay que decir: bajar a 6.000 CEGO al brazo del default. Con
+ *   el ledger devuelto al interior del prefijo (la regresion que la seccion propia
+ *   arregla), a 6.000 el bloque sigue llegando entero —cabe en la rebanada de cola— y
+ *   ninguna asercion se entera; a 12.000 llegan 23 de 37 entradas, se pierden las 14 MAS
+ *   NUEVAS y desaparece hasta la cabecera. Y la ceguera del brazo bajo no es casualidad de
+ *   un fixture: la rebanada de cola del prefijo mide ~7,1-7,8 KB al presupuesto de
+ *   produccion, asi que CUALQUIER bloque acotado a 6.000 B cabe entero en ella. Por eso el
+ *   test de supervivencia inline corre los DOS topes y el brazo de 12.000 se queda aunque
+ *   ya no sea el default. No es el unico testigo: el test de degradado (24.000) y el
+ *   diferencial enterrado/seccion tambien ven el mecanismo al presupuesto de produccion.
+ *   Los tres estan en tests/tool-repetition.test.js y ninguno se puede borrar por «ya no
+ *   es el default».
+ *
+ *   La cifra es por BYTES, no por caracteres: con nombres, rutas y resultados en CJK la
+ *   misma entrada pesa ~460 B y entran la mitad. Degrada sin mentir — la nota de omision
+ *   se dispara igual. Se conservan las MAS RECIENTES, que son las que el modelo esta a
+ *   punto de repetir, y esa propiedad ahora sobrevive al presupuesto inline en vez de
+ *   invertirse en el. El floor lo clava tests/tool-repetition.test.js; el tope superior,
+ *   el test de al lado; y el precio que se paga de verdad —los bytes que salen ensamblados
+ *   hacia upstream en las DOS rutas— el test de wiring que los cuenta ahi y no en la
+ *   constante. Los tres hacen falta: solo el tope deja bajar el numero a 1.000.
+ * @returns {string} el bloque, o '' si no hay historia de herramientas
+ */
+const buildToolHistoryLedger = (messages, { maxEntries = 40, maxBytes = 6000 } = {}) => {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  const limit = Number.isFinite(maxEntries) ? Math.max(0, Math.trunc(maxEntries)) : 40;
+  if (limit === 0) return '';
+  // Sin este guard un maxBytes basura (NaN) hace que toda comparacion sea false y el
+  // bloque salga SIN tope — justo lo que no puede pasar en algo que se inyecta siempre.
+  const byteCap = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 6000;
+
+  const byKey = new Map();   // name + canonicalJson(args) -> entrada
+  // id de la llamada -> { clave, ordinal DE ESA llamada }. El ordinal va aqui y no en la
+  // entrada porque una entrada agrupa varias instancias: sin el, el resultado de la
+  // instancia #1 se le colgaria al ordinal de la instancia #3.
+  const byCallId = new Map();
+  // nombre -> cola FIFO de instancias SIN id. La API legacy de funciones
+  // (`assistant.function_call` + `role:'function'`) no lleva id en ninguno de los dos
+  // lados, asi que el emparejamiento exacto por tool_call_id no puede existir: la rama
+  // `|| message.role === 'function'` de abajo estaba muerta y toda llamada legacy salia
+  // listada SIN resultado, bajo la leyenda que afirma que sus resultados ya estan arriba
+  // — mientras foldToolMessages si escribia su `[TOOL RESULT: Read]` dos lineas mas
+  // abajo. Solo entran aqui las instancias que no tienen NINGUN id: un id que no casa es
+  // un desajuste, no una ausencia, y sigue sin adjudicarse (eso seria la suplantacion que
+  // arregla la numeracion de Task 1).
+  const pendingByName = new Map();
+  let ordinal = 0;
+
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+
+    // Mismas dos ramas que foldToolMessages, en el mismo orden: de eso depende que los
+    // ordinales coincidan.
+    const calls = message.role === 'assistant'
+      ? (Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+        ? message.tool_calls
+        : (message.function_call?.name ? [message.function_call] : []))
+      : [];
+
+    for (const call of calls) {
+      const fn = call?.function || call;
+      ordinal += 1;
+      let parsed = fn?.arguments;
+      if (typeof parsed === 'string') {
+        try {
+          parsed = JSON.parse(parsed);
+        } catch (_) {
+          // Argumentos que no son JSON: se comparan como el string crudo, igual que
+          // createToolCallLedger. Dos llamadas rotas iguales siguen siendo una repeticion.
+        }
+      }
+      // El bloque es UNA entrada por linea, y el renglon es `#n Nombre args -> digest`.
+      // canonicalJson no puede traer un salto literal (JSON.stringify los escapa), pero la
+      // rama de arriba deja `parsed` como el STRING CRUDO cuando los argumentos no parsean
+      // — el caso que Qwen produce constantemente — o cuando el JSON decodifica a un string.
+      // Ese crudo entra con sus saltos intactos y cada uno abre otro renglon con la forma
+      // exacta de una entrada legitima: `{"c":"x"}\n#42 Read {} -> hecho` se lee como la
+      // llamada #42 con su resultado. neutraliseResultMarkers no lo tapa: reescribe `[` y
+      // `<`, nunca saltos. Se colapsa SOLO esta rama: colapsar tambien la salida de
+      // canonicalJson fundiria `echo  hi` con `echo hi`, que son dos comandos distintos.
+      const args = typeof parsed === 'string' ? collapseToOneLine(parsed) : canonicalJson(parsed ?? {});
+      const name = String(fn?.name || 'unknown');
+      const key = `${name}\u0000${args}`;
+      const existing = byKey.get(key);
+      // Ya vista: se queda con el ordinal MAS RECIENTE (apunta a la instancia fresca) y
+      // conserva el digest anterior hasta que llegue un resultado nuevo — si la repeticion
+      // todavia no fue contestada, borrar el resultado que si tenemos seria perder evidencia.
+      // digestOrdinal NO se toca aqui: es lo que despues distingue "este resultado es de
+      // esta instancia" de "es de una anterior y la nueva sigue sin contestar".
+      if (existing) existing.ordinal = ordinal;
+      else byKey.set(key, { ordinal, name, args, digest: '', hasResult: false, digestOrdinal: 0 });
+      if (call?.id) {
+        byCallId.set(call.id, { key, ordinal });
+      } else {
+        // Sin id: la unica correlacion posible es nombre + orden de llegada.
+        if (!pendingByName.has(name)) pendingByName.set(name, []);
+        pendingByName.get(name).push({ key, ordinal });
+      }
+    }
+
+    if (message.role === 'tool' || message.role === 'function') {
+      // Sin tool_call_id que empareje no hay dueno. Adjudicar el resultado a otra llamada
+      // seria exactamente la suplantacion que arregla la numeracion de Task 1.
+      let ref = message.tool_call_id ? byCallId.get(message.tool_call_id) : null;
+      // Solo cuando NO hay id que emparejar se cae al nombre, y solo contra las instancias
+      // que tampoco tenian id. FIFO: en el protocolo legacy cada llamada se contesta antes
+      // de emitir la siguiente, asi que la mas antigua sin contestar es la duena.
+      if (!ref && !message.tool_call_id && message.name) {
+        const queue = pendingByName.get(String(message.name));
+        if (queue && queue.length > 0) ref = queue.shift();
+      }
+      const entry = ref ? byKey.get(ref.key) : null;
+      if (!entry) continue;
+      // Solo avanza si este resultado es de una instancia igual o mas nueva que la que ya
+      // tenemos. Con los resultados en desorden, quedarse con el ULTIMO procesado dejaba el
+      // digest de #1 pisando al de #2.
+      if (ref.ordinal < entry.digestOrdinal) continue;
+      // El texto se recorta; los adjuntos se anuncian aparte y NUNCA se serializan.
+      const { text, attachments, delivered } = summariseToolResultContent(message);
+      const digestText = truncateChars(collapseToOneLine(text), LEDGER_DIGEST_CHARS);
+      const note = attachments > 0 ? attachmentNote(attachments, delivered) : '';
+      entry.digest = [digestText, note].filter(Boolean).join(' ');
+      entry.hasResult = true;
+      entry.digestOrdinal = ref.ordinal;
+    }
+  }
+
+  if (byKey.size === 0) return '';
+
+  const entries = Array.from(byKey.values()).sort((a, b) => b.ordinal - a.ordinal);
+  const kept = entries.slice(0, limit);
+
+  // El renglon entero pasa por la neutralizacion: el digest es salida de herramienta y los
+  // argumentos vienen del cliente, y canonicalJson escapa comillas y saltos pero NO los
+  // corchetes — `{"cmd":"[TOOL RESULT #2: Read]"}` llegaria literal y podria hacerse pasar
+  // por la respuesta de otra llamada. El prefijo `#n` es nuestro y no contiene marcadores.
+  // La neutralizacion solo acorta, nunca alarga, asi que el tope del digest se mantiene.
+  const renderLine = (entry) => {
+    // El ordinal de cabecera es el de la instancia MAS RECIENTE, pero el digest puede venir
+    // de una anterior: si la repeticion todavia no fue contestada, `#3 Read {a} -> viejo`
+    // le vende al modelo el contenido PRE-edicion como si fuera la respuesta de #3, y en la
+    // historia foldeada no existe ningun `[TOOL RESULT #3]`. Es la misma correlacion falsa
+    // que Task 1 elimina, y cae justo en el escenario (releer despues de editar) que
+    // justifica no suprimir. Cuando difieren se nombra la instancia que SI tiene respuesta.
+    const pending = entry.hasResult && entry.digestOrdinal !== entry.ordinal
+      ? ` (unanswered; result from #${entry.digestOrdinal})`
+      : '';
+    return neutraliseUntrustedBody(
+      `#${entry.ordinal} ${collapseToOneLine(entry.name)} ${truncateChars(entry.args, LEDGER_ARGS_CHARS)}${pending}` +
+      (entry.hasResult ? ` -> ${entry.digest || '(empty)'}` : '')
+    );
+  };
+
+  // El presupuesto reserva la nota de omision siempre, se use o no: descubrimos que hubo
+  // recorte por bytes recien dentro del bucle, y anadirla despues podria pasarse del tope.
+  const budget = byteCap - Buffer.byteLength(LEDGER_TRUNCATED_NOTE) - 1;
+  const lines = [LEDGER_HEADER, LEDGER_CAPTION];
+  let bytes = Buffer.byteLength(lines.join('\n'));
+  let truncated = kept.length < entries.length;
+
+  for (const entry of kept) {
+    const line = renderLine(entry);
+    const cost = Buffer.byteLength(line) + 1;
+    if (bytes + cost > budget) {
+      truncated = true;
+      break;
+    }
+    lines.push(line);
+    bytes += cost;
+  }
+
+  // Ni una entrada entro: una cabecera con una lista vacia solo gasta contexto y miente.
+  if (lines.length === 2) return '';
+  if (truncated) lines.push(LEDGER_TRUNCATED_NOTE);
+  return lines.join('\n');
+};
+
+/**
+ * Recorta un bloque ya construido a `maxBytes` SIN partir un renglon.
+ *
+ * Existe porque el bloque no viaja intacto hasta el modelo. En una peticion externalizada
+ * (>90 KiB) lo que queda en el cuerpo HTTP lo arma buildBudgetedAgentPrompt
+ * (utils/request.js), que reparte un presupuesto entre secciones y recorta. El recorte
+ * generico es por CABEZA Y COLA, y aplicado a este bloque —que va del mas nuevo al mas
+ * viejo— conserva las entradas VIEJAS y se come las NUEVAS: exactamente al reves de para
+ * lo que existe. Por eso el ledger es su propia seccion alli y se recorta aqui.
+ *
+ * Dos reglas, las mismas que buildToolHistoryLedger:
+ *  - por renglones enteros: medio renglon se lee como una llamada completa con OTROS
+ *    argumentos, que informa peor que no verla;
+ *  - si se cayo alguna, la nota de omision va puesta — sin ella una lista recortada se
+ *    lee como exhaustiva y "no esta en el ledger" pasa a significar "no se llamo nunca".
+ *
+ * Cuando no cabe ni una entrada devuelve '' : una cabecera con una lista vacia solo gasta
+ * contexto y miente, igual que en el constructor.
+ * @param {string} block - salida de buildToolHistoryLedger
+ * @param {number} maxBytes - tope duro del resultado
+ * @returns {string} el bloque recortado, o '' si no cabe ninguna entrada
+ */
+const truncateToolHistoryLedger = (block, maxBytes) => {
+  const text = String(block || '');
+  if (!text) return '';
+  const limit = Number.isFinite(maxBytes) ? Math.max(0, Math.trunc(maxBytes)) : 0;
+  if (Buffer.byteLength(text) <= limit) return text;
+
+  const lines = text.split('\n');
+  const isEntry = (line) => /^#\d+ /.test(line);
+  // La cabecera y la leyenda son todo lo que precede al primer renglon de entrada. La nota
+  // de omision del final no se conserva: se vuelve a poner abajo, porque ahora sobra seguro.
+  const head = [];
+  let i = 0;
+  for (; i < lines.length && !isEntry(lines[i]); i++) head.push(lines[i]);
+  const entries = lines.slice(i).filter(isEntry);
+
+  const budget = limit - Buffer.byteLength(LEDGER_TRUNCATED_NOTE) - 1;
+  let bytes = Buffer.byteLength(head.join('\n'));
+  const kept = [];
+  for (const line of entries) {
+    const cost = Buffer.byteLength(line) + 1;
+    if (bytes + cost > budget) break;
+    kept.push(line);
+    bytes += cost;
+  }
+  if (kept.length === 0) return '';
+  return [...head, ...kept, LEDGER_TRUNCATED_NOTE].join('\n');
+};
+
+/**
+ * 历史里**已经执行过**的工具调用，按调用顺序，用来给登记簿播种。
+ *
+ * 序号必须与 foldToolMessages（tool-prompt.js）写进历史的 `[TOOL CALL #n]` 逐一对应：
+ * 同一套遍历（assistant 的 tool_calls，退回单个 function_call），每个调用 +1。两边一旦
+ * 错位，日志里的 #2 就指向模型看到的另一次调用 —— 比不编号更坏。
+ * @param {Array<Object>} messages - OpenAI 形状、**折叠之前**的消息（折叠后调用只剩文本）
+ * @returns {Array<{name: string, arguments: string, ordinal: number}>}
+ */
+const extractHistoryToolCalls = (messages) => {
+  if (!Array.isArray(messages)) return [];
+  const out = [];
+  for (const message of messages) {
+    if (!message || typeof message !== 'object' || message.role !== 'assistant') continue;
+    const calls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+      ? message.tool_calls
+      : (message.function_call?.name ? [message.function_call] : []);
+    for (const call of calls) {
+      const fn = call?.function || call;
+      const raw = fn?.arguments;
+      out.push({
+        name: String(fn?.name || 'unknown'),
+        // 统一成字符串：登记簿的键对出站调用做 JSON.parse，历史必须走同一条路径才能对上。
+        arguments: typeof raw === 'string' ? raw : JSON.stringify(raw ?? {}),
+        ordinal: out.length + 1
+      });
+    }
+  }
+  return out;
+};
+
+/** 出站调用与历史种子共用的键：不同的规范化 = 播了也永远匹配不上。 */
+const toolCallLedgerKey = (name, rawArgs) => {
+  const args = rawArgs || '{}';
+  let canonical;
+  try {
+    canonical = canonicalJson(JSON.parse(args));
+  } catch (_) {
+    canonical = args;
+  }
+  return `${name || ''}\u0000${canonical}`;
+};
+
 /**
  * 本轮的工具调用登记簿：同名 + 规范 JSON 相同的第二个调用是跨通道的副本（文本解析器
  * 与原生累积器各自都能产出同一个调用），只保留先到的。文本解析器的调用是边收边发的，
  * 收不回来，所以规则只能是操作性的：丢后到的那个。
- * @returns {(call: Object) => boolean} true = 首次见到，可以发射
+ *
+ * seed = 历史里跑过的调用（extractHistoryToolCalls）。**种下的条目绝不抑制**：三个
+ * 登记簿一直都是「按 attempt」的，谁都没比对过入站 messages 里的 tool_use，所以
+ * 1.451 次跨回合重复一行日志都没留下。但压制会毁掉合法的重复 —— 编辑完再读一遍同一个
+ * 文件是**正确**行为。所以发射判定一个字节都不变，新增的只有告警：名字 + 序号，
+ * 永远不带参数负载（tests/tool-prompt.test.js:1503,1774）。
+ * @param {Object} [options]
+ * @param {Iterable<{name: string, arguments: string, ordinal?: number}>} [options.seed]
+ * @returns {((call: Object) => boolean) & { wasInHistory: (call: Object) => boolean }}
+ *   true = 本轮首次见到，可以发射
  */
-const createToolCallLedger = () => {
+const createToolCallLedger = ({ seed } = {}) => {
   const seen = new Set();
-  return (call) => {
-    const args = call?.function?.arguments || '{}';
-    let canonical;
-    try {
-      canonical = canonicalJson(JSON.parse(args));
-    } catch (_) {
-      canonical = args;
+  // key -> 历史序号。只用于报告，永远不进 seen。
+  const history = new Map();
+  if (seed && typeof seed[Symbol.iterator] === 'function') {
+    let index = 0;
+    for (const entry of seed) {
+      index += 1;
+      if (!entry) continue;
+      // 同一把调用在历史里出现多次时留**最新**的序号，与 buildToolHistoryLedger 的选择
+      // 一致：两处报出来的 #n 必须是同一个，否则日志和模型看到的清单互相矛盾。
+      history.set(
+        toolCallLedgerKey(entry.name, entry.arguments),
+        Number.isFinite(entry.ordinal) ? entry.ordinal : index
+      );
     }
-    const key = `${call?.function?.name || ''}\u0000${canonical}`;
+  }
+
+  const admit = (call) => {
+    const key = toolCallLedgerKey(call?.function?.name, call?.function?.arguments);
     if (seen.has(key)) return false;
     seen.add(key);
+    const ordinal = history.get(key);
+    if (ordinal !== undefined) {
+      logger.warn(
+        `Agent 工具调用在历史里已经执行过（${call?.function?.name || 'unknown'}，历史 #${ordinal}）；按设计不抑制，仅记录`,
+        'AGENT'
+      );
+    }
     return true;
   };
+  admit.wasInHistory = (call) =>
+    history.has(toolCallLedgerKey(call?.function?.name, call?.function?.arguments));
+  return admit;
 };
 
 /**
@@ -479,6 +1291,38 @@ module.exports = {
   buildAgentRetryHint,
   // Guarda de fuga del canal de texto — compartida por anthropic.js y openai-agent-runtime.js.
   canonicalJson,
+  // Neutralizacion de marcadores: fuente unica para foldToolMessages (tool-prompt.js) y
+  // para el ledger de aqui. Todo texto no confiable que vuelve al prompt pasa por ella.
+  neutraliseResultMarkers,
+  // El brazo THINKING de la regla de arriba, suelto: el emisor del delimitador
+  // (controllers/anthropic.js) tiene que poder defusar el texto HERMANO del mismo
+  // mensaje sin pasarlo por el resto de la neutralizacion, que es para otro canal.
+  defuseThinkingMarkers,
+  // Forma canonica de un texto de assistant con razonamiento retenido delante: para el
+  // hash del prefijo de historial (utils/request.js) el bloque no cuenta.
+  stripRetainedThinking,
+  neutraliseUntrustedBody,
+  // Cortar por unidades UTF-16 parte pares subrogados. Exportado porque el tope de
+  // razonamiento de anthropic.js corta igual que el digest del ledger de aqui.
+  trimLoneSurrogates,
+  buildToolHistoryLedger,
+  // El bloque no llega intacto al modelo: en una peticion externalizada lo reparte
+  // buildBudgetedAgentPrompt (utils/request.js). Se exportan las DOS primeras lineas
+  // —con las que alli se separa el bloque del resto del prefijo— y su recorte propio,
+  // que conserva las entradas MAS NUEVAS donde el recorte generico por cabeza y cola se
+  // las comia. Hacen falta las dos: la cabecera sola es una frase corriente, y un system
+  // prompt que la tuviera a principio de linea se llevaba el corte del ledger — medido,
+  // borraba 11,8 KB de reglas del cliente del prompt inline. La leyenda es fija y larga.
+  LEDGER_HEADER,
+  LEDGER_CAPTION,
+  truncateToolHistoryLedger,
+  // El cuerpo del resultado cuando la herramienta devolvio medios. Lo usan los DOS
+  // caminos (controllers/anthropic.js#flattenAnthropicMessages y
+  // utils/chat-helpers.js#harvestCurrentTurnMedia) para no divergir en el texto.
+  toolResultMediaNote,
+  writeToolResultMediaNote,
+  MEDIA_NOTE_KEY,
+  extractHistoryToolCalls,
   createToolCallLedger,
   isRejectedTextCallWarning,
   resolveTextToolCallCap,

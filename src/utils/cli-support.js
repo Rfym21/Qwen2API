@@ -29,7 +29,14 @@ function getAccountCliState(account, rotatorRecord = {}, now = Date.now()) {
   const WARN_WINDOW_MS = 15 * 60 * 1000
   const TOKEN_EXPIRING_MS = 6 * 60 * 60 * 1000
 
-  const cooldownEndsAt = rotatorRecord.cooldownEndsAt || null
+  // Un solo campo para el frontend, pero dos fuentes: el contador de fallos y el destierro
+  // por cuota agotada (account-rotator#recordQuotaExhausted). Gana el que libere mas tarde
+  // —es el que de verdad manda cuando la cuenta vuelve al sorteo—. Sin fundirlos, una
+  // cuenta desterrada por cuota se pintaba `active` mientras la rotacion la ignoraba.
+  const cooldownEndsAt = Math.max(
+    Number(rotatorRecord.cooldownEndsAt) || 0,
+    Number(rotatorRecord.quotaCooldownEndsAt) || 0
+  ) || null
   const lastErrorAt = rotatorRecord.lastErrorAt || null
   const lastErrorCode = rotatorRecord.lastErrorCode || null
   const cliUnavailableReason = account.cli_unavailable_reason || null

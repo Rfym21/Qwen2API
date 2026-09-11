@@ -84,6 +84,47 @@ const config = {
         8 * 1024,
         parseInt(process.env.AGENT_CONTEXT_LIVE_PROMPT_BYTES, 10) || 48 * 1024
     ),
+    // Presupuesto del fallback cuando el adjunto falla y la peticion NO lleva tools
+    // (con tools no se compacta: se responde 529/503 reintentable). Mas holgado que el
+    // live prompt porque aqui no hay adjunto que complete el resto.
+    agentContextFallbackPromptBytes: Math.max(
+        8 * 1024,
+        parseInt(process.env.AGENT_CONTEXT_FALLBACK_PROMPT_BYTES, 10) || 84 * 1024
+    ),
+    // Cortacircuitos del parse de adjuntos (src/utils/upload.js): tras 3 desafios WAF
+    // seguidos no se sube nada durante estos segundos y el 529 lleva ese Retry-After.
+    // 0 lo desactiva.
+    agentParseBreakerSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 300
+    })(),
+    // Limitador de ritmo del parse (src/utils/upload.js): como maximo MAX upload+parse por
+    // ventana de WINDOW segundos por proceso; el resto recibe 529 con Retry-After corto
+    // ANTES de que el WAF (que cuenta por IP) empiece a desafiar. Medido 2026-09-10:
+    // 10 en 150 s disparan el desafio. MAX = 0 lo desactiva.
+    agentParseMaxPerWindow: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_MAX_PER_WINDOW, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 6
+    })(),
+    agentParseWindowSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_PARSE_WINDOW_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 120
+    })(),
+    // Reutilizacion del prefijo de historial entre turnos (src/utils/context-prefix-cache.js):
+    // el historial ya subido y parseado viaja como el mismo adjunto y solo la cola nueva va
+    // inline — un parse cada 3-10 turnos en vez de uno por turno. 'false' lo apaga.
+    agentContextPrefixReuse: process.env.AGENT_CONTEXT_PREFIX_REUSE !== 'false',
+    // Vida ABSOLUTA de una entrada (desde que se subio). Un file_id caducado en Qwen no da
+    // error: el modelo contesta sin el adjunto (medido 2026-09-10), asi que el TTL es la
+    // unica cota contra un historial fantasma.
+    agentContextPrefixTtlSeconds: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_TTL_SECONDS, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 1800
+    })(),
+    agentContextPrefixMaxEntries: (() => {
+        const raw = parseInt(process.env.AGENT_CONTEXT_PREFIX_MAX_ENTRIES, 10)
+        return Number.isFinite(raw) && raw > 0 ? raw : 200
+    })(),
     // Antidetect Tier 1: per-account fingerprint & header diversity.
     // Set to 'false' to instantly roll back to legacy static headers.
     antidetectTier1Enabled: process.env.ANTIDETECT_TIER1_ENABLED !== 'false',

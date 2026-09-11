@@ -6,7 +6,14 @@ const {
   AGENT_BLOCKED_OPEN,
   AGENT_BLOCKED_CLOSE,
   TOOL_CALL_OPEN,
-  TOOL_CALL_CLOSE
+  TOOL_CALL_CLOSE,
+  // Vive en agent-turn.js (la hoja del grafo) porque el ledger de llamadas ejecutadas
+  // reinyecta el mismo texto no confiable y las dos rutas necesitan una unica regla.
+  neutraliseResultMarkers,
+  // Cuerpos de los que nada es nuestro (fichero, pagina, salida de comando): misma
+  // regla mas el delimitador de razonamiento. Ver la nota en agent-turn.js sobre por
+  // que ese brazo no puede vivir en la regla general.
+  neutraliseUntrustedBody
 } = require('./agent-turn.js');
 
 // TOOL_CALL_OPEN / TOOL_CALL_CLOSE 从 agent-turn.js 引入：规范标记与重试提示必须锁步，
@@ -110,10 +117,31 @@ const TOOL_CALL_CLOSE_BARE_RE = /^<[ \t]{0,4}\/[ \t]{0,4}tool_calls?/i;
 // 装饰段同时排除 '[' 和 ']'：consumeTrailingCloser 的 grow 判据把内部的 '['
 // 当成"这段永远成不了闭标记"的证据（`!slice.includes('[', 1)`），正则这一半也必须认同，
 // 否则 `[END TOOL CALL[[[]` 在正则里算闭标记、在 grow 判据里不算，两半自相矛盾。
-const TOOL_CALL_CLOSE_BRACKET_RE =
-  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i;
-const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
-  /^\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?/i;
+//
+// **序号臂**（`#3`）。foldToolMessages 把历史里的调用块写成 `[TOOL CALL #n]`，模型每一轮
+// 都读得到它，而这个文件的开头就写着"模型几乎每次都把标签写坏"、以及当年它正是从读到的
+// 形状里学会了 `<tool_call_id_1>` 那一族。镜像回一个 `[END TOOL CALL #3]` 是最自然的模仿，
+// 而装饰段 `[^\s[\]]{0,16}` **排除空白**，跨不过 '#' 前面那个空格：实测 `[END TOOL CALL#7]`
+// 认得出来，`[END TOOL CALL #7]`（正是我们教出去的那个空格）认不出来 —— 闭标记原样交付给
+// 客户端，stripToolCallResidue 没有 span 可删（交付层绝无第二套扫描），
+// containsOrphanProtocolResidue 也返回 false，连 malformed_protocol 重试都不会触发。
+// 所以这里只放宽到**一段数字**：空白 + '#' + 一串数字，绝不认单词。放数字进来不会咬到
+// 回答（散文里不会出现 `[END TOOL CALL #12]`；`[END TOOL CALL #3 我的回答]` 里序号之后
+// 不是 ']'，整条仍然匹配不上，回答完好），放单词进来会（见 :103-105 的纪律：宁可漏出
+// 闭标记，也绝不吃掉模型的回答）。位数取 6 而不是 4：这个上界唯一的失效方式是
+// foldToolMessages 的序号涨过它 —— 那正是本次修的这个静默泄漏，宁可给足余量；而多几位
+// 数字对"吃掉回答"的风险恰好是零。序号里既没有 '[' 也没有 ']'，与上面 grow 判据的那条
+// 约定仍然一致。裸臂必须**同步**放宽：流尾停在 `[END TOOL CALL #3`（少一个 ']'）时，
+// 裸臂要求"匹配之后什么都不剩"，不带序号就永远剩下 `#3`，闭标记照样漏。
+const TOOL_CALL_CLOSE_ORDINAL = '(?:[ \\t]{0,4}#[ \\t]{0,2}\\d{1,6})?';
+const TOOL_CALL_CLOSE_BRACKET_RE = new RegExp(
+  `^\\[[ \\t]{0,4}(?:END[ \\t_-]{1,2}|\\/[ \\t]{0,4})TOOL[ \\t_-]{1,2}CALLs?[^\\s[\\]]{0,16}${TOOL_CALL_CLOSE_ORDINAL}[ \\t\\r\\n]{0,4}\\]`,
+  'i'
+);
+const TOOL_CALL_CLOSE_BRACKET_BARE_RE = new RegExp(
+  `^\\[[ \\t]{0,4}(?:END[ \\t_-]{1,2}|\\/[ \\t]{0,4})TOOL[ \\t_-]{1,2}CALLs?${TOOL_CALL_CLOSE_ORDINAL}`,
+  'i'
+);
 // 配平点之后、闭标记之前的**闭合残渣**：模型多写了一层 `}` / `]`。实测 2026-09-06
 // （Claude Code 经 /v1/messages）：`{"name":"Bash","arguments":{…}}}\n[END TOOL CALL]`
 // —— 多出的 '}' 让闭标记不再“紧邻”，调用按无闭标记收尾，'}' 作为正文放出，随后的
@@ -123,9 +151,10 @@ const TOOL_CALL_CLOSE_BRACKET_BARE_RE =
 const TRAILING_DEBRIS_MAX = 8;
 // 上界是两种闭标记里更长的那个。两个都是手写的镜像字面量，必须和上面的正则**用眼睛**保持
 // 同步 —— 这是这种写法的固有风险。当前方括号臂（63）其实盖过尖括号臂（58），而方括号闭标记
-// 最长也就 42 个字符，本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，
-// 就算它写短了也咬不出 bug（除非有人把两个臂同时改短到 42 以下）。真要收紧成一个精确不变式，
-// 得把常量导出、在测试里断言"正则匹配长度 ≤ MAX"。
+// 最长 55 个字符（21 关键字 + 16 装饰 + 13 序号 + 4 空白 + 1 闭括号，序号臂加进来之后重算过），
+// 本来就落在任一臂之下；也就是说方括号那个字面量此刻是冗余的安全垫，就算它写短了也咬不出
+// bug（除非有人把两个臂同时改短到 55 以下）。这条不变式不再只靠眼睛：
+// tests/tool-correlation.test.js 钉了"最长的带序号闭标记仍然落在窗口里被吞掉"。
 const TOOL_CALL_CLOSE_MAX = Math.max(
   '</    tool_calls'.length + 42,
   '[    END  TOOL  CALLS'.length + 42
@@ -514,6 +543,17 @@ const consumeTrailingCloser = (text, from, canGrow) => {
   if (!canGrow && bare && !slice.slice(bare[0].length).trim()) {
     return { end: index + slice.length, needMore: false };
   }
+  // 流到此为止，尾巴是**半个**闭标记（`[END TOOL C` + EOF）：bare 正则要求关键字写全，
+  // 所以截断的前缀匹配不上，以前整段作为正文放出去。后果比"多出一段脏字"严重得多：
+  // 放出去的 `\n[END ` 让紧随其后的 `[TOOL CALL]` 通不过"触发器必须是首个内容"那道闸门，
+  // 于是一个**真实的工具调用被静默丢弃**（实测：期望两个调用，只拿到 Bash 一个）。
+  //
+  // isDanglingCloserPrefix 只认规范拼写的字面前缀且必须占满剩余单行，判不准就当正文放行；
+  // 光秃秃的一个 '[' 因此仍然是正文（rest 为空 → false），那确实无从判断。
+  // end 取 text.length 而不是 index + slice.length：slice 只是 63 字符的窗口。
+  if (!canGrow && isDanglingCloserPrefix(text.slice(index))) {
+    return { end: text.length, needMore: false };
+  }
   return { end: debrisEnd, needMore: false };
 };
 
@@ -560,6 +600,12 @@ const consumeMandatoryBracketCloser = (text, from, canGrow) => {
  * flush 专用：closerSwallow 状态下，流死在半个**重复**闭标记上（`[END TOOL C` + EOF）。
  * 只认规范拼写的字面前缀（大小写不敏感，空格/下划线/连字符三种分隔，至少 1 个字符）；
  * 判不准宁可当正文放行 —— 吞掉真实回答比漏出半个标记更糟。
+ *
+ * 序号臂在这里是**第三面镜子**（正则臂、裸臂、字面量表）。流刚好断在 `[END TOOL CALL #`
+ * 上时：关键字写全了，裸臂却因为剩下一个 '#' 而不成立，字面量表也没有一条以 `#` 结尾 ——
+ * 于是半个闭标记漏进正文，而且因为缺 ']'，containsOrphanProtocolResidue 连重试都不点。
+ * 所以先把行尾的 `#<数字>`（数字可以还没到）摘掉再比字面量。摘除锚在行尾，
+ * `[END TOOL CALL and #3 items` 这类多词散文摘不掉也匹配不上，照旧当正文放行。
  * @param {string} value - flush 时 pendingText 从第一个非空白字符起的尾巴
  * @returns {boolean}
  */
@@ -567,10 +613,11 @@ const CLOSER_PREFIX_LITERALS = [
   'END TOOL CALLS', 'END_TOOL_CALLS', 'END-TOOL-CALLS',
   '/TOOL CALLS', '/TOOL_CALLS', '/TOOL-CALLS'
 ];
+const DANGLING_ORDINAL_TAIL_RE = /[ \t]{0,4}#[ \t]{0,2}\d{0,6}$/;
 const isDanglingCloserPrefix = (value) => {
   const match = value.match(/^([[<])[ \t]{0,4}([^\r\n]*)$/);
   if (!match) return false;
-  const rest = match[2].toUpperCase();
+  const rest = match[2].toUpperCase().replace(DANGLING_ORDINAL_TAIL_RE, '');
   if (rest.length === 0 || rest.length > TOOL_CALL_CLOSE_MAX) return false;
   return CLOSER_PREFIX_LITERALS.some(literal => literal.startsWith(rest));
 };
@@ -1455,12 +1502,44 @@ const compressToolDefinition = (tool) => {
 };
 
 /**
+ * 折叠出来的历史标记要带序号，结果才有地址可寻。
+ *
+ * 真实语料（192 段 Claude Code 会话，15337 个 tool_use）里 1451 次跨回合重复调用中，
+ * 925 次（63.7%）在原调用和重复之间还夹着**同名不同参**的另一次调用。二十次 Read
+ * 折出来是二十个一模一样的 `[TOOL RESULT: Read]`，按消息顺序排开，没有任何东西把某个
+ * 结果绑回它的调用 —— 模型分不清哪次读到的是哪个路径，于是重读。Read 同时是调用最多
+ * 和重复最多的工具，正是这个 signature。
+ *
+ * 序号只出现在**折叠的历史**里。模型被要求写的实时标记仍然是不带任何属性的
+ * TOOL_CALL_OPEN（见 buildToolSystemPrompt 里那条「marker 从不带属性」的规则，
+ * 解析器与之锁步）。这里编号的是模型**读**到的过去，不是它现在要**写**的东西。
+ * 即便模型照抄了编号形式，触发器只认前缀，负载照样能恢复（tool-correlation.test.js 有钉）。
+ * @param {number|string} ordinal - 调用序号
+ * @returns {string} 带序号的调用开标记
+ */
+const numberedCallMarker = (ordinal) => TOOL_CALL_OPEN.replace(/\]$/, ` #${ordinal}]`);
+
+/**
+ * 带序号的结果开标记前缀，和 TOOL_RESULT_OPEN 锁步（换分隔符时只改一处）。
+ * @param {number|string} ordinal - 它回答的那次调用的序号
+ * @returns {string} 形如 `[TOOL RESULT #3: `
+ */
+const numberedResultOpen = (ordinal) => TOOL_RESULT_OPEN.replace(/:[ \t]*$/, ` #${ordinal}: `);
+
+/**
  * 构建用于注入 system 消息的工具调用提示词
  * @param {Array<Object>} tools - OpenAI 风格工具定义列表
  * @param {Object} [options] - 可选参数
  * @param {string|Object} [options.tool_choice] - OpenAI tool_choice 参数
  * @returns {string} 完整的工具调用系统提示词
  */
+/**
+ * Herramientas propias del chat de Qwen que el modelo conoce de memoria y aqui no existen.
+ * Medido 2026-09-09: 5 turnos en 30 min entregados a medias por invocarlas. Solo se
+ * nombran las que el cliente NO declaro (un `web_search` declarado es legitimo).
+ */
+const PLATFORM_ONLY_TOOL_NAMES = ['code_interpreter', 'web_search'];
+
 const buildToolSystemPrompt = (tools, options = {}) => {
   if (!Array.isArray(tools) || tools.length === 0) {
     return '';
@@ -1470,6 +1549,9 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     .map(compressToolDefinition)
     .filter(Boolean)
     .join('\n');
+
+  const declaredNames = new Set(tools.map(tool => tool?.function?.name || tool?.name).filter(Boolean));
+  const absentPlatformTools = PLATFORM_ONLY_TOOL_NAMES.filter(name => !declaredNames.has(name));
 
   const lines = [
     '# Tools',
@@ -1488,9 +1570,11 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     '',
     'Tool results come back to you as user messages in this form:',
     '',
-    `${TOOL_RESULT_OPEN}<tool_name>]`,
+    `${numberedResultOpen('n')}<tool_name>]`,
     '<result text or JSON>',
     TOOL_RESULT_CLOSE,
+    '',
+    'Past calls are numbered in call order; a result carries the number of the `[TOOL CALL #n]` it answers, so two calls to the same tool are told apart. Never write a number in a marker you emit.',
     '',
     'Rules:',
     `- If the task requires reading, writing, editing, searching, shell execution, browser use, or any action covered by an available tool, your visible response MUST be a \`${TOOL_CALL_OPEN}\` block. Call the tool instead of describing the action.`,
@@ -1498,8 +1582,16 @@ const buildToolSystemPrompt = (tools, options = {}) => {
     `- The JSON inside \`${TOOL_CALL_OPEN}\` must be valid and on a single logical block.`,
     `- Write the opening marker as exactly \`${TOOL_CALL_OPEN}\` and the closing marker as exactly \`${TOOL_CALL_CLOSE}\`, each on its own line. They never take attributes, an id, or the tool name — everything the call needs is inside the JSON.`,
     '- Use the exact tool name listed above.',
+    ...(absentPlatformTools.length > 0
+      ? [`- Only the tools listed above exist here. ${absentPlatformTools.map(name => `\`${name}\``).join(', ')} and other platform tools are NOT available; never call them.`]
+      : []),
     '- Provide all required arguments; omit unknown ones.',
     `- You may emit multiple \`${TOOL_CALL_OPEN}\` blocks back-to-back when more than one tool is needed.`,
+    // Contrapeso a la linea de arriba y a la de "After every tool result...". Medido:
+    // 526 de 1.451 duplicados no tenian colision de nombre. No es una prohibicion —
+    // releer un archivo despues de editarlo es CORRECTO — asi que la excepcion viaja
+    // en la misma linea que la regla.
+    '- If the same call with the same arguments already ran, reuse its result instead of calling again — unless a preceding action could have changed it.',
     '- After every tool result, evaluate the actual task state. If work remains, emit the next tool call. Only return a normal-language final answer after the requested task is genuinely complete or you are blocked on user input.',
     '- Never claim that a file was changed, a command succeeded, or a result was verified unless the corresponding tool result proves it.',
     `- Do not call nonexistent tools, fabricate tool results, wrap \`${TOOL_CALL_OPEN}\` in code fences, or mix extra commentary into a tool-call turn.`,
@@ -1522,6 +1614,47 @@ const buildToolSystemPrompt = (tools, options = {}) => {
 };
 
 /**
+ * Defusar los marcadores de protocolo del texto que NO escribe el propio fold.
+ *
+ * Invariante que sostiene la correlacion de la Tarea 1: **dentro de la historia plegada,
+ * todo marcador de protocolo lo escribio foldToolMessages**. Sin esto, cualquier mensaje
+ * de texto plano puede traer un `[TOOL RESULT #1: Read]` inventado y colisionar con el
+ * ordinal #1 real — dos bloques reclamando la misma llamada, uno falso, indistinguibles
+ * para el modelo. Es exactamente la colision que la Tarea 1 existe para eliminar.
+ *
+ * El texto plano llega envenenado por vias normales, no hipoteticas: desde que la
+ * historia se pliega tambien sin `tools` (peticiones de compactacion/resumen de Claude
+ * Code), el resumen que produce el modelo puede citar los marcadores que le enseñamos, y
+ * el cliente lo reenvia como un mensaje de usuario corriente en la siguiente peticion,
+ * esta vez CON herramientas. Tambien basta con que alguien pegue una transcripcion.
+ *
+ * Misma regla que ya se aplica al cuerpo de un resultado (contenido no confiable), y por
+ * la misma razon. Solo se toca texto: los items de imagen/media se devuelven intactos, y
+ * el mensaje solo se reemplaza cuando algo cambio de verdad — asi la inmensa mayoria de
+ * los mensajes (sin marcadores) conserva su identidad byte a byte.
+ * @param {object} message
+ * @returns {object} el mismo mensaje, o una copia con el texto defusado
+ */
+const neutraliseMessageMarkers = (message) => {
+  if (!message || typeof message !== 'object') return message;
+  const { content } = message;
+  if (typeof content === 'string') {
+    const safe = neutraliseResultMarkers(content);
+    return safe === content ? message : { ...message, content: safe };
+  }
+  if (!Array.isArray(content)) return message;
+  let changed = false;
+  const next = content.map((item) => {
+    if (!item || item.type !== 'text' || typeof item.text !== 'string') return item;
+    const safe = neutraliseResultMarkers(item.text);
+    if (safe === item.text) return item;
+    changed = true;
+    return { ...item, text: safe };
+  });
+  return changed ? { ...message, content: next } : message;
+};
+
+/**
  * 将历史中的 assistant tool_calls / tool 角色消息折叠成纯文本，
  * 以便上游网页接口（仅识别 user/assistant/system）能正确接收上下文。
  * 折叠时保留原始 tool_call_id，并将后续 role=tool 消息按 id 精确回链。
@@ -1531,7 +1664,10 @@ const buildToolSystemPrompt = (tools, options = {}) => {
 const foldToolMessages = (messages) => {
   if (!Array.isArray(messages)) return messages;
 
-  const callIdToName = new Map();
+  // id -> { name, ordinal }。ordinal 在**本次请求内**从 1 开始按调用顺序单调递增，
+  // 结果消息靠 tool_call_id 回链到它。旧的 callIdToName 只给结果定名，定不了地址。
+  const callIdToRef = new Map();
+  let callOrdinal = 0;
 
   return messages.map((message) => {
     if (!message || typeof message !== 'object') return message;
@@ -1554,14 +1690,19 @@ const foldToolMessages = (messages) => {
         }
         const name = fn?.name || 'unknown';
         const id = call?.id || `call_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
-        callIdToName.set(id, name);
+        callOrdinal += 1;
+        callIdToRef.set(id, { name, ordinal: callOrdinal });
         // 提示词里写的是 {name, arguments} 两个键，这里也只写两个。多出来的 id 是
         // <tool_call_id_1> 这一族坏标签的种子，而模型从来没有自己吐出过 id（name ×36、id ×0）。
-        // callIdToName 仍然留着 id，用来给下面的结果消息定名。
+        // callIdToRef 仍然留着 id，用来给下面的结果消息定名**和**定址。
         const payload = { name, arguments: args ?? {} };
-        return `${TOOL_CALL_OPEN}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
+        return `${numberedCallMarker(callOrdinal)}\n${JSON.stringify(payload)}\n${TOOL_CALL_CLOSE}`;
       });
-      const original = typeof message.content === 'string' ? message.content : '';
+      // El texto libre que el assistant escribio antes de llamar no lo escribio el fold:
+      // pasa por la misma regla que un cuerpo de resultado (ver neutraliseMessageMarkers).
+      const original = typeof message.content === 'string'
+        ? neutraliseResultMarkers(message.content)
+        : '';
       return {
         role: 'assistant',
         content: [original, blocks.join('\n')].filter(Boolean).join('\n')
@@ -1570,38 +1711,32 @@ const foldToolMessages = (messages) => {
 
     if (message.role === 'tool' || message.role === 'function') {
       const callId = message.tool_call_id || '';
-      const name = message.name || callIdToName.get(callId) || (message.role === 'function' ? 'function' : 'tool');
-      const content = typeof message.content === 'string'
-        ? (message.content || 'null')
-        : JSON.stringify(message.content ?? null);
+      const ref = callId ? callIdToRef.get(callId) : null;
+      const name = message.name || ref?.name || (message.role === 'function' ? 'function' : 'tool');
+      // Un resultado vacio NO es `null`: la herramienta corrio y devolvio nada. Escribir
+      // `null` le dice al modelo que devolvio JSON null, que es otra cosa — y ahora se ve,
+      // porque antes el mensaje entero desaparecia (ver el gate del fold en ambos caminos).
+      // Un array vacio es el mismo hecho que un string vacio —la herramienta corrio y no
+      // devolvio nada— y `[]` no lo dice: se lee como un valor JSON de verdad. Llega asi
+      // cuando un escaneo de medios se lleva el unico item del cuerpo.
+      const isEmptyBody = message.content === '' ||
+        (Array.isArray(message.content) && message.content.length === 0);
+      const content = isEmptyBody
+        ? '(empty)'
+        : (typeof message.content === 'string'
+          ? message.content
+          : JSON.stringify(message.content ?? null));
+      // 认领不到调用就不编号：随便派一个序号等于指向**别人**的调用，比没有地址更坏。
+      const open = ref ? numberedResultOpen(ref.ordinal) : TOOL_RESULT_OPEN;
       return {
         role: 'user',
-        content: `${TOOL_RESULT_OPEN}${sanitizeMarkerName(name)}]\n${neutraliseResultMarkers(content)}\n${TOOL_RESULT_CLOSE}`
+        content: `${open}${sanitizeMarkerName(name)}]\n${neutraliseUntrustedBody(content)}\n${TOOL_RESULT_CLOSE}`
       };
     }
 
-    return message;
+    return neutraliseMessageMarkers(message);
   });
 };
-
-/**
- * 结果正文必须对它自己封闭。工具结果是**不可信内容** —— 文件、网页、命令输出 —— 里面
- * 完全可能出现 `[END TOOL RESULT]`。原样写出去，块就在那里提前结束，后面的内容就变成了
- * 对模型说的话。把正文里的标记打断，让它再也关不掉这个块。
- * @param {string} value - 原始结果正文
- * @returns {string} 标记已失效的正文
- */
-const neutraliseResultMarkers = (value) => String(value)
-  .replace(/\[[ \t]*END[ \t]+TOOL[ \t]+RESULT[ \t]*\]/gi, '(END TOOL RESULT)')
-  .replace(/\[[ \t]*TOOL[ \t]+RESULT[ \t]*:/gi, '(TOOL RESULT:')
-  // 调用标记同样要在结果正文里失效：不可信内容里的 `[TOOL CALL]` / `<tool_call>`
-  // 一旦被模型原样引用到回答开头，就是一个可以点火的触发器。把头字符换掉，
-  // 触发器正则（与之锁步）就永远匹配不上。
-  .replace(/\[(?=[ \t]{0,4}tool[ \t_-]{1,2}calls?)/gi, '(')
-  .replace(/\[(?=[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?)/gi, '(')
-  // i 标志不可省：TOOL_CALL_TRIGGER_RE 的尖括号臂是 case-insensitive，缺 i 时
-  // `<TOOL_CALL>` 从不可信正文里原样漏过，被模型引用到回答开头就能点火调起工具。
-  .replace(/<(?=[ \t]{0,4}\/?[ \t]{0,4}tool_calls?)/gi, '(');
 
 /**
  * 结果标记占一整行，工具名里不能出现会把它撑破的字符

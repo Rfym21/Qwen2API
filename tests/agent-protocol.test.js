@@ -629,7 +629,11 @@ test('strict non-stream Agent gate returns an HTTP error instead of a fake compl
 
   assert.equal(retries, 1)
   assert.ok(processingHeartbeats > 0)
-  assert.equal(res.statusCode, 429)
+  // 502, no 429: sigue siendo un error HTTP (que es lo que este test defiende — nunca una
+  // conclusión fabricada), pero deja de anunciarse como límite de tasa. Con 429,
+  // writeOpenAIHttpError lo etiquetaba `rate_limit_error` y un cliente agéntico reintentaba
+  // el turno entero contra la cuenta con la que acababa de fallar.
+  assert.equal(res.statusCode, 502)
   const payload = JSON.parse(res.output)
   assert.equal(payload.error.code, 'upstream_agent_turn_incomplete')
   assert.equal(Object.hasOwn(payload, 'choices'), false)
@@ -921,6 +925,9 @@ test('oversized multimodal Agent context is externalized and upload failure keep
     {
       thresholdBytes: 1024,
       livePromptBytes: 4096,
+      // Compactar es opt-in (peticion sin tools). Ver el test siguiente para el defecto.
+      allowContextCompaction: true,
+      fallbackPromptBytes: 4096,
       uploader: async () => { throw new Error('parse failed') }
     }
   )
@@ -928,6 +935,35 @@ test('oversized multimodal Agent context is externalized and upload failure keep
   assert.match(compacted.payload.messages[0].content, /strict tool protocol with read_file/)
   assert.match(compacted.payload.messages[0].content, /continue the unfinished task/)
   assert.ok(Buffer.byteLength(compacted.payload.messages[0].content) <= 4096)
+})
+
+test('upload failure without explicit compaction permission rejects with a retryable error instead of a silent 200', async () => {
+  // 2026-09-09 21:25: el parse de Qwen cayo y cada turno con tools salio 200 con el
+  // 7–50 % del historial. Sin permiso explicito el fallo tiene que SALIR, no disimularse.
+  const original = [
+    '# Tools',
+    'strict tool protocol with read_file(path: string)',
+    '# Conversation history (JSONL)',
+    JSON.stringify({ role: 'tool', content: 'x'.repeat(12000) }),
+    '# Current message',
+    JSON.stringify({ role: 'user', content: 'continue the unfinished task' })
+  ].join('\n')
+  const parseDown = new Error('Qwen 文档解析服务失败: Internal_Server_Error (f1)')
+  await assert.rejects(
+    externalizeOversizedAgentContext(
+      { messages: [{ role: 'user', content: original }] },
+      'token',
+      {},
+      { thresholdBytes: 1024, livePromptBytes: 4096, uploader: async () => { throw parseDown } }
+    ),
+    (error) => {
+      assert.equal(error.code, 'context_externalization_failed')
+      assert.equal(error.cause, parseDown)
+      assert.equal(error.retryAfter, 10)
+      assert.match(error.message, /Internal_Server_Error/)
+      return true
+    }
+  )
 })
 
 test('externalized Agent context keeps system rules active task and recent tool progress inline', async () => {
@@ -1005,7 +1041,27 @@ test('externalized single-message Agent context keeps the original task outside 
 test('Agent completion control parser rejects bare and mixed completion claims', () => {
   assert.deepEqual(parseAgentControlText('<agent_final>done</agent_final>'), { kind: 'final', text: 'done' })
   assert.equal(parseAgentControlText('done').kind, 'bare')
-  assert.equal(parseAgentControlText('prefix <agent_final>done</agent_final>').kind, 'invalid_control')
+  // `prefix <agent_final>done</agent_final>` era invalid_control aquí, y ese veto es el que
+  // producía el HTTP 429 "1 de cada 4" de /v1/chat/completions con tools: medido en vivo el
+  // 2026-09-08 (3 de 3 invalid_control observados eran prosa de razonamiento filtrada + un
+  // par perfectamente bien formado, con la respuesta correcta dentro). Ahora se acepta y se
+  // conservan las dos mitades sin tags — paridad con el gemelo Anthropic. Detalle completo y
+  // los casos que SIGUEN rechazándose: tests/openai-agent-gate-429.test.js.
+  const prefixed = parseAgentControlText('prefix <agent_final>done</agent_final>')
+  assert.equal(prefixed.kind, 'final')
+  assert.equal(prefixed.text, 'prefix done')
+  // El cierre tiene que ser LO ULTIMO: un tag con texto detras es una mencion incidental, no
+  // un cierre, y aceptarla entregaba planes («luego emito <agent_final>x</agent_final> cuando
+  // acabe») como turnos terminados al primer intento. Detalle en openai-agent-gate-429.
+  assert.equal(
+    parseAgentControlText('prefix <agent_final>done</agent_final> y sigo').kind,
+    'invalid_control'
+  )
+  // Lo genuinamente ambiguo sigue vetado: dos familias en el mismo turno.
+  assert.equal(
+    parseAgentControlText('x <agent_final>a</agent_final> <agent_blocked>b</agent_blocked>').kind,
+    'invalid_control'
+  )
 })
 
 test('Agent completion control stream parser handles split tags and trims only wrapper edges', () => {

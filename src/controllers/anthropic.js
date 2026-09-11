@@ -1,10 +1,15 @@
 const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject } = require('../utils/precise-tokenizer.js');
-const { sendChatRequest } = require('../utils/request.js');
+const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
+const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
 const accountManager = require('../utils/account.js');
 const {
-  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase,
-  createUpstreamDeltaNormalizer, createClientToolNamePredicate
+  isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
+  createUpstreamDeltaNormalizer, createClientToolNamePredicate, willBeFolded,
+  // Fuente unica del tope por turno. Antes esto era un literal `= 4` propio dentro de
+  // buildInternalRequest: dos numeros que nada relacionaba, y bajar ESTE a 2 no rompia
+  // ninguna de las 889 pruebas. Ver chat-helpers.js#HARVEST_MEDIA_CAP.
+  HARVEST_MEDIA_CAP
 } = require('../utils/chat-helpers.js');
 const {
   buildToolSystemPrompt,
@@ -24,25 +29,51 @@ const {
   stripAgentTags,
   buildAgentRetryHint,
   buildAgentTurnDirective,
+  buildToolHistoryLedger,
+  extractHistoryToolCalls,
+  // Gemelo de chat-helpers.js#harvestCurrentTurnMedia. La igualdad de la nota ya no es una
+  // promesa de comentario: los dos caminos llaman a ESTE escritor, que compone la linea y
+  // la apunta fuera del contenido. Lo que si difiere es la forma que cada uno puede
+  // escribir —— la cosecha OpenAI solo visita el turno en curso, asi que nunca necesita la
+  // variante «not included»; este camino desvia el medio en el aplanado, ve tambien los
+  // turnos anteriores y por eso tiene que elegir.
+  writeToolResultMediaNote,
   // Guarda de fuga del canal de texto: una sola implementacion para ambos caminos
   // (spec agent-turn-cutoff-openai-parity). El `tag` de logging es parametro.
   createToolCallLedger,
   resolveTextToolCallCap,
-  createTextChannelRunawayGuard
+  createTextChannelRunawayGuard,
+  // Misma regla de neutralizacion que usan el fold y el ledger para un cuerpo de
+  // resultado: el texto de un bloque `thinking` es contenido que vuelve al prompt y
+  // puede citar marcadores, incluido el delimitador que lo envuelve.
+  neutraliseUntrustedBody,
+  defuseThinkingMarkers,
+  trimLoneSurrogates
 } = require('../utils/agent-turn.js');
 const { ensureAgentCurrentEnvelope } = require('../middlewares/chat-middleware.js');
 const { mapIncomingModel } = require('../utils/model-map.js');
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js');
 const { logger } = require('../utils/logger');
-const { assertNoUpstreamFailure } = require('../utils/upstream-error.js');
+const {
+  assertNoUpstreamFailure,
+  describeUpstreamFailure,
+  noteRateLimitedAccount,
+  RATE_LIMIT_ANTHROPIC_TYPE,
+  UpstreamResponseError
+} = require('../utils/upstream-error.js');
 const {
   analyzeAnthropicCompatibility,
   buildAnthropicCompatibilityHeaders
 } = require('./anthropic.compatibility.js');
 
 const mapAnthropicStopReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
-  if (hasToolCalls) return 'tool_use';
+  // El truncamiento manda SOBRE tool_use. Un turno que el upstream corto a mitad de
+  // emision puede llevar una llamada con los argumentos incompletos; `tool_use` le dice
+  // al cliente "ya termine de pedirla, ejecutala" y la ejecuta igual. La API nativa
+  // reporta `max_tokens` ahi: el turno no termino. Los bloques `tool_use` ya emitidos
+  // siguen viajando —— esto es precedencia de stop_reason, no supresion de la llamada.
   if (upstreamReason === 'length' || upstreamReason === 'max_tokens') return 'max_tokens';
+  if (hasToolCalls) return 'tool_use';
   if (upstreamReason === 'stop_sequence') return 'stop_sequence';
   if (upstreamReason === 'content_filter' || upstreamReason === 'refusal') return 'refusal';
   if (upstreamReason === 'stop' || upstreamReason === 'end_turn') return 'end_turn';
@@ -50,11 +81,53 @@ const mapAnthropicStopReason = (upstreamReason, hasToolCalls, upstreamCompleted)
   return null;
 };
 
-const writeAnthropicError = (res, message, errorType = 'api_error') => {
-  writeAnthropicEvent(res, 'error', {
-    type: 'error',
-    error: { type: errorType, message }
-  });
+/**
+ * Acuna un id de `tool_use` en el espacio de nombres nativo de Anthropic.
+ * @returns {string} `toolu_` + 24 hex minusculas
+ */
+const newAnthropicToolUseId = () => `toolu_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
+
+const ANTHROPIC_TOOL_USE_ID = /^toolu_[0-9a-f]{24}$/;
+// La forma que acuna el constructor compartido (tool-prompt.js createToolCallObject /
+// buildEmitted): `call_` + los mismos 24 hex.
+const SHARED_TOOL_CALL_ID = /^call_([0-9a-f]{24})$/;
+
+/**
+ * Reetiqueta al namespace nativo el id de una llamada en el BORDE DE EMISION de esta
+ * ruta. La reescritura no puede vivir en el constructor compartido: /v1/chat/completions
+ * emite `call_` y esa forma es parte de su contrato. Los dos sitios de emision de
+ * /v1/messages (stream `emitToolUse` y el bucle no-stream que arma `content[]`) son
+ * gemelos y llaman aqui los dos.
+ *
+ * El reetiquetado conserva los 24 hex, asi que dos llamadas distintas del mismo turno
+ * (ids frescos por UUID) siguen siendo distintas. Un id de otra forma no se puede
+ * reetiquetar sin arriesgar colisiones: se acuna uno nuevo.
+ *
+ * Ojo con la direccion de ENTRADA: `flattenAnthropicMessages` NO pasa por aqui. Ahi el
+ * id lo pone el cliente (`toolu_01LhEfp5...`, base62, no 24 hex) y es la clave que
+ * enlaza el `tool_use` con su `tool_result`; reescribirlo romperia la correlacion.
+ *
+ * @param {string} id - id de la llamada tal como lo acuno el constructor compartido
+ * @returns {string} id en el namespace `toolu_`
+ */
+const toAnthropicToolUseId = (id) => {
+  if (typeof id === 'string') {
+    if (ANTHROPIC_TOOL_USE_ID.test(id)) return id;
+    const shared = SHARED_TOOL_CALL_ID.exec(id);
+    if (shared) return `toolu_${shared[1]}`;
+  }
+  return newAnthropicToolUseId();
+};
+
+const writeAnthropicError = (res, message, errorType = 'api_error', retryAfterSeconds = null) => {
+  const error = { type: errorType, message };
+  // A media transmision la cabecera Retry-After ya no se puede poner: el evento es el
+  // unico canal que le queda al cliente, asi que la espera tiene que viajar dentro.
+  // Solo si el upstream la dio de verdad (utils/upstream-error#rateLimitRetryAfterSeconds).
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    error.retry_after = retryAfterSeconds;
+  }
+  writeAnthropicEvent(res, 'error', { type: 'error', error });
   res.end();
 };
 
@@ -134,17 +207,238 @@ const normalizeAnthropicToolChoice = (toolChoice) => {
 };
 
 /**
+ * 把一个 Anthropic `image` 块转成 parserMessages 认识的 OpenAI `image_url` 项。
+ * base64 source 转 data URI（由 normalizeMediaContentItem 负责上传），url source 直接透传。
+ * 单一实现：普通 image 块和 tool_result 里的 image 块共用它。
+ * @param {Object} block - Anthropic image 块
+ * @returns {{type: 'image_url', image_url: {url: string}}|null} 无法取到 url 时返回 null
+ */
+const anthropicImageBlockToItem = (block) => {
+  const src = block?.source || {};
+  const url = src.type === 'base64' && src.data
+    ? `data:${src.media_type || 'image/png'};base64,${src.data}`
+    : (src.url || '');
+  return url ? { type: 'image_url', image_url: { url } } : null;
+};
+
+// Los bloques `thinking` / `redacted_thinking` que llegan de vuelta.
+//
+// Antes se tiraban: la rama `assistant` ni siquiera tenia clausula (el bloque se caia
+// del if/else sin dejar rastro) y la rama `user` lo descartaba a proposito. Con extended
+// thinking + tools, Claude Code reenvia el `thinking` JUNTO al `tool_use` que produjo,
+// asi que tirarlo borra el registro que el propio modelo dejo de POR QUE hizo esa
+// llamada — justo lo que alimenta el duplicado que este plan ataca.
+//
+// El delimitador es de la misma familia que los marcadores que el modelo ya ve en la
+// historia (`[TOOL CALL #1]`, `[TOOL RESULT #1: Read]`), y por construccion no dispara
+// TOOL_CALL_TRIGGER_RE (tool-prompt.js:82), que exige `tool call` tras el corchete.
+const THINKING_OPEN = '[THINKING]';
+const THINKING_CLOSE = '[END THINKING]';
+// `redacted_thinking` trae bytes opacos cifrados: no le dicen nada a Qwen y pueden ser
+// enormes. Se marca que hubo razonamiento y se tira el payload.
+const REDACTED_THINKING_NOTE = '(redacted thinking omitted)';
+// Tope de razonamiento retenido POR MENSAJE. Medido sobre 6.249 bloques `thinking`
+// reales de 1.544 sesiones de Claude Code: p50 = 235, p90 = 755, p99 = 3.076, max =
+// 19.502 caracteres. Con 1.200 se recorta el 4,8% de los bloques y se conserva entero
+// el resto. Es un tope de forma, no de presupuesto: el coste agregado lo acota
+// THINKING_BUDGET_* de abajo, porque 1.200 por mensaje x 120 turnos son 144 KB.
+const THINKING_CHARS_PER_MESSAGE = 1200;
+// Presupuesto de razonamiento POR PETICION. El tope por mensaje NO acota el agregado, y
+// el cuerpo entero tiene que caber en AGENT_CONTEXT_FILE_THRESHOLD_BYTES (92160 por
+// defecto) o `externalizeOversizedAgentContext` (utils/request.js) sube la historia como
+// documento y deja inline un digest recortado — y si la subida falla, trunca la
+// conversacion de verdad. Medido sobre la peor sesion del plan: reteniendo sin acotar,
+// el prefijo de 76 mensajes pasaba de 78.025 a 94.443 bytes y CRUZABA el umbral. Un
+// cambio hecho para reducir llamadas duplicadas provocaba el truncado que las produce.
+//
+// Por eso el presupuesto no es una fraccion fija del umbral sino el HUECO que de verdad
+// queda: si la conversacion ya lo llena, no se retiene nada y el comportamiento vuelve
+// exactamente al de antes de esta tarea.
+//
+// Reserva para lo que no esta en la lista aplanada y si acaba en el cuerpo: prompt de
+// herramientas, ledger, cabeceras del sobre y escapado JSON. Medido con 8 herramientas
+// declaradas sobre esa misma sesion: 6,8 KB a 10 mensajes, 16,2 KB a 76. 24 KiB cubre
+// con margen.
+const THINKING_BUDGET_RESERVE_BYTES = 24 * 1024;
+// Techo absoluto aunque sobre hueco: con p90 = 755, 12 KiB son ~16 turnos recientes con
+// razonamiento. De sobra para el «por que» de la ultima llamada, sin triplicar una
+// peticion corta por retener razonamiento antiguo que ya no explica nada.
+const THINKING_BUDGET_MAX_BYTES = 12 * 1024;
+
+/**
+ * Todos los bloques de razonamiento de UNA consulta, como un fragmento delimitado.
+ * Se llama una vez por mensaje, asi que el tope de abajo es por mensaje por construccion.
+ * @param {string[]} parts - textos ya extraidos, en orden de aparicion
+ * @returns {string} fragmento delimitado, o '' si no hay nada que poner
+ */
+const renderThinkingParts = (parts) => {
+  if (!Array.isArray(parts) || parts.length === 0) return '';
+  const joined = parts.join('\n');
+  // Se recorta por la CABECERA, no por la cola: la decision que produjo la llamada
+  // esta al final del razonamiento. Quedarse con el principio conserva el planteo
+  // y tira exactamente el porque, que es lo unico que veniamos a rescatar.
+  // `trimLoneSurrogates` porque `slice` corta por unidades UTF-16 y parte emojis por
+  // la mitad: la mitad suelta sobrevive al JSON y revienta arriba, no aqui.
+  const capped = joined.length <= THINKING_CHARS_PER_MESSAGE
+    ? joined
+    : `…${trimLoneSurrogates(joined.slice(joined.length - (THINKING_CHARS_PER_MESSAGE - 1)))}`;
+  // Recortar primero y neutralizar despues: asi la neutralizacion tiene la ultima
+  // palabra (un corte a mitad de marcador deja un fragmento inerte, no un marcador).
+  // `neutraliseUntrustedBody` y no la regla general: el cuerpo del razonamiento tambien
+  // puede escribir el cierre del delimitador que lo envuelve, y un delimitador que el
+  // cuerpo puede escribir no delimita nada. Ninguna sustitucion ALARGA (un caracter por
+  // otro, o mas corta), asi que el tope de arriba se sigue respetando exacto.
+  const safe = neutraliseUntrustedBody(capped);
+  return `${THINKING_OPEN}\n${safe}\n${THINKING_CLOSE}`;
+};
+
+/**
+ * El texto util de un bloque de razonamiento. La `signature` es un opaco del wire de
+ * Anthropic: no aporta nada al modelo y ocupa, asi que no viaja.
+ * @param {Object} block - bloque thinking o redacted_thinking
+ * @returns {string} texto a retener, o '' si el bloque no aporta nada
+ */
+const thinkingBlockText = (block) => {
+  if (block?.type === 'redacted_thinking') return REDACTED_THINKING_NOTE;
+  const text = typeof block?.thinking === 'string' ? block.thinking : '';
+  return text.trim() ? text : '';
+};
+
+/**
+ * Bytes de texto que esta lista aplanada va a aportar al cuerpo, aproximados.
+ *
+ * Se cuenta solo TEXTO: las imagenes viajan como fichero subido (extractMediaToFiles),
+ * no dentro del prompt, y contar su data URI en base64 mataria la retencion de
+ * razonamiento en cuanto hubiera una captura en la conversacion. Los 24 bytes fijos por
+ * mensaje son el envoltorio JSONL (`{"role":"assistant","content":""}` mas el salto).
+ * @param {Array<Object>} messages - mensajes ya aplanados, aun sin razonamiento
+ * @returns {number} bytes estimados
+ */
+const historyBytesEstimate = (messages) => {
+  let total = 0;
+  for (const msg of messages) {
+    total += 24 + Buffer.byteLength(String(msg?.role || ''));
+    const content = msg?.content;
+    if (typeof content === 'string') {
+      total += Buffer.byteLength(content);
+    } else if (Array.isArray(content)) {
+      for (const item of content) {
+        if (item?.type === 'text' && typeof item.text === 'string') total += Buffer.byteLength(item.text);
+      }
+    }
+    if (Array.isArray(msg?.tool_calls)) total += Buffer.byteLength(JSON.stringify(msg.tool_calls));
+  }
+  return total;
+};
+
+/**
+ * Cuelga el razonamiento retenido en los mensajes que lo produjeron, de lo NUEVO a lo
+ * VIEJO y hasta agotar el hueco que queda bajo el umbral de externalizacion.
+ *
+ * Newest-first no es un detalle de implementacion: el razonamiento que explica la
+ * llamada que el modelo esta a punto de repetir es el reciente, y es el unico que esta
+ * tarea existe para rescatar. Cuando el presupuesto se agota simplemente no se cuelga —
+ * y no se cuelga NOTA de que falta, porque la ausencia de razonamiento es exactamente lo
+ * que el cliente veia antes de esta tarea: omitirlo no miente, a diferencia de un ledger
+ * recortado, donde «no esta» si significaria «nunca se llamo».
+ * @param {Array<Object>} out - mensajes aplanados, mutados en sitio
+ * @param {Array<{index: number, text: string}>} pending - razonamiento por mensaje, en orden
+ * @returns {void}
+ */
+const attachRetainedThinking = (out, pending) => {
+  if (pending.length === 0) return;
+  const config = require('../config/index.js');
+  const budget = Math.max(0, Math.min(
+    THINKING_BUDGET_MAX_BYTES,
+    config.agentContextFileThresholdBytes - THINKING_BUDGET_RESERVE_BYTES - historyBytesEstimate(out)
+  ));
+  let spent = 0;
+  let dropped = 0;
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const { index, text } = pending[i];
+    const cost = Buffer.byteLength(text) + 1;   // + el salto que lo separa del texto
+    if (spent + cost > budget) { dropped += 1; continue; }
+    spent += cost;
+    const msg = out[index];
+    const body = typeof msg.content === 'string' ? msg.content : '';
+    // El texto HERMANO del mismo mensaje puede escribir `[END THINKING]` igual que el
+    // cuerpo del razonamiento — el modelo cita ficheros en sus respuestas — y ahi
+    // cerraria el bloque que acabamos de abrir, dejando fuera de el todo lo que viniera
+    // detras. Solo el brazo THINKING: los otros marcadores de este texto ya los defusa
+    // foldToolMessages (tool-prompt.js, rama assistant y neutraliseMessageMarkers).
+    // Se defusa solo cuando de verdad hay delimitador que proteger: sin razonamiento
+    // colgado el texto sigue byte a byte igual que antes de esta tarea.
+    msg.content = [text, defuseThinkingMarkers(body)].filter(Boolean).join('\n');
+  }
+  if (dropped > 0) {
+    logger.debug(
+      `Anthropic thinking retention: ${pending.length - dropped}/${pending.length} bloques dentro del presupuesto (${spent}/${budget} B)`,
+      'ANTHROPIC'
+    );
+  }
+};
+
+/**
  * 把 Anthropic 风格的消息（含 content blocks 与 tool_use/tool_result）展开为
  * OpenAI 风格消息列表。tool_use 转为 assistant.tool_calls；tool_result 转为
  * role=tool 消息（保留 tool_call_id），后续由 foldToolMessages 折叠。
  * @param {Array<Object>} messages - Anthropic messages
  * @returns {Array<Object>} OpenAI 风格 messages
  */
+const UNSUPPORTED_BLOCK_NOTE = (type) => `[unsupported content block: ${type} — not forwarded]`;
+
+/**
+ * Indice del primer mensaje del turno EN CURSO.
+ *
+ * Misma regla que el barrido de medios de buildInternalRequest (y que su gemelo
+ * chat-helpers.js#harvestCurrentTurnMedia), expresada sobre la forma de ENTRADA: la
+ * frontera del turno es la ultima respuesta FINAL del asistente —— la que no lleva
+ * `tool_use`. Un assistant al final es prefill, pertenece al turno y no lo cierra.
+ *
+ * Se recalcula aqui en vez de leerse del barrido porque el aplanado corre antes; el
+ * barrido queda intacto, que es lo que exige el invariante de entrega de imagenes. Si las
+ * dos reglas se desincronizaran, lo unico que cambia es el TEXTO de la nota: `.media` se
+ * sigue poniendo siempre, asi que ninguna imagen puede perderse por este calculo. La
+ * concordancia esta clavada extremo a extremo (nota positiva <=> imagen en files[]) en
+ * tests/toolresult-image-note.test.js.
+ *
+ * Unico desacuerdo conocido: HARVEST_MEDIA_CAP corta el RECORRIDO del barrido a los 4
+ * primeros medios, asi que un turno con mas de 4 puede tener un resultado dentro de la
+ * ventana cuyo medio no llega a visitarse. Cuenta como conocido y no como silencioso: ya
+ * no vive solo en este comentario, esta clavado en tests/harvest-media-cap.test.js —— un
+ * turno de 6 resultados con imagen produce 6 notas positivas y 4 imagenes en files[]. Si
+ * alguien lo arregla, esa prueba falla y hay que reescribirla; es lo que se busca.
+ *
+ * @param {Array<Object>} messages - mensajes en forma Anthropic
+ * @returns {number} indice del primer mensaje del turno en curso (0 si no hay frontera)
+ */
+const currentTurnStartIndex = (messages) => {
+  let scanFrom = messages.length - 1;
+  if (messages[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  for (let i = scanFrom; i >= 0; i--) {
+    const candidate = messages[i];
+    if (candidate?.role !== 'assistant') continue;
+    // Paso intermedio del bucle de herramientas, no frontera. Cortar en «cualquier
+    // assistant» dejaria fuera de la ventana la imagen de un Read seguido de un Bash.
+    if (Array.isArray(candidate.content) && candidate.content.some(b => b?.type === 'tool_use')) continue;
+    return i + 1;
+  }
+  return 0;
+};
+
 const flattenAnthropicMessages = (messages) => {
+  // 本次调用里被丢弃的块类型，用于收尾时一条 WARN（不是每块一条）。
+  const droppedBlockTypes = new Set();
   if (!Array.isArray(messages)) return [];
   const out = [];
+  // Razonamiento pendiente de colgar: {index en `out`, fragmento ya delimitado}.
+  const pendingThinking = [];
+  // Todo lo que este en o despues de este indice pertenece al turno en curso: su medio SI
+  // se sube. Lo anterior no, y la nota tiene que decirlo.
+  const turnStart = currentTurnStartIndex(messages);
 
-  for (const msg of messages) {
+  for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+    const msg = messages[msgIndex];
     if (!msg || typeof msg !== 'object') continue;
     const role = msg.role;
 
@@ -157,13 +451,17 @@ const flattenAnthropicMessages = (messages) => {
 
     if (role === 'assistant') {
       const textParts = [];
+      const thinkingParts = [];
       const toolCalls = [];
       for (const block of msg.content) {
         if (block?.type === 'text' && typeof block.text === 'string') {
           textParts.push(block.text);
+        } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+          const text = thinkingBlockText(block);
+          if (text) thinkingParts.push(text);
         } else if (block?.type === 'tool_use') {
           toolCalls.push({
-            id: block.id || `toolu_${generateUUID().replace(/-/g, '').slice(0, 24)}`,
+            id: block.id || newAnthropicToolUseId(),
             type: 'function',
             function: {
               name: block.name,
@@ -172,13 +470,22 @@ const flattenAnthropicMessages = (messages) => {
           });
         }
       }
+      // El razonamiento NO se cuelga aqui: se apunta y se resuelve al final, cuando ya
+      // se sabe cuanto ocupa el resto de la conversacion y cuanto hueco queda bajo el
+      // umbral de externalizacion (attachRetainedThinking). Colgado va DELANTE del texto
+      // y, tras foldToolMessages, delante de los bloques de llamada: se lee en orden
+      // cronologico penso -> dijo -> llamo. Sin bloques thinking `content` queda byte a
+      // byte como antes.
       const out_msg = { role: 'assistant', content: textParts.join('') };
       if (toolCalls.length > 0) out_msg.tool_calls = toolCalls;
       out.push(out_msg);
+      const renderedThinking = renderThinkingParts(thinkingParts);
+      if (renderedThinking) pendingThinking.push({ index: out.length - 1, text: renderedThinking });
       continue;
     }
 
     // user 角色：tool_result 拆为独立 role=tool 消息，普通文本/图片合并保留
+    const outLenBeforeUserMsg = out.length;
     const collectedTextParts = [];
     const flushCollectedText = () => {
       if (collectedTextParts.length === 0) return;
@@ -188,41 +495,119 @@ const flattenAnthropicMessages = (messages) => {
     for (const block of msg.content) {
       if (block?.type === 'tool_result') {
         flushCollectedText();
-        const resultContent = typeof block.content === 'string'
-          ? block.content
-          : Array.isArray(block.content)
-            ? block.content.filter(b => b?.type === 'text').map(b => b.text || '').join('\n')
-            : JSON.stringify(block.content ?? '');
-        out.push({
+        // Claude Code 的 Read 把图片放在 tool_result.content 里。图片走 media 旁路：
+        // role=tool 的 content 必须是字符串，foldToolMessages 会把非字符串 JSON.stringify
+        // 掉，图片项塞进去就废了。
+        //
+        // El resto del array NO es una lista blanca de dos tipos. Antes lo era —— se
+        // conservaba `text`, se desviaba `image` y TODO lo demas desaparecia sin nota, sin
+        // droppedBlockTypes y sin cabecera de compatibilidad, asi que un resultado con un
+        // solo bloque no-texto se plegaba a `(empty)`. Medido sobre 1.564 sesiones reales
+        // del usuario: 37 resultados eran solo-imagen y 326 eran solo `tool_reference`, o
+        // sea que la forma NO cubierta era 8,8x mas frecuente que la cubierta, y `(empty)`
+        // bajo una leyenda que pide reusar el resultado es el empujon mas fuerte hacia el
+        // duplicado. Ahora la rama es simetrica con la de `image` de nivel superior 20
+        // lineas mas abajo: lo que no sabemos representar se ANUNCIA.
+        const toolResultMedia = [];
+        let resultContent;
+        if (typeof block.content === 'string') {
+          resultContent = block.content;
+        } else if (Array.isArray(block.content)) {
+          const parts = [];
+          for (const b of block.content) {
+            // Mismo criterio literal que antes (`type === 'text'`, valor `b.text || ''`):
+            // un resultado de solo texto se rinde byte a byte igual que siempre.
+            if (b?.type === 'text') { parts.push(b.text || ''); continue; }
+            if (b?.type === 'image') {
+              const item = anthropicImageBlockToItem(b);
+              if (item) { toolResultMedia.push(item); continue; }
+              // source:{type:'file'} o un base64 sin datos. Caia en el `.filter(Boolean)` y
+              // desaparecia en silencio, justo lo que la rama gemela de abajo ya arregla.
+              droppedBlockTypes.add(`image(${b?.source?.type || 'unknown'})`);
+              parts.push(UNSUPPORTED_BLOCK_NOTE('image'));
+              continue;
+            }
+            droppedBlockTypes.add(b?.type || 'unknown');
+            parts.push(UNSUPPORTED_BLOCK_NOTE(b?.type || 'unknown'));
+          }
+          resultContent = parts.join('\n');
+        } else {
+          resultContent = JSON.stringify(block.content ?? '');
+        }
+        const toolMessage = {
           role: 'tool',
           tool_call_id: block.tool_use_id || '',
           content: resultContent
-        });
+        };
+        if (toolResultMedia.length > 0) {
+          // `.media` se pone SIEMPRE, este el resultado en el turno en curso o no: el
+          // barrido de medios de buildInternalRequest es quien decide subirlo, y no se
+          // toca. Lo unico que depende de la posicion es lo que dice el CUERPO.
+          toolMessage.media = toolResultMedia;
+          // Y el cuerpo tiene que DECIRLO. Sin nota resultContent queda '' y
+          // foldToolMessages escribe `(empty)`: «el Read no devolvio nada», con la imagen
+          // viajando sin explicacion en files[]. Con la nota positiva en un resultado de
+          // turno ANTERIOR pasa lo contrario y es peor: el modelo se inventa el contenido
+          // de una imagen que no viaja. Ver toolResultMediaNote (agent-turn.js) para las
+          // dos mediciones contra Qwen real.
+          writeToolResultMediaNote(
+            toolMessage, resultContent, toolResultMedia.length, 'image', msgIndex >= turnStart
+          );
+        }
+        out.push(toolMessage);
       } else if (block?.type === 'text' && typeof block.text === 'string') {
         collectedTextParts.push(block.text);
       } else if (block?.type === 'image') {
         // 透传 image 块给现有 parserMessages 处理（OpenAI image_url 形态）
-        const src = block.source || {};
-        const url = src.type === 'base64' && src.data
-          ? `data:${src.media_type || 'image/png'};base64,${src.data}`
-          : (src.url || '');
-        if (url) {
+        const imageItem = anthropicImageBlockToItem(block);
+        if (!imageItem) {
+          // source:{type:'file', file_id} 是 Anthropic 有文档的形态，我们不支持。
+          // 以前它在这里无声消失，模型对着「一张它从没收到的图」作答。
+          droppedBlockTypes.add(`image(${block?.source?.type || 'unknown'})`);
+          collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE('image'));
+        } else {
           if (collectedTextParts.length > 0) {
             out.push({
               role: 'user',
               content: [
                 { type: 'text', text: collectedTextParts.join('') },
-                { type: 'image_url', image_url: { url } }
+                imageItem
               ]
             });
             collectedTextParts.length = 0;
           } else {
-            out.push({ role: 'user', content: [{ type: 'image_url', image_url: { url } }] });
+            out.push({ role: 'user', content: [imageItem] });
           }
         }
+      } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+        // Se tira A PROPOSITO, y la asimetria con la rama assistant es deliberada:
+        // segun la spec el razonamiento vuelve en turnos de assistant, y ahi si lo
+        // retenemos (es el porque de la llamada). En rol user no hay intencion de
+        // usuario que preservar. Fijado por image-passthrough.test.js:387.
+      } else {
+        // 兜底分支。以前这里什么都没有：document（PDF）、search_result、server_tool_use…
+        // 全部无声消失，模型只收到包围它们的那句话就去回答。
+        droppedBlockTypes.add(block?.type || 'unknown');
+        collectedTextParts.push(UNSUPPORTED_BLOCK_NOTE(block?.type || 'unknown'));
       }
     }
     flushCollectedText();
+    // 整条用户消息一个块都没产出（例如 spec 合法的 content: []）时，绝不能让它凭空消失：
+    // 消息一旦少一条，parserMessages 会把**上一条 assistant** 当成 "# Current message"，
+    // 模型于是对着自己上一轮的回答作答；只有这一条时它直接抛错，被吞掉后上游收到的是
+    // 字面量 '聊天历史处理有误…'。保留一个空位，语义不变而结构完整。
+    if (out.length === outLenBeforeUserMsg) {
+      out.push({ role: 'user', content: '' });
+    }
+  }
+
+  attachRetainedThinking(out, pendingThinking);
+
+  if (droppedBlockTypes.size > 0) {
+    logger.warn(
+      `Anthropic content blocks not forwarded: ${Array.from(droppedBlockTypes).join(', ')}`,
+      'ANTHROPIC'
+    );
   }
 
   return out;
@@ -247,16 +632,140 @@ const buildInternalRequest = async (anthropicReq) => {
 
   // 1. 展开 Anthropic 消息（tool_use/tool_result 折叠由 foldToolMessages 完成）
   let flat = flattenAnthropicMessages(messages);
+  // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
+  const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
+  // El ledger se arma AQUI, antes del barrido de medios y del `delete message.media` que
+  // hay al final: la imagen de un tool_result viaja por el bypass `media` y unas lineas
+  // mas abajo desaparece de `flat`. Construido despues, el ledger no ve nada y renderiza
+  // `-> (empty)` — le dice al modelo que el Read no devolvio nada, justo bajo la leyenda
+  // que le pide reusar el resultado en vez de repetir la llamada; Read es la herramienta
+  // mas repetida de la medicion (802 de 1.451). Gemelo de chat-middleware.js, que por la
+  // misma razon lo arma antes de harvestCurrentTurnMedia (alli la imagen no esta en
+  // `media` sino como item del array de `content`, y la cosecha lo deja en `[]`).
+  //
+  // Sigue siendo PRE-FOLD, que es el otro requisito: despues de foldToolMessages la
+  // llamada ya es texto dentro de un string (`[TOOL CALL #1]`), sin tool_calls ni
+  // tool_call_id que recorrer, y el ledger saldria vacio sin ruido.
+  const toolLedger = hasTools ? buildToolHistoryLedger(flat) : '';
+  // tool_result 里的图片走 media 旁路（见 flattenAnthropicMessages）。只收当前回合的：
+  // 从尾部往回扫到上一条 assistant 为止，正好是「最后一次助手发言之后」的这一轮。
+  // 更早的历史图片不重新附加——那是本 PR 明确排除的范围。
+  const currentTurnMedia = [];
+  let scanFrom = flat.length - 1;
+  // assistant prefill（最后一条就是 assistant）属于当前回合，不是回合边界：
+  // 跳过它再开始找边界，否则同一回合 tool_result 里的图片永远收不到。
+  if (flat[scanFrom]?.role === 'assistant') scanFrom -= 1;
+  const lastFlatIndex = flat.length - 1;
+  // 同一张图会从两条路进来：用户消息的 content[]，以及 tool_result 的 media 旁路
+  // （Claude Code 贴图后又让 Read 读了同一个文件）。按 URL 去重，否则 files[] 里
+  // 会出现两条一模一样的记录 = 两次上传 + 提示词里两张一样的图。
+  //
+  // 种子**只**取最后一条 flat 消息的 content[]，绝不取它的 .media：正常的 Read 回合里
+  // 最后一条就是携带图片的 tool 消息，拿它的 .media 播种会把唯一那份也毙掉，图片直接消失。
+  const seenMediaUrls = new Set();
+  const isFreshMedia = (item) => {
+    const url = item?.image_url?.url;   // anthropicImageBlockToItem 产出的形状
+    if (typeof url !== 'string' || url.length === 0) return true;
+    if (seenMediaUrls.has(url)) return false;
+    seenMediaUrls.add(url);
+    return true;
+  };
+  if (Array.isArray(flat[lastFlatIndex]?.content)) {
+    flat[lastFlatIndex].content.filter(item => item?.type === 'image_url').forEach(isFreshMedia);
+  }
+  for (let i = scanFrom; i >= 0; i--) {
+    const candidate = flat[i];
+    if (candidate?.role === 'assistant') {
+      // 回合边界是**最终答复**，不是任意一条 assistant。工具循环里同一个用户回合会有
+      // 好几条 assistant，每条都带 tool_calls，都是中间步骤。按「任意 assistant」断
+      // （本函数的初版写法）意味着：用户贴的图在**第一次**工具调用就没了，tool_result
+      // 里的图片从第二个 assistant 回合起就没了。
+      //
+      // 2026-09-08 对着真实上游实测（/v1/messages，qwen3.8-max，446 字节品红 PNG）：
+      //   图片在最后一条、无工具        → uploads_delta=1，答 "magenta"
+      //   图片 + 一次 tool round-trip   → uploads_delta=0，答 "no image was provided"
+      //   图片 + 两次 tool round-trip   → uploads_delta=0，同上
+      // 与 chat-helpers.js#harvestCurrentTurnMedia 是孪生体，两边必须一起改。
+      // function_call 在本路径上是死分支（flattenAnthropicMessages 只产出 tool_calls），
+      // 保留它纯粹是为了和孪生体逐字对齐。
+      const midTurnCall = (Array.isArray(candidate.tool_calls) && candidate.tool_calls.length > 0) ||
+        !!candidate.function_call?.name;
+      if (midTurnCall) continue;
+      break;
+    }
+    const fromCandidate = [];
+    // media 旁路故意不加 lastFlatIndex 守卫：最后一条 tool 消息的 content 是字符串，
+    // parserMessages 从它身上一个媒体项也拿不到，单步 Read 回合能通正是靠这个不对称。
+    if (Array.isArray(candidate?.media)) fromCandidate.push(...candidate.media.filter(isFreshMedia));
+    // content[] 里的图片同样只有挂在最后一条消息上才会被上传：parserMessages 的多条分支
+    // 只对 lastMessage 调 normalizeMediaContentItem，更早那些被 extractTextFromContent
+    // 整个抹掉，一行日志都没有。粘贴图片的 Claude Code 正好命中这里——它先发
+    // [text, image]，再补一条只有文本的 meta 消息（`[Image: source: …png]`），
+    // 于是图片永远不是最后一条。最后一条不碰：那条 parserMessages 自己会处理。
+    if (i !== lastFlatIndex && Array.isArray(candidate?.content)) {
+      const carried = candidate.content.filter(item => item?.type === 'image_url');
+      if (carried.length > 0) {
+        // 去重只影响**要不要重新挂上去**；摘除是无条件的。被去重毙掉的那份留在历史正文里
+        // 既进不了上游（历史只保留 text），又白占体积。
+        fromCandidate.push(...carried.filter(isFreshMedia));
+        // 必须从原消息里摘掉：留着的话它既进不了上游（历史正文只保留 text），
+        // 又会和重新挂到最后一条的那份重复。只剩一个文本项时收敛回字符串，
+        // 正是 formatSingleMessage 期待的形状。
+        const rest = candidate.content.filter(item => item?.type !== 'image_url');
+        candidate.content = rest.length === 1 && rest[0]?.type === 'text' && typeof rest[0].text === 'string'
+          ? rest[0].text
+          : rest;
+      }
+    }
+    if (fromCandidate.length > 0) currentTurnMedia.unshift(...fromCandidate);
+    // 与孪生体同一个上限，按项算不按消息算（chat-helpers.js#HARVEST_MEDIA_CAP）。
+    if (currentTurnMedia.length >= HARVEST_MEDIA_CAP) break;
+  }
+  // media 是内部旁路，绝不能进上游请求体。历史消息里的 media 携带完整 base64 data URI，
+  // 目前只是碰巧被 foldToolMessages 丢掉，而它只在带工具时才跑——所以在这里全量清掉。
+  for (const message of flat) {
+    if (message && 'media' in message) delete message.media;
+  }
   const systemText = normalizeAnthropicSystem(system);
 
   // 2. system 文本拼到首条用户消息内容前缀（不要作为独立 system 消息，
   //    否则会被 parserMessages 折叠为 "system:..." 文字前缀污染模型理解）
-  // ponytail: gate on tool_choice !== 'none' to match OpenAI path (chat-middleware.js:7-12)
-  const hasTools = normalizedTools.length > 0 && internalToolChoice !== 'none';
   const toolPrompt = hasTools ? buildToolSystemPrompt(normalizedTools, { tool_choice: internalToolChoice }) : '';
+  // Semilla del ledger de deduplicacion, del MISMO recorrido pre-fold y con los mismos
+  // ordinales que ve el modelo. No suprime nada: marca la llamada como ya ejecutada para
+  // poder registrarla (los tres createToolCallLedger eran por-intento y jamas miraron la
+  // historia). Gemelo de chat-middleware.js#processRequestBody -> req.tool_history_calls.
+  const historyToolCalls = hasTools ? extractHistoryToolCalls(flat) : [];
 
-  if (hasTools) {
+  // La historia se pliega segun lo que CONTIENE, no segun lo que esta peticion declara.
+  // Con el fold detras de `hasTools`, una peticion sin `tools` (o con
+  // `tool_choice: 'none'`) dejaba intacto al assistant que solo lleva `tool_use`: su
+  // `content` es '' y formatSingleMessage (chat-helpers.js) descarta todo mensaje cuyo
+  // texto queda vacio, asi que EL TURNO ENTERO desaparecia de la historia mientras su
+  // `tool_result` sobrevivia como una linea JSONL con el rol inexistente "tool" — el
+  // modelo veia un resultado sin la llamada que lo pidio. La compactacion y el resumen
+  // de Claude Code tienen justo esa forma, y llegan sin `tools`.
+  //
+  // Esto es RENDERIZADO, no protocolo: el prompt de herramientas, el ledger y la
+  // directiva de turno siguen atados a `hasTools` (arriba y en el paso 5). Una peticion
+  // sin herramientas recupera su historia legible sin aprender a llamarlas.
+  //
+  // El criterio se importa de chat-helpers.js#willBeFolded en vez de reescribirlo: esa
+  // funcion ya existe para el barrido de medios y su contrato es "¿foldToolMessages
+  // reescribe este mensaje?", alineado literal con las dos ramas del fold.
+  if (hasTools || flat.some(willBeFolded)) {
     flat = foldToolMessages(flat);
+  }
+
+  // 折叠之后再挂图片：parserMessages 只处理最后一条消息里的媒体，挂在这里的图片
+  // 才会被上传，而工具结果正文仍然留在 "# Current message" 里（agent 回合语义不变）。
+  if (currentTurnMedia.length > 0 && flat.length > 0) {
+    const lastFlat = flat[flat.length - 1];
+    if (typeof lastFlat.content === 'string') {
+      lastFlat.content = [{ type: 'text', text: lastFlat.content }, ...currentTurnMedia];
+    } else if (Array.isArray(lastFlat.content)) {
+      lastFlat.content = [...lastFlat.content, ...currentTurnMedia];
+    }
   }
 
   // 3. 走现有 parserMessages 复用图片上传与 thinking 配置
@@ -267,7 +776,38 @@ const buildInternalRequest = async (anthropicReq) => {
   const parsedModel = await parserModel(model);
 
   // 4. 合并 system 文本与工具提示词到最终用户消息开头
-  const prefixParts = [systemText, toolPrompt].filter(Boolean);
+  // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El ledger
+  // va pegado al protocolo porque es parte del contrato de herramientas (sin el protocolo
+  // delante seria una lista de ordinales sueltos), y delante de la historia que documenta.
+  // Vive en el prefijo, fuera del bloque de historia: ahi dentro el contrapeso se
+  // recortaria justo en las conversaciones largas, que son las que repiten llamadas.
+  //
+  // Estar en el prefijo NO lo pone a salvo, y creer que si costo una version entera de
+  // esto. En una peticion externalizada (>90 KiB) el prefijo se retiene inline RECORTADO
+  // por cabeza y cola, y el bloque —que va del mas nuevo al mas viejo— perdia sus entradas
+  // NUEVAS en el hueco compactado. Por eso buildBudgetedAgentPrompt (utils/request.js) lo
+  // separa del prefijo y lo recorta aparte, por renglones. Ese corte se hace reconociendo
+  // las dos primeras lineas del bloque mas un renglon de entrada: si esta linea deja de
+  // poner el ledger AL FINAL del prefijo, alli hay que mirar.
+  //
+  // El sobre de turno se aplica ANTES del prefijo, igual que en el gemelo OpenAI
+  // (chat-middleware.js#processRequestBody). Al reves —que era como estaba— una peticion
+  // cuya historia entra en un solo mensaje no lleva el marcador `# Conversation history
+  // (JSONL)`, asi que ensureAgentCurrentEnvelope no cortocircuita y JSON-escapa el
+  // prefijo ENTERO (protocolo de herramientas + ledger) dentro de `# Current message`:
+  // el modelo recibe su contrato como `\n` literales dentro de un string, y el orden
+  // documentado (toolPrompt -> ledger -> envelope -> directive) queda invertido. Se
+  // alcanza con una peticion de UN mensaje; no hace falta ningun cambio futuro. Con
+  // historia el resultado es identico byte a byte: el marcador ya esta ahi y wrap()
+  // devuelve el texto tal cual.
+  if (hasTools && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
+    const lastForEnvelope = parsedMessages[parsedMessages.length - 1];
+    lastForEnvelope.content = ensureAgentCurrentEnvelope(
+      lastForEnvelope.content,
+      lastForEnvelope.role || 'user'
+    );
+  }
+  const prefixParts = [systemText, toolPrompt, toolLedger].filter(Boolean);
   if (prefixParts.length > 0 && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
     const prefix = prefixParts.join('\n\n');
     const last = parsedMessages[parsedMessages.length - 1];
@@ -291,9 +831,7 @@ const buildInternalRequest = async (anthropicReq) => {
   // 5. Agent-loop injections (match OpenAI path ordering: envelope → prefix → directive)
   if (hasTools && Array.isArray(parsedMessages) && parsedMessages.length > 0) {
     const last = parsedMessages[parsedMessages.length - 1];
-    const role = last.role || 'user';
-    // Wrap content with # Current message marker so upstream distinguishes turn from history
-    last.content = ensureAgentCurrentEnvelope(last.content, role);
+    // El sobre `# Current message` ya se aplico arriba, antes del prefijo (ver alli).
     // Append agent-turn directive after full content assembly
     const directive = buildAgentTurnDirective({ afterToolResult });
     if (typeof last.content === 'string') {
@@ -315,6 +853,9 @@ const buildInternalRequest = async (anthropicReq) => {
   const lastParsed = Array.isArray(parsedMessages) && parsedMessages.length > 0
     ? parsedMessages[parsedMessages.length - 1]
     : { role: 'user', content: '' };
+  // 媒体从 content[] 换到 files[]：content[] 带图 + files[] 带外置上下文文档的组合
+  // 会让上游 500（详见 extractMediaToFiles）。无媒体时原样返回，请求体逐字节不变。
+  const { content: envelopeContent, files: envelopeFiles } = extractMediaToFiles(lastParsed.content || '');
 
   const envelopeMessage = {
     id: null,
@@ -323,9 +864,9 @@ const buildInternalRequest = async (anthropicReq) => {
     parent_id: null,
     childrenIds: [generateUUID()],
     role: lastParsed.role || 'user',
-    content: lastParsed.content || '',
+    content: envelopeContent,
     user_action: 'chat',
-    files: [],
+    files: envelopeFiles,
     timestamp: now,
     models: [parsedModel],
     model: '',
@@ -387,14 +928,28 @@ const buildInternalRequest = async (anthropicReq) => {
     toolSchemas[name] = tool.function.parameters;
   }
 
+  // Clave de sesion para reutilizar el prefijo de historial ya subido a Qwen
+  // (utils/context-prefix-cache.js). Claude Code mete su session id en metadata.user_id;
+  // su auto-compact reescribe messages[0] y con ello la clave, y la entrada vieja muere
+  // por TTL. Sin user_id no hay clave y todo sigue como antes.
+  const contextPrefixKey = buildContextPrefixKey({
+    userId: anthropicReq.metadata?.user_id,
+    model,
+    system,
+    tools,
+    firstMessage: Array.isArray(messages) ? messages[0] : null
+  });
+
   return {
     body,
     hasTools,
+    historyToolCalls,
     toolChoice: internalToolChoice,
     allowedToolNames: normalizedTools.map(tool => tool.function.name).filter(Boolean),
     toolSchemas,
     enable_thinking: thinkingCfg.thinking_enabled,
-    model: parsedModel
+    model: parsedModel,
+    contextPrefixKey
   };
 };
 
@@ -669,7 +1224,8 @@ const runWithAnthropicPing = async (res, work, intervalMs) => {
 const handleAnthropicStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
+    upstreamOptions = {}
   } = ctx;
 
   res.set({
@@ -794,7 +1350,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     attemptThinkText = '';
     attemptThinkEvidence = false;
     suppressPostToolUseOutput = false;
-    admitToolCall = createToolCallLedger();
+    // Sembrado con la historia: una llamada ya ejecutada se emite igual (releer tras un
+    // edit es correcto) y solo deja un warn. La supresion sigue siendo por-attempt.
+    admitToolCall = createToolCallLedger({ seed: historyToolCalls });
     hasEmittedToolCalls = false;
     nativeThinkEvidence = false;
     stopRequested = false;
@@ -913,7 +1471,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     writeAnthropicEvent(res, 'content_block_start', {
       type: 'content_block_start',
       index: blockIndex,
-      content_block: { type: 'tool_use', id: call.id, name: call.function.name, input: {} }
+      content_block: {
+        type: 'tool_use',
+        id: toAnthropicToolUseId(call.id),
+        name: call.function.name,
+        input: {}
+      }
     });
     const args = call.function.arguments || '{}';
     for (const piece of sliceArgsJson(args)) {
@@ -1306,7 +1869,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     let retryResp = null;
     try {
       await runWithAnthropicPing(res, async () => {
-        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)));
+        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)), upstreamOptions);
       });
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
@@ -1468,7 +2031,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 const handleAnthropicNonStream = async (res, ctx, upstream) => {
   const {
     message_id, model, hasTools, toolChoice, requestBody, allowedToolNames = [],
-    toolSchemas = null, sendRequest = sendChatRequest
+    toolSchemas = null, sendRequest = sendChatRequest, historyToolCalls = [],
+    upstreamOptions = {}
   } = ctx;
 
   let thinkingContent = '';
@@ -1678,7 +2242,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   };
   // 跨通道去重登记簿替代原来的 concat：同名同参数只留先到的（原生在前 —— 它先关闭）。
   const mergeToolCalls = (native, parsed) => {
-    const admit = createToolCallLedger();
+    // Misma semilla que la rama de streaming: informa, no suprime.
+    const admit = createToolCallLedger({ seed: historyToolCalls });
     return [...native, ...parsed]
       .filter(call => {
         if (admit(call)) return true;
@@ -1853,7 +2418,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
     let retryResp;
     try {
-      retryResp = await sendRequest(appendRetryHint(requestBody, hint));
+      retryResp = await sendRequest(appendRetryHint(requestBody, hint), upstreamOptions);
     } catch (e) {
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
@@ -2029,7 +2594,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     try { input = JSON.parse(call.function.arguments || '{}'); } catch (_) { input = {}; }
     contentBlocks.push({
       type: 'tool_use',
-      id: call.id,
+      id: toAnthropicToolUseId(call.id),
       name: call.function.name,
       input
     });
@@ -2065,6 +2630,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
  * @param {object} res - Express 响应
  */
 const handleAnthropicMessages = async (req, res) => {
+  // Fuera del try a proposito: el catch necesita saber QUE cuenta sirvio la peticion para
+  // poder sacarla de la rotacion cuando el fallo es "sin cuota". Dentro del bloque no la ve.
+  let currentAccount = null;
+  // Tambien fuera: el catch decide si olvidar un prefijo de historial reutilizado.
+  let upstreamResp = null;
+  let contextPrefixKey = null;
   try {
     const compatibility = analyzeAnthropicCompatibility(req.body || {});
     const compatibilityHeaders = buildAnthropicCompatibilityHeaders(compatibility);
@@ -2077,9 +2648,17 @@ const handleAnthropicMessages = async (req, res) => {
     }
 
     const built = await buildInternalRequest(req.body || {});
-    const { body, hasTools, toolChoice, allowedToolNames, toolSchemas, model } = built;
+    const { body, hasTools, historyToolCalls, toolChoice, allowedToolNames, toolSchemas, model } = built;
+    contextPrefixKey = built.contextPrefixKey || null;
 
-    const upstreamResp = await sendChatRequest(body);
+    // Sin tools el contexto puede compactarse si el adjunto falla; con tools NO: un agente
+    // que ve una fraccion del historial repite lo hecho, asi que sale 529 reintentable.
+    // Las MISMAS opciones viajan en los reenvios de correccion (ctx.upstreamOptions): con
+    // la clave de sesion el reintento reutiliza el prefijo de historial ya subido en vez
+    // de subir y parsear el historial entero otra vez (hasta 3 parses por turno HTTP).
+    const upstreamOptions = { allowContextCompaction: !hasTools, contextPrefixKey };
+    upstreamResp = await sendChatRequest(body, upstreamOptions);
+    currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
       return res.status(500).json({
         type: 'error',
@@ -2087,16 +2666,26 @@ const handleAnthropicMessages = async (req, res) => {
       });
     }
 
+    // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
+    // del adjunto deja pasar un 200 con una fracción del contexto original: sin esta
+    // cabecera el cliente cree que el modelo lo vio todo. Convención existente:
+    // anthropic.compatibility.js#X-Qwen2API-Anthropic-Warnings.
+    if (upstreamResp.contextCompacted) {
+      res.set('X-Qwen2API-Context-Compacted', String(upstreamResp.contextSerializedBytes || 0));
+    }
+
     const message_id = `msg_${generateUUID().replace(/-/g, '').slice(0, 24)}`;
     const ctx = {
       message_id,
       model,
       hasTools,
+      historyToolCalls,
       toolChoice,
       allowedToolNames,
       toolSchemas,
       requestBody: body,
-      currentAccount: upstreamResp.currentAccount
+      currentAccount,
+      upstreamOptions
     };
 
     if (req.body?.stream) {
@@ -2106,14 +2695,36 @@ const handleAnthropicMessages = async (req, res) => {
     }
   } catch (error) {
     logger.error('Anthropic Messages 处理错误', 'ANTHROPIC', '', error);
+    // La cuota diaria agotada es 429 `rate_limit_error`, como la API nativa — no un 500
+    // `api_error`. Gemelo: chat.js#writeOpenAIHttpError. La deteccion es unica
+    // (utils/upstream-error.js#describeUpstreamFailure); aqui solo se traduce al cable.
+    const failure = describeUpstreamFailure(error, 500);
+    const errorType = failure.rateLimited
+      ? RATE_LIMIT_ANTHROPIC_TYPE
+      : (failure.overloaded ? 'overloaded_error' : 'api_error');
+    // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
+    // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
+    noteRateLimitedAccount(error, currentAccount);
+    // Un prefijo de historial reutilizado pudo ser la causa (file_id que Qwen ya no
+    // reconoce): se olvida y el reintento del cliente hornea uno nuevo. Un 529 por
+    // ContextExternalizationError nunca llega aqui con contextPrefixReused.
+    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError) {
+      invalidateContextPrefix(contextPrefixKey);
+    }
     if (!res.headersSent) {
-      res.status(500).json({
+      // Retry-After solo con una espera que mando el upstream de verdad.
+      if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
+      res.status(failure.status).json({
         type: 'error',
-        error: { type: 'api_error', message: error.publicMessage || 'Service error' }
+        error: { type: errorType, message: error.publicMessage || 'Service error' }
       });
     } else {
+      // A media transmision el status ya no se puede cambiar: el `type` del evento es el
+      // unico canal que le queda al cliente para distinguir cuota de averia.
       if (!res.writableEnded) {
-        try { writeAnthropicError(res, error.publicMessage || '上游响应处理失败', 'api_error'); } catch (_) { /* ignore */ }
+        try {
+          writeAnthropicError(res, error.publicMessage || '上游响应处理失败', errorType, failure.retryAfter);
+        } catch (_) { /* ignore */ }
       }
     }
   }
@@ -2125,6 +2736,7 @@ module.exports = {
   buildAnthropicCompatibilityHeaders,
   // 暴露内部辅助以便测试
   flattenAnthropicMessages,
+  buildInternalRequest,
   normalizeAnthropicTools,
   normalizeAnthropicToolChoice,
   normalizeAnthropicSystem,

@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node src/start.js",
     "dev": "nodemon src/server.js",
-    "test": "node --test --test-force-exit tests/*.test.js",
+    "test": "node tools/test-gate.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "pm2": "pm2 start ecosystem.config.js",
@@ -18,7 +18,9 @@
     "pm2:delete": "pm2 delete qwen2api",
     "pm2:logs": "pm2 logs qwen2api",
     "pm2:status": "pm2 status",
-    "pm2:monit": "pm2 monit"
+    "pm2:monit": "pm2 monit",
+    "test:raw": "node --test --test-force-exit tests/*.test.js",
+    "test:bless": "node tools/test-gate.js --bless"
   },
   "keywords": [],
   "author": "",

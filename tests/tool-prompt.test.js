@@ -47,7 +47,10 @@ test('empty tool results remain visible in Agent history', () => {
     { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', function: { name: 'read_file', arguments: '{}' } }] },
     { role: 'tool', tool_call_id: 'call_1', content: '' }
   ])
-  assert.match(folded[1].content, /^\[TOOL RESULT: read_file\]\nnull\n\[END TOOL RESULT\]$/)
+  // El bloque sigue visible (ese es el pin). El cuerpo dice `(empty)` y ya no `null`:
+  // la herramienta corrio y devolvio nada, no devolvio JSON null. La distincion
+  // empty-vs-null se pincha en anthropic-native-parity.test.js.
+  assert.match(folded[1].content, /^\[TOOL RESULT #1: read_file\]\n\(empty\)\n\[END TOOL RESULT\]$/)
 })
 
 test('legacy function_call and function result messages remain executable history', () => {
@@ -56,7 +59,7 @@ test('legacy function_call and function result messages remain executable histor
     { role: 'function', name: 'read_file', content: 'file body' }
   ])
   assert.equal(folded[0].role, 'assistant')
-  assert.match(folded[0].content, /\[TOOL CALL\]/)
+  assert.match(folded[0].content, /\[TOOL CALL #1\]/)
   assert.match(folded[0].content, /"name":"read_file"/)
   assert.equal(folded[1].role, 'user')
   assert.match(folded[1].content, /^\[TOOL RESULT: read_file\]\n/)
@@ -543,7 +546,9 @@ test('tolerant tags: history is still written in the canonical form', () => {
       tool_calls: [{ id: 'c1', function: { name: 'read_file', arguments: '{"path":"a"}' } }]
     }
   ])
-  assert.match(folded[0].content, /^\[TOOL CALL\]\n/)
+  // El ordinal solo existe en la historia foldeada (ver tool-correlation.test.js):
+  // el marcador que el prompt le pide EMITIR al modelo sigue sin numero.
+  assert.match(folded[0].content, /^\[TOOL CALL #1\]\n/)
   assert.match(folded[0].content, /\n\[END TOOL CALL\]$/)
   // La forma nativa nunca se reescribe: cada aparicion en la historia re-sembraria
   // el formato que la plataforma intercepta.
@@ -1862,7 +1867,10 @@ const callShape = (calls) => calls.map(c => [c.function.name, JSON.parse(c.funct
 // tal cual: ninguna de las dos vias puede esconder un closer que la otra deja visible
 // (review loop 2: el strip incondicional enmascaraba closers doblados que solo streaming
 // dejaba en el wire).
-const ORPHAN_BRACKET_CLOSER_RE = /\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}[ \t\r\n]{0,4}\]/i
+// El brazo del ordinal (` #3`) es el mismo que TOOL_CALL_CLOSE_BRACKET_RE: la historia
+// foldeada ensena `[TOOL CALL #n]` y el modelo espeja `[END TOOL CALL #n]`. Si este
+// mirror no lo lleva, assertParity deja de reconocer ese closer como span pelado.
+const ORPHAN_BRACKET_CLOSER_RE = /\[[ \t]{0,4}(?:END[ \t_-]{1,2}|\/[ \t]{0,4})TOOL[ \t_-]{1,2}CALLs?[^\s[\]]{0,16}(?:[ \t]{0,4}#[ \t]{0,2}\d{1,6})?[ \t\r\n]{0,4}\]/i
 const BARE_CLOSER_SPAN_RE = new RegExp(`^${ORPHAN_BRACKET_CLOSER_RE.source}$`, 'i')
 
 /**
@@ -2312,13 +2320,26 @@ test('loop 2 (P6): closer DOBLADO tras un rechazo duro en primer contenido se co
   assert.equal(wholeCanonical.errors[0]?.type, 'unknown_tool')
   assert.equal(stripToolCallResidue(wholeCanonical.cleanedText, wholeCanonical.residueSpans).trim(), '')
   assert.doesNotMatch(streamChunked(canonical, NARRATED_OPTS, 9).visible, /\[END/)
+  // Mismo par, con el ordinal que la historia foldeada ensena (`[TOOL CALL #n]`): el
+  // modelo espeja el numero tambien en el cierre. Antes del brazo del ordinal el espacio
+  // previo al '#' hacia que el closer no se reconociera y llegara al cliente.
+  const numbered = '[TOOL CALL #2]{"name":"NotATool","arguments":{}}[END TOOL CALL #2]\n[END TOOL CALL #2]'
+  const wholeNumbered = assertParity(numbered, NARRATED_OPTS, 'loop2 hard reject doubled (numerado)')
+  assert.equal(wholeNumbered.errors[0]?.type, 'unknown_tool')
+  assert.equal(stripToolCallResidue(wholeNumbered.cleanedText, wholeNumbered.residueSpans).trim(), '')
+  assert.doesNotMatch(streamChunked(numbered, NARRATED_OPTS, 9).visible, /\[END/)
 })
 
 test('loop 2 (P8): closer doblado tras un trigger despues de prosa — filas 1/5/6 — se consume en ambas vias', () => {
   const rows = [
     ['fila 1', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', NARRATED_OPTS, 1],
     ['fila 5', 'Note:\n[TOOL CALL]{"name":"Bash","arguments":{}}[END TOOL CALL]\n[END TOOL CALL]', NARRATED_OPTS, 0],
-    ['fila 6', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', { allowedToolNames: NARRATED_ALLOWED }, 0]
+    ['fila 6', 'Let me check.\n[TOOL CALL]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL]\n[END TOOL CALL]', { allowedToolNames: NARRATED_ALLOWED }, 0],
+    // Las mismas tres filas con el ordinal espejado en AMBOS marcadores: es la forma que
+    // el modelo lee en cada vuelta desde que foldToolMessages numera la historia.
+    ['fila 1 #n', 'Let me check.\n[TOOL CALL #1]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL #1]\n[END TOOL CALL #1]', NARRATED_OPTS, 1],
+    ['fila 5 #n', 'Note:\n[TOOL CALL #4]{"name":"Bash","arguments":{}}[END TOOL CALL #4]\n[END TOOL CALL #4]', NARRATED_OPTS, 0],
+    ['fila 6 #n', 'Let me check.\n[TOOL CALL #9]{"name":"Read","arguments":{"file_path":"a"}}[END TOOL CALL #9]\n[END TOOL CALL #9]', { allowedToolNames: NARRATED_ALLOWED }, 0]
   ]
   for (const [row, text, options, calls] of rows) {
     const whole = assertParity(text, options, `loop2 doubled ${row}`)
@@ -2462,4 +2483,50 @@ test('loop 2 (P16): nombre en la cola del trigger tras prosa → una Read con {"
   const bad = assertParity('Some prose.\n[TOOL_CALL]NotATool{"file_path":"a"}[END TOOL CALL]', NARRATED_OPTS, 'loop2 bad name hint after prose')
   assert.equal(bad.toolCalls.length, 0)
   assert.equal(bad.errors.length, 0, 'tras prosa jamas error')
+})
+
+
+// ---- cierre truncado al final del stream (residuo [END… que además se comia una llamada) ----
+const CLOSER_CALL = '[TOOL CALL]\n{"name":"Bash","arguments":{"command":"ls"}}\n'
+const parseCloser = (text) => parseToolCallsFromText(text, { allowedToolNames: ['Bash', 'Read'] })
+
+test('cierre truncado: se traga medio [END TOOL CALL] en vez de soltarlo como prosa', () => {
+  for (const tail of ['[E', '[END', '[END TOOL', '[END TOOL C', '[END TOOL CAL']) {
+    const r = parseCloser(CLOSER_CALL + tail)
+    assert.deepEqual(r.toolCalls.map(c => c.function.name), ['Bash'], `tail ${JSON.stringify(tail)}`)
+    assert.equal(r.cleanedText.trim(), '', `tail ${JSON.stringify(tail)} solto prosa`)
+  }
+})
+
+test('cierre truncado: un "[" solo sigue siendo prosa — es genuinamente ambiguo', () => {
+  const r = parseCloser(CLOSER_CALL + '[')
+  assert.deepEqual(r.toolCalls.map(c => c.function.name), ['Bash'])
+  assert.equal(r.cleanedText.trim(), '[')
+})
+
+test('cierre truncado: nunca se come prosa real que solo se parece a un cierre', () => {
+  for (const tail of ['[END]', '[ENDING the run]', '[NOTE] done', 'END']) {
+    const r = parseCloser(CLOSER_CALL + tail)
+    assert.ok(r.cleanedText.includes(tail), `tail ${JSON.stringify(tail)} se lo comio: ${JSON.stringify(r.cleanedText)}`)
+  }
+})
+
+test('cierre truncado: ya no bloquea la llamada que viene detras', () => {
+  // El "\n[END " que se soltaba hacia que el siguiente [TOOL CALL] no pasara la puerta
+  // de "el trigger debe ser el primer contenido", perdiendo una llamada real en silencio.
+  const r = parseCloser(CLOSER_CALL + '[END TOOL C\n[TOOL CALL]\n{"name":"Read","arguments":{"path":"a"}}\n[END TOOL CALL]')
+  assert.ok(r.toolCalls.map(c => c.function.name).includes('Bash'))
+})
+
+test('Agent tool prompt names the absent platform tools so the model does not call them', () => {
+  // 5 turnos en 30 min (2026-09-09) entregados a medias porque el modelo invoco
+  // code_interpreter / web_search, que existen en el chat de Qwen pero no aqui.
+  const schema = { type: 'object', properties: {} }
+  const prompt = buildToolSystemPrompt([{ type: 'function', function: { name: 'read_file', parameters: schema } }])
+  assert.match(prompt, /`code_interpreter`, `web_search`[^\n]*NOT available; never call them/)
+
+  // Un web_search declarado por el cliente es legitimo: no se veta.
+  const withSearch = buildToolSystemPrompt([{ type: 'function', function: { name: 'web_search', parameters: schema } }])
+  assert.match(withSearch, /`code_interpreter`[^\n]*NOT available/)
+  assert.doesNotMatch(withSearch, /`web_search`[^\n]*NOT available/)
 })

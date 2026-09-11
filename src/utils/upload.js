@@ -5,6 +5,7 @@ const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
 const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
 const { buildRequestHeaders } = require('./header-profile')
+const config = require('../config/index.js')
 
 // 配置常量
 const UPLOAD_CONFIG = {
@@ -322,6 +323,48 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
  * @param {Object} [account]
  * @param {Object} [options]
  */
+/**
+ * 解析服务整体故障的信号。Qwen 挂掉时仍回 HTTP 200，但 body 是
+ * `{"success":false,"data":{"code":"Internal_Server_Error"}}`（status 接口）或
+ * `{"success":true,"data":{"code":"Internal_Server_Error"}}`（parse 接口），没有任何
+ * 按文件的 status。下面的轮询把它当成「还没好」：30 次 × 500 ms = 15 s，然后报一个
+ * 并非超时的「解析超时」。实测 2026-09-09 21:25 起 22/22 次都是这个形状。
+ * @param {import('axios').AxiosResponse} response
+ * @returns {string|null} 故障码；正常或未知时为 null
+ */
+/**
+ * Segunda forma, medida en vivo 2026-09-10 04:29-04:54 con un probe desde el VPS:
+ * getstsToken y OSS van bien, pero POST /api/v2/files/parse contesta HTTP 200 con la
+ * pagina `aliyun_waf_captcha` (16 KiB de HTML, `<meta name="aliyun_waf_captcha">`).
+ * axios entrega el HTML como string; para el parser JSON de arriba era "sin codigo",
+ * asi que se hacian 30 sondeos y luego un "解析超时" que tampoco era timeout.
+ */
+const WAF_CAPTCHA_CODE = 'WAF_CAPTCHA'
+const WAF_BODY_RE = /aliyun_waf|AliyunCaptcha|<!doctype html|<html[\s>]/i
+
+const parseServiceFailureCode = (response) => {
+    const body = response?.data
+    const contentType = String(response?.headers?.['content-type'] || '')
+    if (typeof body === 'string') {
+        if (/text\/html/i.test(contentType) || WAF_BODY_RE.test(body.slice(0, 4096))) return WAF_CAPTCHA_CODE
+        return 'non_json_body'
+    }
+    if (!body || typeof body !== 'object') return null
+    const code = body.data && typeof body.data === 'object' ? body.data.code : undefined
+    if (body.success === false) return String(code || body.code || body.message || 'unknown')
+    if (typeof code === 'string' && /error|fail/i.test(code)) return code
+    return null
+}
+
+const throwIfParseServiceFailed = (response, fileId) => {
+    const code = parseServiceFailureCode(response)
+    if (code === null) return
+    const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId})`)
+    error.code = code === WAF_CAPTCHA_CODE ? 'qwen_parse_waf_challenge' : 'qwen_parse_unavailable'
+    error.parseCode = code
+    throw error
+}
+
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
 
@@ -331,16 +374,19 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)
 
-    await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+    const parseResponse = await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
+    throwIfParseServiceFailed(parseResponse, fileId)
 
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 30)
     const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
+    let lastStatus = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const response = await axios.post(
             `${baseUrl}/api/v2/files/parse/status`,
             { file_id_list: [fileId] },
             requestConfig
         )
+        throwIfParseServiceFailed(response, fileId)
         const payload = unwrapApiData(response)
         const records = Array.isArray(payload) ? payload : (payload?.list || payload?.items || [])
         const record = records.find(item => item?.file_id === fileId) || records[0]
@@ -350,10 +396,11 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         if (status === 'failed' || status === 'error') {
             throw new Error(record?.error_msg || record?.message || 'Qwen 文档解析失败')
         }
+        if (status) lastStatus = status
         if (attempt < maxAttempts) await delay(intervalMs)
     }
 
-    throw new Error(`Qwen 文档解析超时: ${fileId}`)
+    throw new Error(`Qwen 文档解析超时: ${fileId} (last status="${lastStatus || 'none'}")`)
 }
 
 /**
@@ -400,12 +447,110 @@ const buildChatFileDescriptor = ({ fileId, fileUrl, filename, size }) => {
 /**
  * 上传并解析 Agent 长上下文，返回可直接放入 message.files 的描述符。
  */
+/**
+ * Cortacircuitos del parse. Con el WAF desafiando /files/parse cada intento cuesta un
+ * upload a OSS + un parse (~2-3 s) y otra pagina captcha contra la cuenta, y el cliente
+ * agentico vuelve cada Retry-After: 20 turnos en 5 min el 2026-09-10 04:32-04:37 (prod y
+ * qwen-next, identico), 0 respuestas utiles. Tras PARSE_BREAKER_STRIKES desafios seguidos
+ * se deja de subir durante `agentParseBreakerSeconds`; el 529 sale al instante con ese
+ * tiempo en Retry-After y el primer parse bueno lo cierra. No es evasion del WAF: es
+ * dejar de golpearlo.
+ */
+// Reloj inyectable: breaker y limitador comparten la fuente de tiempo para que los
+// tests avancen la ventana sin dormir.
+let parseClock = () => Date.now()
+const nowMs = () => parseClock()
+const setParseClockForTests = (fn) => { parseClock = typeof fn === 'function' ? fn : () => Date.now() }
+
+const PARSE_BREAKER_STRIKES = 3
+const parseBreaker = { strikes: 0, openUntil: 0 }
+
+const parseBreakerRemainingSeconds = () => Math.max(0, Math.ceil((parseBreaker.openUntil - nowMs()) / 1000))
+
+const resetParseBreaker = () => {
+    parseBreaker.strikes = 0
+    parseBreaker.openUntil = 0
+}
+
+/** @param {Error|null} error - null cuando el parse termino bien */
+const noteParseOutcome = (error) => {
+    if (!error) {
+        resetParseBreaker()
+        return
+    }
+    if (error.code !== 'qwen_parse_waf_challenge') return
+    parseBreaker.strikes += 1
+    const cooldownSeconds = Math.max(0, Number(config.agentParseBreakerSeconds) || 0)
+    if (cooldownSeconds > 0 && parseBreaker.strikes >= PARSE_BREAKER_STRIKES) {
+        parseBreaker.openUntil = nowMs() + cooldownSeconds * 1000
+        error.retryAfterSeconds = cooldownSeconds
+        logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传`, 'UPLOAD')
+    }
+}
+
+const assertParseBreakerClosed = () => {
+    const remaining = parseBreakerRemainingSeconds()
+    if (remaining <= 0) return
+    const error = new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (breaker open, ${remaining}s left, upload skipped)`)
+    error.code = 'qwen_parse_waf_challenge'
+    error.parseCode = WAF_CAPTCHA_CODE
+    error.retryAfterSeconds = remaining
+    error.breakerOpen = true
+    throw error
+}
+
+/**
+ * Limitador de ritmo del parse. El WAF de Aliyun cuenta POST /files/parse por IP de
+ * origen: el 2026-09-10 12:28-12:31 diez upload+parse en 150 s (un turno de Claude Code
+ * cada ~15 s, 120-195 KB cada uno) bastaron para que empezara a desafiar; ~1/hora nunca
+ * lo hace. El breaker solo reacciona DESPUES del desafio y luego bloquea 300 s. Aqui se
+ * reserva un hueco ANTES de tocar STS/OSS/parse: sin hueco, 529 inmediato con Retry-After
+ * corto (5-20 s) y el cliente agentico se autorregula. Los intentos limitados no llegan
+ * al WAF, asi que no cuentan como strike. `agentParseMaxPerWindow` = 0 lo desactiva.
+ */
+const PARSE_RATE_LIMITED_CODE = 'PARSE_RATE_LIMITED'
+const PARSE_RATE_RETRY_MIN_SECONDS = 5
+const PARSE_RATE_RETRY_MAX_SECONDS = 20
+const parseWindow = []
+
+const resetParseRateLimiter = () => { parseWindow.length = 0 }
+
+const takeParseSlot = () => {
+    const max = Math.max(0, parseInt(config.agentParseMaxPerWindow, 10) || 0)
+    if (max <= 0) return
+    const windowSeconds = Math.max(1, parseInt(config.agentParseWindowSeconds, 10) || 120)
+    const windowMs = windowSeconds * 1000
+    const now = nowMs()
+    while (parseWindow.length > 0 && parseWindow[0] <= now - windowMs) parseWindow.shift()
+    if (parseWindow.length < max) {
+        parseWindow.push(now)
+        return
+    }
+    const untilFree = Math.ceil((parseWindow[0] + windowMs - now) / 1000)
+    const retryAfter = Math.min(PARSE_RATE_RETRY_MAX_SECONDS, Math.max(PARSE_RATE_RETRY_MIN_SECONDS, untilFree))
+    logger.warn(`Agent 上下文解析已达速率上限 (${max}/${windowSeconds}s)，${retryAfter}s 后重试`, 'UPLOAD')
+    const error = new Error(`Qwen 文档解析服务失败: ${PARSE_RATE_LIMITED_CODE} (${max}/${windowSeconds}s reached, upload skipped)`)
+    error.code = 'qwen_parse_rate_limited'
+    error.parseCode = PARSE_RATE_LIMITED_CODE
+    error.retryAfterSeconds = retryAfter
+    error.breakerOpen = false
+    throw error
+}
+
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
     if (content.length === 0) throw new Error('Agent 上下文为空')
+    assertParseBreakerClosed()
+    takeParseSlot()
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
-    await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    try {
+        await parseUploadedTextFile(uploaded.file_id, authToken, account, options)
+    } catch (error) {
+        noteParseOutcome(error)
+        throw error
+    }
+    noteParseOutcome(null)
     return buildChatFileDescriptor({
         fileId: uploaded.file_id,
         fileUrl: uploaded.file_url,
@@ -420,5 +565,11 @@ module.exports = {
     uploadFileToQwenOss,
     parseUploadedTextFile,
     buildChatFileDescriptor,
-    uploadAgentContextFile
+    uploadAgentContextFile,
+    resetParseBreaker,
+    noteParseOutcome,
+    assertParseBreakerClosed,
+    takeParseSlot,
+    resetParseRateLimiter,
+    setParseClockForTests
 }

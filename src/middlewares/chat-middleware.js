@@ -1,7 +1,7 @@
 const { generateUUID } = require('../utils/tools.js')
-const { isChatType, isThinkingEnabled, parserModel, parserMessages } = require('../utils/chat-helpers.js')
+const { isChatType, isThinkingEnabled, parserModel, parserMessages, extractMediaToFiles, harvestCurrentTurnMedia, attachMediaToLastMessage, willBeFolded } = require('../utils/chat-helpers.js')
 const { buildToolSystemPrompt, foldToolMessages } = require('../utils/tool-prompt.js')
-const { buildAgentTurnDirective } = require('../utils/agent-turn.js')
+const { buildAgentTurnDirective, buildToolHistoryLedger, extractHistoryToolCalls } = require('../utils/agent-turn.js')
 const { logger } = require('../utils/logger')
 const { mapIncomingModel } = require('../utils/model-map.js')
 
@@ -11,6 +11,8 @@ const shouldEnableToolRuntime = (tools, chatType, toolChoice) => (
   chatType === 't2t' &&
   toolChoice !== 'none'
 )
+
+const HARVEST_CHAT_TYPES = new Set(['t2t', 'search', 'image_edit'])
 
 const AGENT_CURRENT_MESSAGE_MARKER = '# Current message'
 
@@ -117,11 +119,45 @@ const processRequestBody = async (req, res, next) => {
     const hasTools = shouldEnableToolRuntime(tools, chatType, tool_choice)
     const originalLastMessage = Array.isArray(messages) ? messages[messages.length - 1] : null
     const afterToolResult = ['tool', 'function'].includes(String(originalLastMessage?.role || '').toLowerCase())
+    // 当前回合的图片几乎从来不在最后一条消息上：真实客户端会在图片后面再补一条纯文本
+    // 消息（OpenClaw 的 OPENCLAW_INTERNAL_CONTEXT，Claude Code 的 `[Image: source: …]`），
+    // 而 parserMessages 只上传最后一条的媒体。先收上来，折叠完再挂回去。
+    // 详见 chat-helpers.js#harvestCurrentTurnMedia（含 2026-09-08 的真实抓包证据）。
+    // 白名单，不是黑名单：routes/chat.js 的分发表把 deep_research 和**所有未知类型**都
+    // 交给 handleImageVideoCompletion，而那个控制器只在 t2i/t2v/image_edit 里给 content
+    // 赋值。用黑名单的话，任何新增/未知类型都会默默落进收割区。
+    //
+    // image_edit 必须留在名单里：那条路正是靠收割把输入图放进 files[]
+    // （chat.image.video.js:1290-1313）。t2i/t2v 排除掉：那里 content 是纯文本提示词，
+    // 收割会把它变成数组、塞进空的 '\n\n' 分隔符，还会为一张控制器根本不看的图付一次上传，
+    // 顺带打断 '@16:9' 这类尺寸嗅探。
+    // El ledger se arma AQUI, antes de la cosecha: harvestCurrentTurnMedia reescribe
+    // `candidate.content` quitando los items de imagen, y un tool_result que solo traia la
+    // imagen (la forma exacta del Read de Claude Code) queda como `[]`. Construido
+    // despues, el digest sale `-> []` — le dice al modelo que el Read no devolvio nada,
+    // justo bajo la leyenda que le pide reusar el resultado en vez de repetir la llamada;
+    // Read es la herramienta mas repetida de la medicion (802 de 1.451). Gemelo de
+    // anthropic.js#buildInternalRequest, que por la misma razon lo arma antes de su
+    // barrido de medios (alli la imagen esta en el bypass `media`, no en `content`).
+    //
+    // Sigue siendo PRE-FOLD, que es el otro requisito: despues de foldToolMessages la
+    // llamada ya es texto (`[TOOL CALL #1]`) sin tool_calls ni tool_call_id que recorrer,
+    // y el ledger saldria vacio sin que nada lo delate.
+    const toolHistoryLedger = hasTools ? buildToolHistoryLedger(messages || []) : ''
+
+    const currentTurnMedia = HARVEST_CHAT_TYPES.has(chatType)
+      ? harvestCurrentTurnMedia(messages)
+      : []
+
     let preparedMessages = messages
     let toolSystemPrompt = ''
     if (hasTools) {
       toolSystemPrompt = buildToolSystemPrompt(tools, { tool_choice })
-      preparedMessages = foldToolMessages(messages || [])
+      // Semilla del ledger de deduplicacion del runtime (openai-agent-runtime.js), del
+      // mismo recorrido pre-fold y con los mismos ordinales que ve el modelo. No suprime:
+      // marca la llamada como ya ejecutada para poder registrarla. Gemelo de
+      // anthropic.js#buildInternalRequest -> built.historyToolCalls.
+      req.tool_history_calls = extractHistoryToolCalls(messages || [])
       req.has_tools = true
       req.tool_choice = tool_choice || 'auto'
       req.allowed_tool_names = tools
@@ -163,7 +199,34 @@ const processRequestBody = async (req, res, next) => {
       req.has_tools = false
       req.allowed_tool_names = []
       req.tool_schemas = null
+      req.tool_history_calls = []
     }
+
+    // La historia se pliega segun lo que CONTIENE, no segun lo que esta peticion declara.
+    // Gemelo exacto de anthropic.js#buildInternalRequest. Con el fold dentro de
+    // `if (hasTools)`, una peticion sin `tools` (o con `tool_choice: 'none'`) dejaba
+    // intacto al assistant que solo lleva `tool_calls`: su `content` es null/'' y
+    // formatSingleMessage (chat-helpers.js) descarta todo mensaje cuyo texto queda
+    // vacio, asi que EL TURNO ENTERO desaparecia de la historia mientras su resultado
+    // sobrevivia como una linea JSONL con el rol inexistente "tool" — el modelo veia
+    // una respuesta sin la pregunta. La compactacion y el resumen de Claude Code tienen
+    // justo esa forma y llegan sin `tools`.
+    //
+    // Es RENDERIZADO, no protocolo: toolSystemPrompt, el ledger y req.has_tools siguen
+    // atados a `hasTools` (arriba), asi que una peticion sin herramientas recupera su
+    // historia legible sin aprender a llamarlas.
+    //
+    // Posicion obligatoria: DESPUES de harvestCurrentTurnMedia (el fold convierte el
+    // array de contenido en texto y se llevaria la imagen por delante) y ANTES de
+    // attachMediaToLastMessage (el fold devuelve objetos nuevos; colgar antes seria
+    // colgar sobre el objeto que se descarta).
+    if (hasTools || (Array.isArray(messages) && messages.some(willBeFolded))) {
+      preparedMessages = foldToolMessages(messages || [])
+    }
+
+    // 必须在 foldToolMessages 之后再挂：折叠会把 role=tool/assistant 的消息换成新对象，
+    // 挂早了那份就被丢掉了。挂到最后一条，parserMessages 才会去上传它。
+    attachMediaToLastMessage(preparedMessages, currentTurnMedia)
 
     // 处理 messages 参数 : 消息历史（返回 OpenAI 格式消息数组）
     const parsedMessages = await parserMessages(preparedMessages, thinkingConfig, chatType)
@@ -171,8 +234,22 @@ const processRequestBody = async (req, res, next) => {
     // 将解析后的消息填充到 React UI 格式的消息对象中
     // 取最后一条用户消息作为主消息内容，历史消息通过 content 传递
     const lastMessage = parsedMessages[parsedMessages.length - 1] || { role: 'user', content: '' }
+    // 图片从 content[] 换到 files[]：content[] 带图 + files[] 带外置上下文文档的组合
+    // 会让上游 500（详见 chat-helpers.js#extractMediaToFiles）。
+    //
+    // 只对走文本控制器的 chat_type 生效。routes/chat.js 的分发表把 t2t / search 交给
+    // handleChatCompletion，其余（t2i / t2v / image_edit，以及未知类型的兜底）全部交给
+    // handleImageVideoCompletion —— 后者拿的就是这个 req.body，并且直接读
+    // messages[0].content，期待原始的 content 数组。换成字符串会让 image_edit 走进
+    // `!Array.isArray(userPrompt)` 分支退化成 t2i，把输入图片整个丢掉。
+    const splitsMediaToFiles = chatType === 't2t' || chatType === 'search'
+    const { content: envelopeContent, files: envelopeFiles } = splitsMediaToFiles
+      ? extractMediaToFiles(lastMessage.content || '')
+      : { content: lastMessage.content || '', files: [] }
     body.messages[0].role = lastMessage.role || 'user'
-    body.messages[0].content = lastMessage.content || ''
+    body.messages[0].content = envelopeContent
+    // files 的键位在上面的信封字面量里（对齐 React UI 的键顺序，别挪），这里只填内容。
+    body.messages[0].files.push(...envelopeFiles)
     body.messages[0].chat_type = chatType
     body.messages[0].sub_chat_type = chatType
     body.messages[0].feature_config.thinking_enabled = thinkingConfig.thinking_enabled
@@ -183,15 +260,26 @@ const processRequestBody = async (req, res, next) => {
         body.messages[0].content,
         lastMessage.role || 'user'
       )
+      // Orden fijo en ambos caminos: toolPrompt -> ledger -> envelope -> directive. El
+      // ledger va pegado al protocolo porque es parte del contrato de herramientas (sin el
+      // protocolo delante seria una lista de ordinales sueltos), y delante de la historia
+      // que documenta. Vive en el prefijo, fuera del bloque de historia, donde se recortaria
+      // justo en las conversaciones largas, que son las que repiten llamadas.
+      //
+      // Estar en el prefijo NO lo pone a salvo: en una peticion externalizada el prefijo se
+      // retiene inline recortado por cabeza y cola, y el bloque perdia ahi sus entradas mas
+      // NUEVAS. buildBudgetedAgentPrompt (utils/request.js) lo separa y lo recorta aparte,
+      // reconociendolo por sus dos primeras lineas; tiene que ir AL FINAL del prefijo.
+      const toolPrefix = [toolSystemPrompt, toolHistoryLedger].filter(Boolean).join('\n\n')
       const msgContent = body.messages[0].content
       if (typeof msgContent === 'string') {
-        body.messages[0].content = `${toolSystemPrompt}\n\n${msgContent}`
+        body.messages[0].content = `${toolPrefix}\n\n${msgContent}`
       } else if (Array.isArray(msgContent)) {
         const textIdx = msgContent.findIndex(c => c?.type === 'text')
         if (textIdx >= 0) {
-          msgContent[textIdx].text = `${toolSystemPrompt}\n\n${msgContent[textIdx].text || ''}`
+          msgContent[textIdx].text = `${toolPrefix}\n\n${msgContent[textIdx].text || ''}`
         } else {
-          msgContent.unshift({ type: 'text', text: toolSystemPrompt })
+          msgContent.unshift({ type: 'text', text: toolPrefix })
         }
       }
 

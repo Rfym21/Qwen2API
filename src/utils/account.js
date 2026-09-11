@@ -753,6 +753,17 @@ class Account {
     }
 
     /**
+     * 记录“该账户今天的额度已耗尽”，把它移出轮询直到额度恢复。
+     * 调用方：anthropic.js / chat.js 的 catch，经 upstream-error#noteRateLimitedAccount。
+     * 额度耗尽藏在 HTTP 200 的 SSE 包体里，request.js 的状态码分支永远看不到它。
+     * @param {string} email - 邮箱地址
+     * @param {number|null} [retryAfterSeconds] - 上游给的真实等待（秒）
+     */
+    recordAccountQuotaExhausted(email, retryAfterSeconds = null) {
+        this.accountRotator.recordQuotaExhausted(email, retryAfterSeconds)
+    }
+
+    /**
      * 累计 daily stats（per-account）
      * 调用方：chat.js / anthropic.js / cli.chat.js 在成功消费完上游 usage 后
      * 注意：PM2_INSTANCES>1 时各 worker 各持一份 in-memory 副本（已记于 epic notes）

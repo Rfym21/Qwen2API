@@ -378,7 +378,8 @@ const assertHeadlineWire = (res, sender) => {
   assert.deepEqual(uses.map(u => u.name), ['SendMessage', 'Bash']);
   assert.equal(uses[0].args, SEND_MESSAGE_ARGS, 'SendMessage arguments byte-exact (snapshot REPLACE, not +=)');
   assert.equal(uses[1].args, BASH_ARGS, 'Bash arguments byte-exact: the doubled final snapshot is ONE call');
-  assert.ok(uses.every(u => /^call_[0-9a-f]{24}$/.test(u.id)), 'fresh ids, never a platform function_id');
+  // Namespace nativo (Tarea 6): /v1/messages emite `toolu_`; /v1/chat/completions sigue en `call_`.
+  assert.ok(uses.every(u => /^toolu_[0-9a-f]{24}$/.test(u.id)), 'fresh ids, never a platform function_id');
   assert.equal(stopReasonOf(res.output), 'tool_use');
   assert.doesNotMatch(res.output, /"type":"error"/);
   assert.match(res.output, /"type":"message_stop"/);

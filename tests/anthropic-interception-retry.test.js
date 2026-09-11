@@ -1122,3 +1122,43 @@ describe('searchTable injection never poisons the think settle (R12)', () => {
   });
 });
 
+
+// A.4 (2026-09-10): el reenvio de correccion viaja con las MISMAS opciones que la primera
+// peticion (ctx.upstreamOptions). Sin ellas sendChatRequest no conoce la sesion y vuelve a
+// subir y parsear el historial entero — hasta 3 parses por turno HTTP contra el WAF de
+// /files/parse; con la clave reutiliza el prefijo ya subido (0 parses).
+describe('correction retries carry ctx.upstreamOptions (history-prefix reuse)', () => {
+  const recordingSender = (seen, ...turns) => {
+    const queue = [...turns];
+    return async (body, options) => {
+      seen.push(options);
+      const next = queue.shift();
+      return next ? { status: true, response: next() } : { status: false };
+    };
+  };
+  const upstreamOptions = { allowContextCompaction: false, contextPrefixKey: 'k'.repeat(64) };
+
+  it('stream: the retry is sendRequest(body, ctx.upstreamOptions)', async () => {
+    const seen = [];
+    const sender = recordingSender(seen, turnOf(answerFrame(BRACKET_CALL)));
+    await runStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender, { upstreamOptions });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], upstreamOptions);
+  });
+
+  it('non-stream: same options object on the retry', async () => {
+    const seen = [];
+    const sender = recordingSender(seen, turnOf(answerFrame(BRACKET_CALL)));
+    await runNonStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender, { upstreamOptions });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0], upstreamOptions);
+  });
+
+  it('without upstreamOptions in ctx the retry still sends (empty options), as before', async () => {
+    const seen = [];
+    const sender = recordingSender(seen, turnOf(answerFrame(BRACKET_CALL)));
+    await runStream(turnOf(interceptionFrame('read_file'), answerFrame(NARRATION)), sender);
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], {});
+  });
+});
