@@ -36,7 +36,6 @@
     "jwt-decode": "^4.0.0",
     "mime-types": "^3.0.1",
     "multer": "^2.3.0",
-    "proxy-agent": "^5.0.0",
     "tiktoken": "^1.0.21"
   },
   "devDependencies": {
@@ -44,5 +43,8 @@
     "eslint": "^10.9.1",
     "globals": "^17.11.0",
     "yaml": "^2.9.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

@@ -47,6 +47,9 @@ const result = await build({
   target: 'bun',
   env: 'disable',
   minify: true,
+  // urllib only requires proxy-agent lazily (detectProxyAgent) and we never enable it;
+  // it is not installed, so keep the bundler from trying to resolve it.
+  external: ['proxy-agent'],
   compile: {
     target: compileTarget,
     outfile: outputPath,
