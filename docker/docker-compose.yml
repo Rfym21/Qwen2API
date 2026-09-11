@@ -21,15 +21,6 @@ services:
       # 监听地址(非必填)
       # Listen address (optional)
       - LISTEN_ADDRESS=
-      # PM2 多进程配置
-      # PM2进程数量: max(使用所有CPU核心), 数字(指定进程数量), 1(单进程)
-      # 注意: PM2集群模式下所有进程共用同一个端口
-      # PM2 multi-process: max (all cores), number, or 1 (single)
-      # Note: in cluster mode all processes share the same port
-      - PM2_INSTANCES=1
-      # PM2内存限制，超过此限制将自动重启进程
-      # PM2 memory limit — process restarts when exceeded
-      - PM2_MAX_MEMORY=1G
       # 搜索信息展示模式
       # table: 使用折叠块和表格展示
       # text: 使用纯文本

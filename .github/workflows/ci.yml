@@ -1,8 +1,4 @@
-name: ci
-
-# Gates the Node backend (tests + lint) on every push and PR, all branches,
-# no path filter (D40 — docker-build.yml's path filter is exactly the trap
-# this avoids). public/ (Vue/Vite) has no build or lint step here.
+name: CI
 on:
   push:
   pull_request:
@@ -15,37 +11,5 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    # Must exceed the gate's own worst case (TEST_GATE_TIMEOUT_MS x
-    # TEST_GATE_ATTEMPTS, pinned below to 2 x 300s = 10 min) plus npm ci and
-    # lint. With the old 10 here and the gate's 10-minute default watchdog, the
-    # job died at 10 min and the watchdog — the thing that makes the gate unable
-    # to hang — could never fire.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-      - run: npm ci
-      # Lint first: it is the cheaper step, and a red test must not hide
-      # lint results.
-      - run: npm run lint
-      - run: npm test
-        env:
-          # src/config calls process.exit(1) at require time when API_KEY is
-          # unset, killing the five suites that load controllers. The value
-          # itself is never read by any test.
-          API_KEY: ci-test-key
-          # The gate runs one node process per test file (the parent runner
-          # dropped file tails on this loaded 2-vCPU box: 1035 of 1074 on 3 of
-          # 3 attempts, 2026-09-11). Measured: ~10s locally, 77s on an idle
-          # 4-core VPS at concurrency 1. 300s per attempt is ~4x that, and 2
-          # attempts still fit inside timeout-minutes above, so a hung process
-          # is reported by the gate as TIMEOUT instead of looking like CI
-          # infrastructure flake. A short attempt is no longer expected at all;
-          # the second attempt is a safety net, not the mechanism.
-          TEST_GATE_TIMEOUT_MS: 300000
-          TEST_GATE_ATTEMPTS: 2
+  verify:
+    uses: ./.github/workflows/verify.yml

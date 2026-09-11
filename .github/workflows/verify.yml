@@ -1,0 +1,152 @@
+name: Verify and build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    # The gate may consume 2 x 300s; leave time for installation and lint.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-regression-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run test
+        env:
+          API_KEY: ci-test-key
+          DATA_SAVE_MODE: none
+          ACCOUNTS: ''
+          ENABLE_CLI: 'false'
+          ENABLE_FILE_LOG: 'false'
+          CACHE_MODE: default
+          SEARCH_INFO_MODE: text
+          TEST_GATE_TIMEOUT_MS: 300000
+          TEST_GATE_ATTEMPTS: 2
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-frontend-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('public/bun.lock') }}
+      - run: bun install --cwd public --frozen-lockfile
+      - run: bun run build:frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: public/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  binaries:
+    needs: [regression, frontend]
+    name: Binary and container (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            docker_arch: amd64
+            extension: ''
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            docker_arch: arm64
+            extension: ''
+          - platform: windows-x64
+            runner: windows-2022
+            docker_arch: ''
+            extension: .exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: public/dist
+      # No backend devDependencies or Node-based fallback in these jobs.
+      - run: bun install --frozen-lockfile --production
+      - name: Verify source runtime
+        run: bun run test:bun
+      - name: Compile native executable
+        run: bun --no-env-file tools/build-binary.mjs --target bun-${{ matrix.platform }}
+      - name: Verify isolated native executable
+        run: bun run test:bun --binary pkg_dist/qwen2api-${{ matrix.platform }}${{ matrix.extension }}
+      - name: Package executable and checksum
+        run: bun --no-env-file tools/package-binary.mjs --platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.platform }}
+          path: pkg_dist/releases/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Compile Alpine executable
+        if: runner.os == 'Linux'
+        run: bun --no-env-file tools/build-binary.mjs --target bun-${{ matrix.platform }}-musl --outfile pkg_dist/docker/${{ matrix.docker_arch }}/qwen2api
+      - uses: docker/setup-buildx-action@v3
+        if: runner.os == 'Linux'
+      - name: Build container from the compiled executable
+        if: runner.os == 'Linux'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: BINARY_SOURCE=prebuilt
+          platforms: linux/${{ matrix.docker_arch }}
+          tags: qwen2api:ci-${{ matrix.docker_arch }}
+          load: true
+          provenance: false
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=binary-image-${{ matrix.docker_arch }}
+          cache-to: type=gha,mode=max,scope=binary-image-${{ matrix.docker_arch }}
+      - name: Verify actual Alpine container
+        if: runner.os == 'Linux'
+        run: bun run test:bun --docker-image qwen2api:ci-${{ matrix.docker_arch }}
+      - name: Export the tested image without rebuilding it
+        if: runner.os == 'Linux'
+        run: docker save --output pkg_dist/docker-image-${{ matrix.docker_arch }}.tar qwen2api:ci-${{ matrix.docker_arch }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: docker-image-${{ matrix.docker_arch }}
+          path: pkg_dist/docker-image-${{ matrix.docker_arch }}.tar
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 7

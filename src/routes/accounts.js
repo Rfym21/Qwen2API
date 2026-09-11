@@ -744,8 +744,8 @@ router.get('/statsHistory', adminKeyVerify, async (req, res) => {
  * smoke-testing the storage layer).
  *
  * Registered ONLY when ENABLE_STATS_DEBUG_ARCHIVE === 'true'.
- * NODE_ENV is intentionally NOT used — this repo does not set it
- * (src/start.js, ecosystem.config.js), so 'production' cannot be guaranteed.
+ * NODE_ENV is intentionally NOT used: debug access must be explicitly enabled
+ * regardless of the runtime or deployment environment.
  *
  * In any normal (including production) configuration the route is absent —
  * POST returns 404. Caveat: GET on any unknown path falls into app.get('*')

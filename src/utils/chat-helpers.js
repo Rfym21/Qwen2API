@@ -164,7 +164,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
             // UNA sola consulta, y se comprueba el status. `cacheIsExist` + `getCache` son
             // dos comprobaciones independientes: desde que el modo file BORRA las entradas
             // caducadas (img-caches.js#cacheIsExist) la entrada puede desaparecer entre las
-            // dos —— otro worker del cluster PM2 la caduca, o el propio TTL vence en medio
+            // dos —— otra replica la caduca, o el propio TTL vence en medio
             // —— y `getCache` devuelve `{status:404,url:null}`. Ese null se mandaba upstream
             // como `{type:'image',image:null}`: una imagen que el modelo nunca ve, sin un
             // solo error por nuestro lado. Antes del borrado perezoso la ventana no existia.

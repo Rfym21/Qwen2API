@@ -1,12 +1,18 @@
 # Only send inputs used by the Docker build stages.
 **
 !package.json
-!package-lock.json
-!ecosystem.config.js
+!bun.lock
 !src/
 !src/**
 !public/
 !public/**
+!tools/
+!tools/build-binary.mjs
+!tools/binary-entry.mjs
+!tools/binary-frontend.mjs
+!pkg_dist/
+!pkg_dist/docker/
+!pkg_dist/docker/**
 
 # Do not import host dependencies, generated output, or local settings.
 **/node_modules
@@ -15,6 +21,7 @@
 **/.env
 **/.env.*
 **/.npm
+**/.bun
 **/.cache
 **/.tmp
 **/.temp

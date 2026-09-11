@@ -1,7 +1,7 @@
 const express = require('express')
-const multer = require('multer')
 const router = express.Router()
 const { apiKeyVerify } = require('../middlewares/authorization.js')
+const { createUploadMiddleware } = require('../middlewares/upload.js')
 const { processRequestBody } = require('../middlewares/chat-middleware.js')
 const { handleChatCompletion } = require('../controllers/chat.js')
 const {
@@ -11,12 +11,7 @@ const {
     handleOpenAIVideoGeneration
 } = require('../controllers/chat.image.video.js')
 
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: {
-        fileSize: 100 * 1024 * 1024
-    }
-})
+const parseMediaUpload = createUploadMiddleware()
 
 const selectChatCompletion = (req, res, next) => {
     const ChatCompletionMap = {
@@ -50,13 +45,13 @@ router.post('/v1/images/generations',
 
 router.post('/v1/images/edits',
     apiKeyVerify,
-    upload.any(),
+    parseMediaUpload,
     handleOpenAIImagesEdit
 )
 
 router.post('/v1/videos',
     apiKeyVerify,
-    upload.any(),
+    parseMediaUpload,
     handleOpenAIVideoGeneration
 )
 

@@ -20,6 +20,9 @@ class UpstreamResponseError extends Error {
  * pool en cada vuelta. Las dos APIs nativas contestan 429 justamente para evitar eso.
  */
 const RATE_LIMIT_CODE = 'RateLimited';
+const QUOTA_LIMIT_CODE = 'quota_limit';
+const WAF_CHALLENGE_CODE = 'upstream_waf_challenge';
+const isWafChallengeError = (error) => String(error?.code || '').toLowerCase() === WAF_CHALLENGE_CODE;
 /** Vocabulario de cable de cada API. Juntos aqui para que los gemelos no se separen. */
 const RATE_LIMIT_ANTHROPIC_TYPE = 'rate_limit_error';
 const RATE_LIMIT_OPENAI_TYPE = 'insufficient_quota';
@@ -37,7 +40,9 @@ const RATE_LIMIT_MESSAGE_RE = /upper limit for today|reached the upper limit|已
  */
 const isRateLimitError = (error) => {
   if (!error || typeof error !== 'object') return false;
-  if (String(error.code || '').toLowerCase() === RATE_LIMIT_CODE.toLowerCase()) return true;
+  if (isWafChallengeError(error)) return false;
+  const code = String(error.code || '').toLowerCase();
+  if (code === RATE_LIMIT_CODE.toLowerCase() || code === QUOTA_LIMIT_CODE) return true;
   return RATE_LIMIT_MESSAGE_RE.test(String(error.publicMessage || error.message || ''));
 };
 
@@ -184,10 +189,10 @@ const assertNoUpstreamFailure = (payload) => {
     payload.data?.url,
     payload.error?.code
   ].filter(Boolean).map(String);
-  if (upstreamSignals.some(item => /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i.test(item))) {
+  if (upstreamSignals.some(item => item.toLowerCase() === WAF_CHALLENGE_CODE || /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i.test(item))) {
     throw new UpstreamResponseError(
       'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
-      'upstream_waf_challenge',
+      WAF_CHALLENGE_CODE,
       { ret }
     );
   }
@@ -197,7 +202,9 @@ const assertNoUpstreamFailure = (payload) => {
     const message = typeof explicitError === 'string'
       ? explicitError
       : (explicitError.message || explicitError.msg || 'Qwen 上游返回业务错误');
-    throw new UpstreamResponseError(message, explicitError.code || 'upstream_business_error');
+    const waitHours = explicitError.num ?? payload.data?.num;
+    throw new UpstreamResponseError(message, explicitError.code || 'upstream_business_error',
+      waitHours == null ? null : { waitHours });
   }
 
   if (payload.success === false && !Array.isArray(payload.choices)) {
@@ -217,6 +224,7 @@ module.exports = {
   UpstreamResponseError,
   assertNoUpstreamFailure,
   isRateLimitError,
+  isWafChallengeError,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,

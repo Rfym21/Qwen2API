@@ -14,6 +14,7 @@ class AccountRotator {
     this.lastErrorCode = new Map() // 最近一次错误码（HTTP status 或 transport err.code）
     this.cooldownStartedAt = new Map() // 进入 cooldown 的起始时间戳（failureCounts 达阈值时刻）
     this.quotaCooldownUntil = new Map() // 日额度耗尽的账户 -> 解禁时间戳（见 recordQuotaExhausted）
+    this.challengeCooldownUntil = new Map()
     this.maxFailures = 3 // 最大失败次数
     this.cooldownPeriod = 5 * 60 * 1000 // 5分钟冷却期
     // 额度耗尽的默认静默期。上游给了 `data.num`（小时）时用那个，这是没给时的回退。
@@ -42,18 +43,20 @@ class AccountRotator {
 
   /**
    * 获取下一个可用的账户对象
+   * @param {string[]} excludedEmails - Accounts already attempted in this request
    * @returns {Object|null} 账户对象或 null
    */
-  getNextAccount() {
+  getNextAccount(excludedEmails = []) {
     if (this.accounts.length === 0) {
       logger.error('没有可用的账户', 'ACCOUNT')
       return null
     }
 
-    const availableAccounts = this._getAvailableAccounts()
+    const excluded = new Set(excludedEmails)
+    const availableAccounts = this._getAvailableAccounts().filter(account => !excluded.has(account.email))
     if (availableAccounts.length === 0) {
-      logger.warn('所有账户都不可用，使用轮询策略', 'ACCOUNT')
-      return this._getAccountByRoundRobin()
+      logger.warn('没有未排除且可用的账户，停止重试', 'ACCOUNT')
+      return null
     }
 
     // 从可用账户中选择最少使用的
@@ -164,9 +167,16 @@ class AccountRotator {
     this.lastErrorAt.set(email, Date.now())
     this.lastErrorCode.set(email, 'RateLimited')
     logger.warn(
-      `账户 ${email} 日额度已耗尽，暂停轮询 ${Math.round(waitMs / 60000)} 分钟`,
+      `账户 ${email} 额度已耗尽，暂停轮询 ${Math.round(waitMs / 60000)} 分钟`,
       'ACCOUNT'
     )
+  }
+
+  recordChallenge(email) {
+    if (!email) return
+    // Keep this separate from transport failures and quota cooldowns.
+    this.challengeCooldownUntil.set(email, Date.now() + this.cooldownPeriod)
+    this.recordError(email, 'upstream_waf_challenge')
   }
 
   /**
@@ -202,7 +212,10 @@ class AccountRotator {
         available: this._isAccountAvailable(account),
         lastErrorAt: this.lastErrorAt.get(email) || null,
         lastErrorCode: this.lastErrorCode.get(email) || null,
-        cooldownEndsAt: cooldownStart ? cooldownStart + this.cooldownPeriod : null,
+        cooldownEndsAt: Math.max(
+          cooldownStart ? cooldownStart + this.cooldownPeriod : 0,
+          this.challengeCooldownUntil.get(email) || 0
+        ) || null,
         quotaCooldownEndsAt: this.quotaCooldownUntil.get(email) || null
       }
     })
@@ -233,6 +246,13 @@ class AccountRotator {
   _isAccountAvailable(account) {
     if (!account.token) {
       return false
+    }
+
+    // A token refresh does not resolve an upstream verification challenge.
+    const challengeUntil = this.challengeCooldownUntil.get(account.email)
+    if (challengeUntil) {
+      if (Date.now() < challengeUntil) return false
+      this.challengeCooldownUntil.delete(account.email)
     }
 
     // 额度流放优先于一切：这个账户对上游来说今天已经没有配额，再选它就是白烧一轮。
@@ -280,32 +300,6 @@ class AccountRotator {
   }
 
   /**
-   * 轮询策略获取账户对象
-   * @returns {Object|null} 账户对象或null
-   * @private
-   */
-  _getAccountByRoundRobin() {
-    if (this.currentIndex >= this.accounts.length) {
-      this.currentIndex = 0
-    }
-
-    const account = this.accounts[this.currentIndex]
-    this.currentIndex++
-
-    if (account && account.token) {
-      this._recordUsage(account.email)
-      return account
-    }
-
-    // 如果当前账户无效，尝试下一个
-    if (this.currentIndex < this.accounts.length) {
-      return this._getAccountByRoundRobin()
-    }
-
-    return null
-  }
-
-  /**
    * 记录账户使用
    * @param {string} email - 邮箱地址
    * @private
@@ -327,7 +321,8 @@ class AccountRotator {
       this.lastErrorAt,
       this.lastErrorCode,
       this.cooldownStartedAt,
-      this.quotaCooldownUntil
+      this.quotaCooldownUntil,
+      this.challengeCooldownUntil
     ]
     for (const map of maps) {
       for (const email of map.keys()) {
@@ -349,6 +344,7 @@ class AccountRotator {
     this.lastErrorCode.clear()
     this.cooldownStartedAt.clear()
     this.quotaCooldownUntil.clear()
+    this.challengeCooldownUntil.clear()
   }
 }
 

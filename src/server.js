@@ -17,10 +17,14 @@ const anthropicRouter = require('./routes/anthropic.js')
 const verifyRouter = require('./routes/verify.js')
 const accountsRouter = require('./routes/accounts.js')
 const settingsRouter = require('./routes/settings.js')
+const { resolveRuntimePath } = require('./utils/runtime-paths')
+const { mountFrontend } = require('./utils/frontend.js')
 
 if (config.dataSaveMode === 'file') {
-  if (!fs.existsSync(path.join(__dirname, '../data/data.json'))) {
-    fs.writeFileSync(path.join(__dirname, '../data/data.json'), JSON.stringify({"accounts": [] }, null, 2))
+  const dataFilePath = resolveRuntimePath('data', 'data.json')
+  fs.mkdirSync(path.dirname(dataFilePath), { recursive: true })
+  if (!fs.existsSync(dataFilePath)) {
+    fs.writeFileSync(dataFilePath, JSON.stringify({"accounts": [] }, null, 2))
   }
 }
 
@@ -77,16 +81,7 @@ app.use(verifyRouter)
 app.use('/api', accountsRouter)
 app.use('/api', settingsRouter)
 
-app.use(express.static(path.join(__dirname, '../public/dist')))
-
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/dist/index.html'), (err) => {
-    if (err) {
-      logger.error('管理页面加载失败', 'SERVER', '', err)
-      res.status(500).send('服务器内部错误')
-    }
-  })
-})
+mountFrontend(app)
 
 // 处理错误中间件（必须放在所有路由之后）
 app.use((err, req, res, next) => {
@@ -119,19 +114,22 @@ const applyPersistedSettings = async () => {
 }
 
 const startServer = () => {
-  if (config.listenAddress) {
-    app.listen(config.listenPort, config.listenAddress, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+  const server = app.listen(config.listenPort, config.listenAddress || undefined, () => {
+    logger.server('服务器启动成功', 'SERVER', serverInfo)
+    logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
+    logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
+  })
+
+  // Bun is PID 1 in Docker. Drain requests, but bound shutdown for long-lived SSE.
+  process.once('SIGTERM', () => {
+    const shutdownTimer = setTimeout(() => process.exit(1), 8000)
+    shutdownTimer.unref()
+    server.close(() => {
+      clearTimeout(shutdownTimer)
+      process.exit(0)
     })
-  } else {
-    app.listen(config.listenPort, () => {
-      logger.server('服务器启动成功', 'SERVER', serverInfo)
-      logger.info('开源地址: https://github.com/Rfym21/Qwen2API', 'INFO')
-      logger.info('电报群聊: https://t.me/nodejs_project', 'INFO')
-    })
-  }
+    server.closeIdleConnections()
+  })
 }
 
 applyPersistedSettings().finally(startServer)

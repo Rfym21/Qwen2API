@@ -1,5 +1,5 @@
 {
-  "installCommand": "npm install && cd public && npm install && npm run build",
+  "installCommand": "bun install --frozen-lockfile && bun install --cwd public --frozen-lockfile && bun run build:frontend",
   "buildCommand": null,
   "outputDirectory": null,
   "devCommand": null,

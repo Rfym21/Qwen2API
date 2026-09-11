@@ -163,7 +163,7 @@
     "modelMapTitle": "🗺️ Model mapping",
     "modelMapHint": "Incoming model names are replaced by a Qwen model before the request goes upstream. Names not listed here go to the fallback row, except names that already are Qwen model ids: those pass through unchanged.",
     "modelMapRulesHint": "On save, aliases are lowercased and a trailing [..] suffix is stripped. An alias equal to a Qwen model id overrides that id on purpose.",
-    "modelMapClusterHint": "With several PM2 workers, a saved map reaches the other workers at their next restart.",
+    "modelMapClusterHint": "Bun runs one process by default. With multiple replicas, persisted maps reach other replicas at their next restart.",
     "modelMapNoneModeHint": "DATA_SAVE_MODE=none: changes apply in memory only and are lost on restart.",
     "modelMapAlias": "Incoming name",
     "modelMapTarget": "Qwen model",

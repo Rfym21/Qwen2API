@@ -4,8 +4,8 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2026.09.11.12.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Version](https://img.shields.io/badge/version-26.09.11.16.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Bun](https://img.shields.io/badge/Bun-1.3.14+-green.svg)](https://bun.sh/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
 [🔗 Join Telegram Group](https://t.me/nodejs_project) | [📖 Documentation](#api-documentation) | [🐳 Docker Deployment](#docker-deployment)
@@ -74,7 +74,8 @@ When the [proxy](file://d:\Code\Qwen2API\src\utils\account-parser.js#L27-L27) fi
 
 ### Requirements
 
-- Node.js 18+ (required for source deployment)
+- Bun 1.3.14+ (source deployments; Docker pins 1.3.14)
+- Node.js 24+ (development regression tests and lint only, not the production image)
 - Docker (optional)
 - Redis (optional, for data persistence)
 
@@ -90,11 +91,6 @@ SERVICE_PORT=3000             # Service port
 # 🔐 Security Configuration
 API_KEY=sk-123456,sk-456789   # API key (required, supports multiple keys)
 ACCOUNTS=                     # Account configuration (format: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
-
-# 🚀 PM2 Multi-process Configuration
-PM2_INSTANCES=1               # Number of PM2 processes (1/number/max)
-PM2_MAX_MEMORY=1G             # PM2 memory limit (100M/1G/2G, etc.)
-                              # Note: All processes in PM2 cluster mode share the same port
 
 # 🔍 Feature Configuration
 SEARCH_INFO_MODE=table        # Search info display mode (table/text)
@@ -123,10 +119,8 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `LISTEN_ADDRESS` | Service listen address | `localhost` or `0.0.0.0` |
-| [SERVICE_PORT](file://d:\Code\Qwen2API\src\start.js#L12-L12) | Service running port | `3000` |
+| `SERVICE_PORT` | Service running port | `3000` |
 | `API_KEY` | API access key, supports multi-key configuration. The first is the admin key (can access frontend management page), others are regular keys (API calls only). Multiple keys separated by commas | `sk-admin123,sk-user456,sk-user789` |
-| [PM2_INSTANCES](file://d:\Code\Qwen2API\src\start.js#L11-L11) | Number of PM2 processes | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | PM2 memory limit | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | Search result display format | `table` or [text](file://d:\Code\Qwen2API\src\utils\tool-prompt.js#L206-L206) |
 | `OUTPUT_THINK` | Whether to show AI thinking process | `true` or `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Reasoning output format. Default `false` = reasoning goes to a separate `reasoning_content` field; `true` = legacy behavior (`<think>` inside `content`) | `true` or `false` |
@@ -244,32 +238,75 @@ git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
 # Install dependencies
-npm install
+bun install --frozen-lockfile
+bun install --cwd public --frozen-lockfile
+bun run build:frontend
 
 # Configure environment variables
 cp .env.example .env
 # Edit .env file
 
-# Smart start (recommended - automatically determines single/multi-process)
-npm start
+# Start one Bun process
+bun run start
 
 # Development mode
-npm run dev
+bun run dev
 ```
 
-### 🚀 PM2 Multi-Process Deployment
+### Runtime and validation
 
-Use PM2 for production environment multi-process deployment, providing better performance and stability.
+The service runs in one Bun process; PM2 and automatic cluster startup have been removed.
+`PM2_INSTANCES` and `PM2_MAX_MEMORY` no longer apply. Compose handles restarts with
+`restart: always`; use `mem_limit` for container memory limits. Account statistics,
+rate limits, and runtime settings include process-local state, so multiple replicas
+need coordinated state before sharing persistence.
 
-**Important Note**: In PM2 cluster mode, all processes share the same port, and PM2 automatically performs load balancing.
+`bun run test` retains the Node test runner for the existing regression suite.
+`bun run test:bun` starts a real Bun service with a local mock upstream to verify
+login, frontend files, WASM, and OpenAI/Anthropic JSON and SSE responses without real accounts.
+Source execution is the default. `node src/server.js` remains available for temporary comparisons.
 
-### 🤖 Smart Start Mode
+### Standalone executable
 
-Using `npm start` can automatically determine the startup method:
+Run `bun run build:binary` to build the frontend and a native executable in `pkg_dist/`.
+For Linux x64, use `bun run build:binary --target bun-linux-x64` (use `bun-linux-x64-musl`
+for Alpine). Cross-compilation does not verify execution on the target platform.
+Test a Windows build with `bun run test:bun --binary pkg_dist/qwen2api-windows-x64.exe`.
 
-- When `PM2_INSTANCES=1`, uses single-process mode
-- When `PM2_INSTANCES>1`, uses Node.js cluster mode
-- Automatically limits process count to no more than CPU cores
+The executable embeds Bun, the backend, frontend assets, and tiktoken WASM; deployment
+does not need Node, Bun, or node_modules. Run it from a writable directory containing
+your `.env`, or pass environment variables. Credentials and `.env` are not embedded.
+The binary writes `data/`, `logs/`, and `caches/` under the working directory by default;
+set `QWEN2API_RUNTIME_DIR` to override this root. `--version` prints the version without
+starting the server. Docker uses Alpine plus the musl executable, without source files,
+node_modules, or a separate Bun CLI.
+
+### CI and releases
+
+`ci.yml` validates pushes and PRs without publishing. `verify.yml` is shared by CI and
+releases: Node 24 runs lint/regressions, Bun is selected from packageManager, the frontend
+is built once, and Windows x64/Linux x64/Linux arm64 binaries are built and tested on native
+runners. Linux jobs also test the actual Alpine containers before exporting their images.
+
+`release.yml` publishes only when package.json version changes on main, or through a
+manual Run workflow with `publish` checked on main. Unchecked manual runs only build artifacts.
+Other package fields, normal source changes, PRs, tag pushes, and new branches without a
+previous commit do not automatically publish.
+
+Releases include three .tar.gz archives (executable, .env.example, instructions), SHA256SUMS,
+and linux/amd64 + linux/arm64 Docker images. Downloads use glibc; containers use musl.
+Tested image archives are published without rebuilding. Version tags cannot move to another
+commit; published releases cannot be replaced. Failed drafts may be retried at the same commit.
+latest is updated only while main has the same version and the release commit remains in its
+history; later docs commits do not suppress it. Publish jobs use queue:max (up to 100 pending
+runs), so later package-only changes do not replace pending releases. Publishing across registries
+is not atomic: a failed run can leave a draft and partial image tags.
+
+Configure DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets and a writable Docker Hub repository.
+The publish job alone gets contents:write and uses the release environment, where you can add
+main-only restrictions and approvals. Bump the existing version before the first new release.
+Local build: `docker build -f docker/Dockerfile -t qwen2api:local .`.
+On Linux, test it with `bun run test:bun --docker-image qwen2api:local`.
 
 ### ☁️ Hugging Face Deployment
 
@@ -284,6 +321,8 @@ Quickly deploy to Hugging Face Spaces:
 ### ☁️ Vercel Deployment
 
 Quickly deploy to Vercel:
+
+This platform entry retains Node/Express compatibility; the Bun runtime migration targets local and Docker deployments.
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
 
@@ -303,7 +342,7 @@ DATA_SAVE_MODE=none
 Qwen2API/
 ├── README.md
 ├── README-en.md
-├── ecosystem.config.js              # PM2 configuration file
+├── bun.lock                         # Bun dependency lockfile
 ├── package.json
 │
 ├── docker/                          # Docker configuration directory
@@ -320,7 +359,6 @@ Qwen2API/
 │
 ├── src/                             # Backend source code directory
 │   ├── server.js                    # Main server file
-│   ├── start.js                     # Smart start script (automatically determines single/multi-process)
 │   ├── config/
 │   │   └── index.js                 # Configuration file
 │   ├── controllers/                 # Controllers directory

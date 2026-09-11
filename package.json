@@ -1,24 +1,20 @@
 {
   "name": "qwen2api",
-  "version": "2026.09.11.12.00",
+  "version": "26.09.11.16.00",
   "main": "src/server.js",
+  "packageManager": "bun@1.3.14",
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.3.14"
   },
   "scripts": {
-    "start": "node src/start.js",
-    "dev": "nodemon src/server.js",
+    "start": "bun --no-env-file src/server.js",
+    "dev": "bun --no-env-file --watch src/server.js",
+    "build:frontend": "bun run --cwd public --bun build",
+    "build:binary": "bun run build:frontend && bun --no-env-file tools/build-binary.mjs",
     "test": "node tools/test-gate.js",
+    "test:bun": "bun --no-env-file tools/bun-smoke.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "pm2": "pm2 start ecosystem.config.js",
-    "pm2:stop": "pm2 stop qwen2api",
-    "pm2:restart": "pm2 restart qwen2api",
-    "pm2:reload": "pm2 reload qwen2api",
-    "pm2:delete": "pm2 delete qwen2api",
-    "pm2:logs": "pm2 logs qwen2api",
-    "pm2:status": "pm2 status",
-    "pm2:monit": "pm2 monit",
     "test:raw": "node --test --test-force-exit tests/*.test.js",
     "test:bless": "node tools/test-gate.js --bless"
   },
@@ -34,19 +30,19 @@
     "csrf": "^3.1.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "form-data": "^4.0.2",
+    "form-data": "^4.0.6",
     "https-proxy-agent": "^7.0.6",
     "ioredis": "^5.6.1",
     "jwt-decode": "^4.0.0",
     "mime-types": "^3.0.1",
-    "multer": "^1.4.5-lts.1",
-    "pm2": "^6.0.8",
+    "multer": "^2.3.0",
+    "proxy-agent": "^5.0.0",
     "tiktoken": "^1.0.21"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.9.1",
     "globals": "^17.11.0",
-    "nodemon": "^3.1.7"
+    "yaml": "^2.9.0"
   }
 }

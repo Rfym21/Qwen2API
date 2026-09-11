@@ -2,8 +2,8 @@ import js from '@eslint/js';
 import globals from 'globals';
 
 export default [
-  // Vue/Vite frontend has its own toolchain; this gate covers the Node backend.
-  { ignores: ['public/**'] },
+  // Vue/Vite and temporary build outputs are not backend lint inputs.
+  { ignores: ['public/**', '.tmp/**'] },
   js.configs.recommended,
   {
     files: ['**/*.js', '**/*.cjs'],
@@ -16,7 +16,7 @@ export default [
   {
     files: ['**/*.mjs'],
     languageOptions: {
-      ecmaVersion: 2024,
+      ecmaVersion: 2025,
       sourceType: 'module',
       globals: { ...globals.node },
     },

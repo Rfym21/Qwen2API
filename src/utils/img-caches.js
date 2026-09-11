@@ -1,7 +1,7 @@
 const fs = require('fs')
-const path = require('path')
 const config = require('../config')
 const { logger } = require('./logger')
+const { resolveRuntimePath } = require('./runtime-paths')
 
 // Vida de una URL de subida cacheada.
 //
@@ -74,6 +74,9 @@ const IMAGE_CACHE_MAX_ENTRIES = 512
 class imgCacheManager {
   constructor() {
     this.cacheMap = new Map()
+    if (config.cacheMode === 'file') {
+      fs.mkdirSync(resolveRuntimePath('caches'), { recursive: true })
+    }
   }
 
   cacheIsExist(signature) {
@@ -93,7 +96,7 @@ class imgCacheManager {
         // URL para siempre, entre reinicios incluidos, y es el modo que el README recomienda
         // para Docker. La firma de la URL sí sabe cuándo muere, así que se lee de ahí; sin
         // firma se cae al mtime del fichero. Un fallo de lectura es un miss, no una excepción.
-        const cachePath = path.join(__dirname, '../../caches', `${signature}.txt`)
+        const cachePath = resolveRuntimePath('caches', `${signature}.txt`)
         if (!fs.existsSync(cachePath)) return false
         const url = fs.readFileSync(cachePath, 'utf-8')
         if (cachedUrlIsUsable(url, fs.statSync(cachePath).mtimeMs)) return true
@@ -129,7 +132,7 @@ class imgCacheManager {
             this.cacheMap.delete(this.cacheMap.keys().next().value)
           }
         } else {
-          const cachePath = path.join(__dirname, '../../caches', `${signature}.txt`)
+          const cachePath = resolveRuntimePath('caches', `${signature}.txt`)
           fs.writeFileSync(cachePath, url)
         }
 
@@ -144,7 +147,7 @@ class imgCacheManager {
 
   getCache(signature) {
     try {
-      const cachePath = path.join(__dirname, '../../caches', `${signature}.txt`)
+      const cachePath = resolveRuntimePath('caches', `${signature}.txt`)
       const isExist = this.cacheIsExist(signature)
 
       if (isExist) {

@@ -339,10 +339,9 @@ class Account {
      * saveAllAccounts batch (instead of 30 individual saves).
      *
      * Caveats:
-     * - PM2_INSTANCES > 1: each worker archives its own partial copy of stats;
-     *   the daily total would be under-reported proportionally to the worker
-     *   count. With instances=1 (ecosystem.config.js default) this is not
-     *   triggered.
+     * - Multiple replicas archive independent in-memory stats. They need
+     *   coordinated aggregation before sharing persistence; one process is
+     *   the supported default.
      * - DATA_SAVE_MODE=none: saveAllAccounts returns false and history is not
      *   persisted. Set DATA_SAVE_MODE=file or redis to enable the feature.
      * @private
@@ -544,7 +543,7 @@ class Account {
      * 获取下一个可用的账户对象（包含 proxy 等完整字段）
      * @returns {Object|null} 账户对象或 null
      */
-    getAccount() {
+    getAccount(excludedEmails = []) {
         if (!this.isInitialized) {
             logger.warn('账户管理器尚未初始化完成', 'ACCOUNT')
             return null
@@ -555,7 +554,7 @@ class Account {
             return null
         }
 
-        const account = this.accountRotator.getNextAccount()
+        const account = this.accountRotator.getNextAccount(excludedEmails)
         if (!account) {
             logger.error('所有账户令牌都不可用', 'ACCOUNT')
         }
@@ -763,10 +762,14 @@ class Account {
         this.accountRotator.recordQuotaExhausted(email, retryAfterSeconds)
     }
 
+    recordAccountChallenge(email) {
+        this.accountRotator.recordChallenge(email)
+    }
+
     /**
      * 累计 daily stats（per-account）
      * 调用方：chat.js / anthropic.js / cli.chat.js 在成功消费完上游 usage 后
-     * 注意：PM2_INSTANCES>1 时各 worker 各持一份 in-memory 副本（已记于 epic notes）
+     * 注意：多个副本各持一份 in-memory 统计，不会自动聚合。
      * @param {string} email - 邮箱地址
      * @param {'chat'|'cli'} kind - 统计类别
      * @param {Object} delta - 增量

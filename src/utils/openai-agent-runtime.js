@@ -8,7 +8,8 @@ const {
 } = require('./tool-prompt.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
 const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
-const { assertNoUpstreamFailure } = require('./upstream-error.js')
+const { assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError } = require('./upstream-error.js')
+const { recordFailedAccount, createAccountReplayBody } = require('./agent-account-failover.js')
 const {
   parseAgentControlText,
   createAgentControlStreamParser,
@@ -747,7 +748,30 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   let lastAttempt = null
   let lastEvaluation = null
   let upstreamContext = { ...(options.upstream_context || {}) }
-  const retryBaseBody = options.upstream_request_body || options.requestBody
+  let currentAccount = options.currentAccount || upstreamContext.currentAccount || null
+  let retryBaseBody = options.upstream_request_body || options.requestBody
+  let currentUpstreamOptions = { ...(options.upstreamOptions || {}) }
+  const attemptedAccounts = new Set(currentAccount?.email ? [currentAccount.email] : [])
+  let deliveredOutput = false
+  let challengeFailovers = 0
+  const observeDelivery = callback => typeof callback === 'function'
+    ? async (text, metadata) => {
+        if (text) deliveredOutput = true
+        await callback(text, metadata)
+      }
+    : null
+  const deliveryCallbacks = {
+    on_reasoning_delta: observeDelivery(options.on_reasoning_delta),
+    on_content_delta: observeDelivery(options.on_content_delta)
+  }
+  const sendBoundRequest = async (body, upstreamOptions) => {
+    try {
+      return await requestSender(body, { ...upstreamOptions, currentAccount })
+    } catch (error) {
+      recordFailedAccount(error, currentAccount)
+      throw error
+    }
+  }
   let attemptsMade = 0
   // 协议恢复重试（intercepted / malformed_protocol 共享）整个请求只允许一次。
   // 用过之后 evaluate 会跳过这两个检查，让第二次拦截/残缺按原有规则原样交付。
@@ -763,10 +787,58 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
 
   for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber++) {
     attemptsMade = attemptNumber
-    const attempt = await collectOpenAIAgentAttempt(currentResponse, {
-      ...options,
-      attempt_number: attemptNumber
-    })
+    let attempt
+    try {
+      attempt = await collectOpenAIAgentAttempt(currentResponse, {
+        ...options,
+        ...deliveryCallbacks,
+        attempt_number: attemptNumber
+      })
+    } catch (error) {
+      if (!(error instanceof UpstreamResponseError)) throw error
+      recordFailedAccount(error, currentAccount)
+      const quotaFailure = isRateLimitError(error)
+      const challengeFailure = isWafChallengeError(error)
+      const replayBody = (quotaFailure || challengeFailure) && !deliveredOutput
+        ? createAccountReplayBody(options.requestBody)
+        : null
+      if (!replayBody || !currentAccount?.email || !error.accountFailureRecorded ||
+          attemptNumber >= maxAttempts || typeof requestSender !== 'function' ||
+          options.isClientDisconnected?.() || (challengeFailure && challengeFailovers >= 1)) {
+        throw error
+      }
+
+      const replacementAccount = require('./account.js').getAccount([...attemptedAccounts])
+      if (!replacementAccount?.token || attemptedAccounts.has(replacementAccount.email)) throw error
+      attemptedAccounts.add(replacementAccount.email)
+      if (challengeFailure) challengeFailovers += 1
+      logger.warn(`Agent attempt ${attemptNumber}/${maxAttempts}: ${error.code}; retrying with a different healthy account`, 'AGENT')
+      currentAccount = replacementAccount
+      // Re-externalize the original complete prompt. Do not reuse another
+      // account's conversation IDs, shortened prompt, or cached context attachment.
+      currentUpstreamOptions = { ...currentUpstreamOptions, contextPrefixKey: null, allowContextCompaction: false }
+      const retryResponse = await sendBoundRequest(replayBody, {
+        ...currentUpstreamOptions,
+        chatId: null,
+        parentId: null,
+        agentRetry: true
+      })
+      if (!retryResponse?.status || !retryResponse.response) {
+        return {
+          ok: false,
+          error: { status: 502, message: retryResponse?.message || 'Account failover request failed', code: 'upstream_retry_failed' },
+          attempt: null,
+          attempts: attemptNumber,
+          currentAccount
+        }
+      }
+      currentAccount = retryResponse.currentAccount || currentAccount
+      attemptedAccounts.add(currentAccount.email)
+      currentResponse = retryResponse.response
+      retryBaseBody = retryResponse.requestBody || replayBody
+      upstreamContext = { chatId: retryResponse.chatId || null, parentId: null, responseId: null }
+      continue
+    }
     const evaluation = evaluateOpenAIAgentAttempt(attempt, {
       ...options,
       protocol_recovery_used: protocolRecoveryRetried
@@ -805,6 +877,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       }
       return {
         ok: true,
+        currentAccount,
         attempt,
         finishReason: evaluation.finishReason,
         attempts: attemptNumber,
@@ -837,7 +910,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         attempts: attemptNumber
       }
     }
-    if (attemptNumber >= maxAttempts || typeof requestSender !== 'function') break
+    if (attemptNumber >= maxAttempts || typeof requestSender !== 'function' || options.isClientDisconnected?.()) break
 
     if (evaluation.retryReason === 'intercepted' || evaluation.retryReason === 'malformed_protocol') {
       protocolRecoveryRetried = true
@@ -856,13 +929,12 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     // (visto 2026-09-06 20:29 en qwen-next). Defensa en profundidad — hoy toda ronda cortada
     // con llamadas se acepta arriba y no llega aquí —: el reintento abre chat nuevo.
     const chatBusy = attempt.textChannelCut === true || attempt.upstreamStopped === true
-    const retryResponse = await requestSender(retryBody, {
+    const retryResponse = await sendBoundRequest(retryBody, {
       // Opciones de contexto de la peticion original (compactar / clave del prefijo de
       // historial): sin ellas el reenvio no puede reutilizar el adjunto y quema un parse.
-      ...(options.upstreamOptions || {}),
+      ...currentUpstreamOptions,
       chatId: chatBusy ? null : (upstreamContext.chatId || null),
       parentId: chatBusy ? null : (upstreamContext.responseId || null),
-      currentAccount: options.currentAccount || null,
       agentRetry: true
     })
     if (!retryResponse?.status || !retryResponse.response) {
@@ -878,6 +950,8 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       }
     }
     currentResponse = retryResponse.response
+    currentAccount = retryResponse.currentAccount || currentAccount
+    if (currentAccount?.email) attemptedAccounts.add(currentAccount.email)
     upstreamContext = mergePresent(upstreamContext, {
       chatId: retryResponse.chatId,
       currentAccount: retryResponse.currentAccount
@@ -905,6 +979,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   // forma medida en vivo al PRIMER intento; cuando eso no aplica, agotar es agotar.
   return {
     ok: false,
+    currentAccount,
     error: exhaustedError(lastAttempt, lastEvaluation?.retryReason),
     attempt: lastAttempt,
     attempts: attemptsMade

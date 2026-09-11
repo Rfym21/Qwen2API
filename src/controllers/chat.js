@@ -447,13 +447,16 @@ const handleOpenAIAgentStream = async (
                 requestBody,
                 sendChatRequest: options.sendChatRequest || sendChatRequest,
                 on_reasoning_delta: onReasoningDelta,
-                on_content_delta: onContentDelta
+                on_content_delta: onContentDelta,
+                isClientDisconnected: () => res.destroyed || res.writableEnded
             }),
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
         logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
-        noteRateLimitedAccount(error, options.currentAccount)
+        if (!error.accountFailureRecorded) {
+            noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
+        }
         writeOpenAIHttpError(res, upstreamErrorShape(
             error, '上游 Agent 回合处理失败', 'upstream_stream_error'
         ))
@@ -529,7 +532,7 @@ const handleOpenAIAgentStream = async (
     }
     const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
     const usage = normalizeAgentUsage(attempt, requestBody, completionText)
-    attributeChatUsage(options.currentAccount, usage)
+    attributeChatUsage(runtime.currentAccount || options.currentAccount, usage)
     res.write(`data: ${JSON.stringify({
         id: `chatcmpl-${messageId}`,
         object: 'chat.completion.chunk',
@@ -564,13 +567,16 @@ const handleOpenAIAgentNonStream = async (
             () => runOpenAIAgentTurn(response, {
                 ...options,
                 requestBody,
-                sendChatRequest: options.sendChatRequest || sendChatRequest
+                sendChatRequest: options.sendChatRequest || sendChatRequest,
+                isClientDisconnected: () => res.destroyed || res.writableEnded
             }),
             options.agent_processing_heartbeat_ms
         )
     } catch (error) {
         logger.error('OpenAI 非流式 Agent 回合处理失败', 'AGENT', '', error)
-        noteRateLimitedAccount(error, options.currentAccount)
+        if (!error.accountFailureRecorded) {
+            noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
+        }
         writeOpenAIHttpError(res, upstreamErrorShape(error, '上游 Agent 回合处理失败'))
         return
     }
@@ -602,7 +608,7 @@ const handleOpenAIAgentNonStream = async (
     }
     const completionText = `${output.reasoning}${output.content}${JSON.stringify(attempt.toolCalls || [])}`
     const usage = normalizeAgentUsage(attempt, requestBody, completionText)
-    attributeChatUsage(options.currentAccount, usage)
+    attributeChatUsage(runtime.currentAccount || options.currentAccount, usage)
     res.json({
         id: `chatcmpl-${generateUUID()}`,
         object: 'chat.completion',

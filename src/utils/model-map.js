@@ -2,7 +2,7 @@ const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { MODEL_SUFFIXES } = require('./model-suffixes.js')
 
-// 落到回退目标的入站模型名，去重、封顶。每个进程一份（PM2 多 worker 时各自独立）。
+// 落到回退目标的入站模型名，去重、封顶。每个进程一份，多个副本之间各自独立。
 // 后续 dashboard（_bmad-output/implementation-artifacts/spec-model-map-ui.md，spec 2）会读它。
 const UNMAPPED_CAP = 100
 // 记录或打日志前先截断：请求体上限 128 MB（src/server.js），

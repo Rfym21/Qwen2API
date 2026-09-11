@@ -4,8 +4,8 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2026.09.11.12.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Version](https://img.shields.io/badge/version-26.09.11.16.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Bun](https://img.shields.io/badge/Bun-1.3.14+-green.svg)](https://bun.sh/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
 [🔗 加入交流群](https://t.me/nodejs_project) | [📖 文档](#api-文档) | [🐳 Docker 部署](#docker-部署)
@@ -74,7 +74,8 @@ ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5:/
 
 ### 环境要求
 
-- Node.js 18+ (源码部署时需要)
+- Bun 1.3.14+ (源码部署时需要，Docker 固定使用 1.3.14)
+- Node.js 24+ (仅开发时运行现有回归测试及 lint，生产镜像不需要)
 - Docker (可选)
 - Redis (可选，用于数据持久化)
 
@@ -90,11 +91,6 @@ SERVICE_PORT=3000             # 服务端口
 # 🔐 安全配置
 API_KEY=sk-123456,sk-456789   # API 密钥 (必填，支持多密钥)
 ACCOUNTS=                     # 账户配置 (格式: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
-
-# 🚀 PM2 多进程配置
-PM2_INSTANCES=1               # PM2进程数量 (1/数字/max)
-PM2_MAX_MEMORY=1G             # PM2内存限制 (100M/1G/2G等)
-                              # 注意: PM2集群模式下所有进程共用同一个端口
 
 # 🔍 功能配置
 SEARCH_INFO_MODE=table        # 搜索信息展示模式 (table/text)
@@ -130,8 +126,6 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `LISTEN_ADDRESS` | 服务监听地址 | `localhost` 或 `0.0.0.0` |
 | `SERVICE_PORT` | 服务运行端口 | `3000` |
 | `API_KEY` | API 访问密钥，支持多密钥配置。第一个为管理员密钥（可访问前端管理页面），其他为普通密钥（仅可调用API）。多个密钥用逗号分隔 | `sk-admin123,sk-user456,sk-user789` |
-| `PM2_INSTANCES` | PM2进程数量 | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | PM2内存限制 | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | 搜索结果展示格式 | `table` 或 `text` |
 | `OUTPUT_THINK` | 是否显示 AI 思考过程 | `true` 或 `false` |
 | `LEGACY_REASONING_IN_CONTENT` | 推理输出格式。默认 `false`=推理走独立的 `reasoning_content` 字段；`true`=旧版行为（`<think>` 并入 `content`） | `true` 或 `false` |
@@ -252,32 +246,91 @@ git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
 # 安装依赖
-npm install
+bun install --frozen-lockfile
+bun install --cwd public --frozen-lockfile
+bun run build:frontend
 
 # 配置环境变量
 cp .env.example .env
 # 编辑 .env 文件
 
-# 智能启动 (推荐 - 自动判断单进程/多进程)
-npm start
+# Bun 单进程启动
+bun run start
 
 # 开发模式
-npm run dev
+bun run dev
 ```
 
-### 🚀 PM2 多进程部署
+### 运行与验证
 
-使用 PM2 进行生产环境多进程部署，提供更好的性能和稳定性。
+服务使用 Bun 单进程运行，已移除 PM2 和自动 cluster 启动。旧的
+`PM2_INSTANCES`、`PM2_MAX_MEMORY` 不再生效。容器重启由 Compose 的
+`restart: always` 管理；内存上限可使用 Compose 的 `mem_limit` 配置。
+账户统计、限流和运行时设置含进程内状态，多副本部署前需要先解决共享与同步。
 
-**重要说明**: PM2 集群模式下，所有进程共用同一个端口，PM2 会自动进行负载均衡。
+`bun run test` 保留 Node 测试运行器，以继续执行原有回归测试；
+`bun run test:bun` 则启动真实 Bun 服务和本地模拟上游，检查登录、前端、WASM
+及 OpenAI/Anthropic 的 JSON 和 SSE 响应，不使用真实账户。
+默认以源码运行，也可使用 `node src/server.js` 临时对照验证。
 
-### 🤖 智能启动模式
+### 独立二进制
 
-使用 `npm start` 可以自动判断启动方式：
+```bash
+# 当前系统/架构；自动构建前端，输出到 pkg_dist/
+bun run build:binary
 
-- 当 `PM2_INSTANCES=1` 时，使用单进程模式
-- 当 `PM2_INSTANCES>1` 时，使用 Node.js 集群模式
-- 自动限制进程数不超过 CPU 核心数
+# 可选：交叉编译 Linux x64（Alpine 使用 bun-linux-x64-musl）
+bun run build:binary --target bun-linux-x64
+
+# Windows 产物的隔离验证
+bun run test:bun --binary pkg_dist/qwen2api-windows-x64.exe
+```
+
+可执行文件内含 Bun 运行时、后端、前端静态资源和 tiktoken WASM，无需另装
+Node、Bun 或 node_modules。Windows x64 产物为 `pkg_dist/qwen2api-windows-x64.exe`。
+目标系统必须与编译目标一致；交叉编译完成不代表已在该系统验证。
+
+启动前进入一个可写目录，在该目录配置 `.env`（或直接设置环境变量），再运行可执行文件。
+`.env` 和账户凭据不会打包进产物。二进制默认将 `data/`、`logs/`、`caches/`
+放在当前工作目录；可用 `QWEN2API_RUNTIME_DIR` 指定其他可写根目录。
+`--version` 可查看版本，不会启动服务。Docker 使用 Alpine + musl 二进制，
+不再复制源码、node_modules 或单独的 Bun CLI。
+
+### CI 与发布工作流
+
+- `ci.yml`：推送和 PR 调用验证流程，只上传 Actions artifacts，不发布。
+- `verify.yml`：可复用验证。Node 24 执行 lint 与完整回归，Bun 版本取自
+  `package.json` 的 `packageManager`；前端只构建一次。Windows x64、Linux x64/arm64
+  在各自原生 runner 编译并测试二进制，Linux 额外测试实际的 Alpine 容器。
+- `release.yml`：仅监听 `main` 的 `package.json`。比较推送前后的 `version`，
+  未变化就跳过产物构建和发布；新建分支没有比较基准时也跳过，可手动构建。
+  普通源码提交、PR、标签推送均不触发发布。
+
+手动操作：Actions → Release → Run workflow。不勾选 `publish` 只验证并生成 artifacts；
+勾选后只允许从 `main` 发布，且仍必须完整通过验证。
+
+发布产物为 Windows x64、Linux x64/arm64 的 `.tar.gz`（可执行文件、`.env.example`、
+运行说明）和 `SHA256SUMS`，以及 `linux/amd64`、`linux/arm64` 多架构 Docker 镜像。
+Linux 下载包为 glibc 版，Docker 为 musl 版。发布直接加载验证任务导出的镜像，
+不重新构建；自动生成 `v<version>` 标签。只有 main 仍为同一版本、且发布提交仍在
+main 历史中时才更新 `latest`，后续普通文档提交不会阻止更新。
+
+首次启用需要配置 `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN` secrets，并确保 Docker Hub
+目标仓库可写。发布使用 `release` environment，可设置 main 分支限制和人工审批；
+只有发布 job 具有 `contents: write` 权限，其他验证任务不接触发布凭据。
+
+已发布版本不能覆盖。Git 标签或 Docker 版本标签指向其他提交时，必须提升版本号。
+中途失败会保留草稿，允许在同一提交上重跑；多个外部服务的发布不是原子事务，
+失败时可能已出现部分镜像标签。当前版本曾发布过旧镜像，首次正式发布应使用新版本。
+发布 job 使用 GitHub 的 `queue: max` 保留等待任务（最多 100 个），不会因新的
+普通 package.json 提交而替换掉待发布版本。验证任务可以并行，发布阶段串行执行。
+
+本地构建二进制镜像仍可直接运行：
+```bash
+docker build -f docker/Dockerfile -t qwen2api:local .
+# Linux 上测试实际容器（使用本地模拟上游，不使用真实账户）
+bun run test:bun --docker-image qwen2api:local
+```
 
 ### ☁️ Hugging Face 部署
 
@@ -292,6 +345,8 @@ npm run dev
 ### ☁️ Vercel 部署
 
 快速部署到 Vercel：
+
+此平台入口仍保留 Node/Express 兼容方式；Bun 运行时迁移适用于本地和 Docker。
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
 
@@ -311,7 +366,7 @@ DATA_SAVE_MODE=none
 ```
 Qwen2API/
 ├── README.md
-├── ecosystem.config.js              # PM2配置文件
+├── bun.lock                         # Bun依赖锁文件
 ├── package.json
 │
 ├── docker/                          # Docker配置目录
@@ -328,7 +383,6 @@ Qwen2API/
 │
 ├── src/                             # 后端源代码目录
 │   ├── server.js                    # 主服务器文件
-│   ├── start.js                     # 智能启动脚本 (自动判断单进程/多进程)
 │   ├── config/
 │   │   └── index.js                 # 配置文件
 │   ├── controllers/                 # 控制器目录

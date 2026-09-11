@@ -246,7 +246,7 @@ test('DEFECT 2: blessing zero attempts is refused rather than writing garbage', 
 /* ---------------------------------------------------------------------------
  * DEFECT 3 (minor) — the CI job's timeout-minutes must be able to contain the
  * gate's own worst case (TEST_GATE_TIMEOUT_MS x TEST_GATE_ATTEMPTS) plus the
- * npm ci / lint steps. As shipped the watchdog was 10 min x 3 attempts = 30 min
+ * dependency installation / lint steps. As shipped the watchdog was 10 min x 3 attempts = 30 min
  * inside a 10-minute job, so the job died first and the watchdog could never
  * act — the gate's "it can never hang" property did not hold in CI.
  * ------------------------------------------------------------------------- */
@@ -254,18 +254,23 @@ test('DEFECT 2: blessing zero attempts is refused rather than writing garbage', 
 test('DEFECT 3: the CI job budget can contain the gate watchdog x attempts', () => {
   const fs = require('node:fs')
   const path = require('node:path')
-  const ci = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8')
+  const { parse } = require('yaml')
+  const workflowDirectory = path.join(__dirname, '..', '.github', 'workflows')
+  const ci = parse(fs.readFileSync(path.join(workflowDirectory, 'ci.yml'), 'utf8'))
+  const verification = parse(fs.readFileSync(path.join(workflowDirectory, 'verify.yml'), 'utf8'))
+  assert.equal(ci.jobs.verify.uses, './.github/workflows/verify.yml')
+  const regressionJob = verification.jobs.regression
+  const regressionStep = regressionJob.steps.find(step => step.run === 'bun run test')
+  assert.ok(regressionStep, 'The reusable workflow must run the complete regression gate')
 
-  assert.match(ci, /npm test/, 'ci.yml no longer runs npm test — this guard is stale')
+  const jobMinutes = regressionJob['timeout-minutes']
+  assert.ok(Number.isInteger(jobMinutes), 'verify.yml regression job has no timeout-minutes')
 
-  const jobMinutes = Number(/^\s*timeout-minutes:\s*(\d+)\s*$/m.exec(ci)?.[1])
-  assert.ok(Number.isInteger(jobMinutes), 'ci.yml has no timeout-minutes to check against')
-
-  const gateMs = Number(/^\s*TEST_GATE_TIMEOUT_MS:\s*(\d+)\s*$/m.exec(ci)?.[1])
+  const gateMs = regressionStep.env.TEST_GATE_TIMEOUT_MS
   assert.ok(Number.isInteger(gateMs),
-    'ci.yml must pin TEST_GATE_TIMEOUT_MS; the 10-minute default x 3 attempts outlives any sane job budget')
+    'verify.yml must pin TEST_GATE_TIMEOUT_MS; the 10-minute default x 3 attempts outlives any sane job budget')
 
-  const attempts = Number(/^\s*TEST_GATE_ATTEMPTS:\s*(\d+)\s*$/m.exec(ci)?.[1] ?? 3)
+  const attempts = regressionStep.env.TEST_GATE_ATTEMPTS
   const worstCaseMs = gateMs * attempts
   assert.ok(worstCaseMs < jobMinutes * 60000,
     `gate worst case ${worstCaseMs}ms >= job budget ${jobMinutes * 60000}ms: ` +

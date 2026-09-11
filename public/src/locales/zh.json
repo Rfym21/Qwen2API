@@ -152,7 +152,7 @@
     "modelMapTitle": "🗺️ 模型映射",
     "modelMapHint": "请求发往上游前，入站模型名会被替换成 Qwen 模型。未列出的名字走回退行；但本身就是 Qwen 模型 id 的名字原样透传。",
     "modelMapRulesHint": "保存时别名转小写并去掉末尾的 [..] 后缀。别名等于某个 Qwen 模型 id 时会覆盖该 id，这是有意为之。",
-    "modelMapClusterHint": "PM2 多 worker 时，保存的映射在其他 worker 重启后才生效。",
+    "modelMapClusterHint": "默认使用 Bun 单进程。若部署多个副本，持久化映射在其他副本重启后才生效。",
     "modelMapNoneModeHint": "DATA_SAVE_MODE=none：修改只在内存中生效，重启后丢失。",
     "modelMapAlias": "入站模型名",
     "modelMapTarget": "Qwen 模型",

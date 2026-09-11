@@ -4,8 +4,8 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-2026.09.11.12.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Version](https://img.shields.io/badge/version-26.09.11.16.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Bun](https://img.shields.io/badge/Bun-1.3.14+-green.svg)](https://bun.sh/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
 [🔗 Присоединиться к чату](https://t.me/nodejs_project) | [📖 Документация](#api-документация) | [🐳 Развертывание Docker](#развертывание-docker)
@@ -94,7 +94,8 @@ ACCOUNTS=user1@mail.com:pass1|http://10.0.0.1:8080,user2@mail.com:pass2|socks5:/
 
 ### Требования к окружению
 
-- Node.js 18+ (необходим при развертывании из исходников)
+- Bun 1.3.14+ (для запуска из исходников; Docker использует 1.3.14)
+- Node.js 24+ (только для тестов и lint при разработке, не нужен в production-образе)
 - Docker (опционально)
 - Redis (опционально, для персистентного хранения данных)
 
@@ -110,11 +111,6 @@ SERVICE_PORT=3000             # Порт сервиса
 # 🔐 Безопасность
 API_KEY=sk-123456,sk-456789   # API-ключи (обязательно, поддержка нескольких ключей)
 ACCOUNTS=                     # Настройка аккаунтов (формат: user1:pass1[|proxy_url],user2:pass2[|proxy_url])
-
-# 🚀 Многопроцессная конфигурация PM2
-PM2_INSTANCES=1               # Количество процессов PM2 (1/число/max)
-PM2_MAX_MEMORY=1G             # Ограничение памяти PM2 (100M/1G/2G и т.д.)
-                              # Примечание: в кластерном режиме PM2 все процессы используют один порт
 
 # 🔍 Конфигурация функций
 SEARCH_INFO_MODE=table        # Режим отображения результатов поиска (table/text)
@@ -145,8 +141,6 @@ CACHE_MODE=default            # Режим кэширования изображ
 | `LISTEN_ADDRESS` | Адрес прослушивания сервиса | `localhost` или `0.0.0.0` |
 | `SERVICE_PORT` | Порт работы сервиса | `3000` |
 | `API_KEY` | API-ключи доступа, поддержка нескольких ключей. Первый ключ — администраторский (доступ к панели управления), остальные — обычные (только вызов API). Разделяются запятой | `sk-admin123,sk-user456,sk-user789` |
-| `PM2_INSTANCES` | Количество процессов PM2 | `1`/`4`/`max` |
-| `PM2_MAX_MEMORY` | Ограничение памяти PM2 | `100M`/`1G`/`2G` |
 | `SEARCH_INFO_MODE` | Формат отображения результатов поиска | `table` или `text` |
 | `OUTPUT_THINK` | Отображать ли процесс размышления AI | `true` или `false` |
 | `LEGACY_REASONING_IN_CONTENT` | Формат вывода рассуждений. По умолчанию `false` = рассуждения в отдельном поле `reasoning_content`; `true` = старый режим (`<think>` внутри `content`) | `true` или `false` |
@@ -262,32 +256,70 @@ git clone https://github.com/Rfym21/Qwen2API.git
 cd Qwen2API
 
 # Установить зависимости
-npm install
+bun install --frozen-lockfile
+bun install --cwd public --frozen-lockfile
+bun run build:frontend
 
 # Настроить переменные окружения
 cp .env.example .env
 # Отредактировать файл .env
 
-# Умный запуск (рекомендуется — автоматически определяет одно-/многопроцессный режим)
-npm start
+# Запустить один процесс Bun
+bun run start
 
 # Режим разработки
-npm run dev
+bun run dev
 ```
 
-### 🚀 Многопроцессное развертывание PM2
+### Запуск и проверка
 
-Используйте PM2 для многопроцессного развертывания в продакшене, обеспечивая лучшую производительность и стабильность.
+Сервис работает в одном процессе Bun. PM2 и автоматический cluster удалены;
+`PM2_INSTANCES` и `PM2_MAX_MEMORY` больше не действуют. Перезапуск задается через
+Compose `restart: always`, лимит памяти через `mem_limit`. Статистика, лимиты и
+настройки частично хранятся в памяти процесса: нескольким репликам нужна синхронизация.
 
-**Важно**: В кластерном режиме PM2 все процессы используют один порт, PM2 автоматически выполняет балансировку нагрузки.
+`bun run test` сохраняет Node test runner для существующих тестов.
+`bun run test:bun` проверяет реальный Bun-сервис с локальным mock upstream:
+вход, фронтенд, WASM, OpenAI/Anthropic JSON и SSE без реальных аккаунтов.
+По умолчанию используются исходники. Для сравнения доступен `node src/server.js`.
 
-### 🤖 Умный режим запуска
+### Отдельный исполняемый файл
 
-Используйте `npm start` для автоматического определения способа запуска:
+`bun run build:binary` собирает фронтенд и бинарный файл для текущей системы в `pkg_dist/`.
+Для Linux x64: `bun run build:binary --target bun-linux-x64` (для Alpine: `bun-linux-x64-musl`).
+Кросс-компиляция не заменяет проверку запуска на целевой системе.
+Проверка Windows: `bun run test:bun --binary pkg_dist/qwen2api-windows-x64.exe`.
 
-- При `PM2_INSTANCES=1` — однопроцессный режим
-- При `PM2_INSTANCES>1` — кластерный режим Node.js
-- Количество процессов автоматически ограничивается числом ядер CPU
+Файл содержит Bun, бэкенд, фронтенд и tiktoken WASM; Node, Bun и node_modules на сервере
+не нужны. Запускайте его из доступного для записи каталога с `.env` либо задайте переменные
+окружения. Учётные данные и `.env` не встраиваются. Каталоги `data/`, `logs/`, `caches/`
+создаются относительно рабочего каталога; `QWEN2API_RUNTIME_DIR` меняет этот корень.
+`--version` выводит версию без запуска сервера. Docker содержит Alpine и musl-бинарник,
+без исходников, node_modules и отдельного Bun CLI.
+
+### CI и публикация
+
+`ci.yml` проверяет push и PR без публикации. Общий `verify.yml` запускает lint и регрессию
+на Node 24, берет Bun из packageManager, собирает фронтенд один раз и проверяет бинарники
+Windows x64, Linux x64/arm64 на нативных runner. Linux также проверяет реальные Alpine-контейнеры.
+
+`release.yml` публикует только при изменении version в package.json на main или вручную
+через Run workflow с включённым publish на main. Без publish создаются только artifacts.
+Обычные изменения исходников, PR и push тегов не публикуют релиз.
+
+Релиз содержит три .tar.gz (бинарник, .env.example, инструкция), SHA256SUMS и Docker-образы
+linux/amd64 и linux/arm64. Архивы Linux используют glibc, контейнеры musl. Публикуются уже
+проверенные образы без повторной сборки. Опубликованные версии не перезаписываются; тег
+другого коммита требует новой версии. Незавершённый черновик можно повторить на том же коммите.
+latest обновляется, пока main имеет ту же версию и содержит коммит релиза в своей истории.
+Очередь publish использует queue:max (до 100 ожидающих задач). Публикация не атомарна: при сбое могут
+остаться черновик и часть тегов образов.
+
+Нужны secrets DOCKERHUB_USERNAME, DOCKERHUB_TOKEN и доступный для записи Docker Hub репозиторий.
+Только publish job имеет contents:write; environment release позволяет задать ограничения
+ветки и ручное подтверждение. Перед первым новым релизом увеличьте текущую версию.
+Локальная сборка: `docker build -f docker/Dockerfile -t qwen2api:local .`.
+Проверка контейнера на Linux: `bun run test:bun --docker-image qwen2api:local`.
 
 ### ☁️ Развертывание на Hugging Face
 
@@ -302,6 +334,8 @@ npm run dev
 ### ☁️ Развертывание на Vercel
 
 Быстрое развертывание на Vercel:
+
+Этот вариант сохраняет совместимость Node/Express; переход на Bun относится к локальному запуску и Docker.
 
 [![Развернуть с Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FRfym21%2FQwen2API)
 
@@ -320,7 +354,7 @@ DATA_SAVE_MODE=none
 ```
 Qwen2API/
 ├── README.md
-├── ecosystem.config.js              # Конфигурация PM2
+├── bun.lock                         # Фиксация зависимостей Bun
 ├── package.json
 │
 ├── docker/                          # Директория конфигурации Docker
@@ -337,7 +371,6 @@ Qwen2API/
 │
 ├── src/                             # Директория исходного кода бэкенда
 │   ├── server.js                    # Главный файл сервера
-│   ├── start.js                     # Скрипт умного запуска (авто-определение одно-/многопроцессного режима)
 │   ├── config/
 │   │   └── index.js                 # Файл конфигурации
 │   ├── controllers/                 # Директория контроллеров

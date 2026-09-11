@@ -3,6 +3,7 @@ const path = require('path')
 const config = require('../config/index.js')
 const redisClient = require('./redis')
 const { logger } = require('./logger')
+const { resolveRuntimePath } = require('./runtime-paths')
 
 /**
  * 数据持久化管理器
@@ -18,7 +19,7 @@ const RENAME_RETRY_DELAYS_MS = [20, 50, 100]
 // 进程内串行化：所有对 data.json 的 read-modify-write 排队执行。
 // 队列必须是模块级的——进程里存在多个 DataPersistence 实例
 // （utils/account.js 一个、routes/settings.js 一个），实例级的锁挡不住并发。
-// 注：PM2 cluster（PM2_INSTANCES > 1）下跨进程仍可能「后写覆盖先写」丢一次统计，
+// 注：多个进程共享文件时仍可能「后写覆盖先写」丢一次统计，
 // 但原子 rename 保证任何时刻文件都是完整 JSON，不会再出现半截内容。
 let fileWriteQueue = Promise.resolve()
 let tmpFileCounter = 0
@@ -40,7 +41,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 class DataPersistence {
   constructor() {
-    this.dataFilePath = path.join(__dirname, '../../data/data.json')
+    this.dataFilePath = resolveRuntimePath('data', 'data.json')
     // 最近一次「解析成功」的快照，用于文件损坏时自愈
     this.backupFilePath = `${this.dataFilePath}.bak`
     // 每个 email 的待持久化 stats 与定时器（debounce）

@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const { resolveRuntimePath } = require('./runtime-paths')
 
 /**
  * 日志管理器
@@ -13,7 +14,7 @@ class Logger {
       // 是否启用文件日志
       enableFileLog: options.enableFileLog || false,
       // 日志文件路径
-      logDir: options.logDir || path.join(__dirname, '../../logs'),
+      logDir: options.logDir || resolveRuntimePath('logs'),
       // 日志文件名格式
       logFileName: options.logFileName || 'app.log',
       // 是否显示时间戳
