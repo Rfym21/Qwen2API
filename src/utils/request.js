@@ -3,7 +3,7 @@ const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
 const { getSsxmodForAccount } = require('./ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
@@ -667,7 +667,6 @@ const sendChatRequest = async (body, options = {}) => {
     }
 
     const chatBaseUrl = getChatBaseUrl()
-    const proxyAgent = getProxyAgent(currentAccount)
 
     // Antidetect: per-account fingerprint headers replace static block
     const ssxmod = getSsxmodForAccount(currentAccount)
@@ -690,11 +689,7 @@ const sendChatRequest = async (body, options = {}) => {
         timeout: 10 * 60 * 1000, // Max/thinking models may exceed 60s before answer
     }
 
-    // 添加代理配置
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false // 禁用axios默认代理，使用httpsAgent
-    }
+    applyProxyToAxiosConfig(requestConfig, currentAccount);
 
     const chatType = body.chat_type || body.messages?.[0]?.chat_type || 't2t'
     const chat_id = options.chatId || await generateChatID(currentToken, body.model, currentAccount, chatType)
@@ -843,7 +838,6 @@ const sendChatRequest = async (body, options = {}) => {
 const generateChatID = async (currentToken, model, account, chatType = 't2t') => {
     try {
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
 
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
@@ -863,11 +857,7 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
             headers
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {

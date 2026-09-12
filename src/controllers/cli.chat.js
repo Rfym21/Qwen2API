@@ -1,7 +1,7 @@
 const axios = require('axios')
 const { logger } = require('../utils/logger')
 const accountManager = require('../utils/account')
-const { getProxyAgent, getCliBaseUrl } = require('../utils/proxy-helper')
+const { applyProxyToAxiosConfig, getCliBaseUrl } = require('../utils/proxy-helper');
 const { consumeSSEStream, formatSSEFrame } = require('../utils/sse')
 
 /**
@@ -295,7 +295,6 @@ const handleCliChatCompletion = async (req, res) => {
         req.account.cli_info.request_number++
 
         const cliBaseUrl = getCliBaseUrl()
-        const proxyAgent = getProxyAgent(req.account)
 
         // 设置请求配置
         const axiosConfig = {
@@ -325,11 +324,7 @@ const handleCliChatCompletion = async (req, res) => {
             }
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            axiosConfig.httpsAgent = proxyAgent
-            axiosConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(axiosConfig, req.account);
 
         // 如果是流式请求，设置响应类型为流
         if (isStream) {

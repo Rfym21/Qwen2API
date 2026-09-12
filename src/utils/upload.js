@@ -103,7 +103,6 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 
         const requestId = generateUUID()
         const bearerToken = authToken.startsWith('Bearer ') ? authToken : `Bearer ${authToken}`
-        const proxyAgent = getProxyAgent(account)
 
         // Antidetect: per-account fingerprint headers replace static UA
         const baseHeaders = buildRequestHeaders(account, {
@@ -125,11 +124,7 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
             timeout: UPLOAD_CONFIG.timeout
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         logger.info(`请求STS Token: ${filename} (${filesize} bytes, ${filetypeSimple})`, 'UPLOAD', '🎫')
 
@@ -202,15 +197,51 @@ const requestStsToken = async (filename, filesize, filetypeSimple, authToken, re
 }
 
 /**
+ * Preserve the OSS buffered-upload response contract while bypassing Bun's Node agent shim.
+ */
+const createOssProxyClient = (account) => {
+    if (!process.versions.bun || !getProxyAgent(account)) return undefined;
+    return {
+        async request(url, options) {
+            let response;
+            try {
+                response = await axios.request(applyProxyToAxiosConfig({
+                    url,
+                    method: options.method,
+                    headers: options.headers,
+                    data: options.content,
+                    timeout: options.timeout,
+                    responseType: 'arraybuffer',
+                    validateStatus: () => true
+                }, account));
+            } catch (error) {
+                // ali-oss recognizes urllib's transport status codes when preserving errors.
+                error.status = ['ETIMEDOUT', 'ECONNABORTED'].includes(error.code) ? -2 : -1;
+                throw error;
+            }
+            const data = Buffer.from(response.data);
+            const headers = response.headers.toJSON();
+            return {
+                status: response.status,
+                headers,
+                data,
+                res: { status: response.status, statusCode: response.status, headers, size: data.length }
+            };
+        }
+    };
+};
+
+/**
  * 使用STS凭证将文件Buffer上传到阿里云OSS（带重试机制）
  * @param {Buffer} fileBuffer - 文件内容的Buffer
  * @param {Object} stsCredentials - STS凭证
  * @param {Object} ossInfo - OSS信息
  * @param {string} fileContentTypeFull - 文件的完整MIME类型
  * @param {number} retryCount - 重试次数
+ * @param {Object} [account] - 账户对象，用于保持 STS 和 OSS 的代理一致
  * @returns {Promise<Object>} 上传结果
  */
-const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount = 0) => {
+const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount = 0, account) => {
     try {
         // 参数验证
         if (!fileBuffer || !stsCredentials || !ossInfo) {
@@ -218,6 +249,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             throw new Error('缺少必要的上传参数')
         }
 
+        const proxyAgent = getProxyAgent(account);
         const client = new OSS({
             accessKeyId: stsCredentials.access_key_id,
             accessKeySecret: stsCredentials.access_key_secret,
@@ -225,6 +257,9 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             bucket: ossInfo.bucket,
             endpoint: ossInfo.endpoint,
             secure: true,
+            agent: proxyAgent,
+            httpsAgent: proxyAgent,
+            urllib: createOssProxyClient(account),
             timeout: UPLOAD_CONFIG.timeout
         })
 
@@ -252,7 +287,7 @@ const uploadToOssWithSts = async (fileBuffer, stsCredentials, ossInfo, fileConte
             logger.warn(`等待 ${delayMs}ms 后重试OSS上传...`, 'UPLOAD', '⏳')
             await delay(delayMs)
 
-            return uploadToOssWithSts(fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount + 1)
+            return uploadToOssWithSts(fileBuffer, stsCredentials, ossInfo, fileContentTypeFull, retryCount + 1, account);
         }
 
         throw error
@@ -299,7 +334,7 @@ const uploadFileToQwenOss = async (fileBuffer, originalFilename, authToken, acco
         )
 
         // 第二步：上传到OSS
-        await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType)
+        await uploadToOssWithSts(fileBuffer, credentials, file_info, mimeType, 0, account);
 
         logger.success('文件上传流程完成', 'UPLOAD')
 

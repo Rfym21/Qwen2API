@@ -1,7 +1,7 @@
 const axios = require('axios')
 const accountManager = require('../utils/account.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { generateUUID } = require('../utils/tools.js')
 const { buildRequestHeaders } = require('../utils/header-profile')
 const { logger } = require('../utils/logger')
@@ -30,7 +30,6 @@ const getLatestModels = async (force = false) => {
     const chatBaseUrl = getChatBaseUrl()
     // 一次取出账户对象，token 与 proxy 走同一个账号，避免 round-robin 错位
     const account = accountManager.getAccount()
-    const proxyAgent = getProxyAgent(account)
 
     // Antidetect: per-account fingerprint headers replace static block
     const ssxmod = getSsxmodForAccount(account)
@@ -49,11 +48,7 @@ const getLatestModels = async (force = false) => {
         headers
     }
 
-    // 添加代理配置
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false
-    }
+    applyProxyToAxiosConfig(requestConfig, account);
 
     fetchPromise = axios.get(`${chatBaseUrl}/api/models`, requestConfig).then(response => {
         cachedModels = response.data.data

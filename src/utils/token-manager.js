@@ -1,7 +1,7 @@
 const axios = require('axios')
 const { sha256Encrypt, JwtDecode, jitter } = require('./tools')
 const { logger } = require('./logger')
-const { getProxyAgent, getChatBaseUrl } = require('./proxy-helper')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { buildUserAgent } = require('./header-profile')
 
 /**
@@ -33,7 +33,6 @@ class TokenManager {
      */
     async login(email, password, account) {
         try {
-            const proxyAgent = getProxyAgent(account)
             // Use per-account fingerprint UA when available; fall back to legacy Edge UA
             const ua = (account && account.fingerprint) ? buildUserAgent(account.fingerprint) : this.defaultHeaders['User-Agent']
             const requestConfig = {
@@ -41,11 +40,7 @@ class TokenManager {
                 timeout: 10000 // 10秒超时
             }
 
-            // 添加代理配置
-            if (proxyAgent) {
-                requestConfig.httpsAgent = proxyAgent
-                requestConfig.proxy = false
-            }
+            applyProxyToAxiosConfig(requestConfig, account);
 
             const response = await axios.post(this.loginEndpoint, {
                 email: email,

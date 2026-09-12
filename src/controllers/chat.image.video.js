@@ -8,7 +8,7 @@ const { uploadFileToQwenOss } = require('../utils/upload.js')
 const { parserModel } = require('../utils/chat-helpers.js')
 const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
-const { getProxyAgent, getChatBaseUrl } = require('../utils/proxy-helper')
+const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -632,16 +632,12 @@ const sendOpenAIErrorResponse = (res, error) => {
  * @returns {Promise<string>} Base64 内容
  */
 const downloadAssetAsBase64 = async (contentUrl, account) => {
-    const proxyAgent = getProxyAgent(account)
     const requestConfig = {
         responseType: 'arraybuffer',
         timeout: 1000 * 60 * 2
     }
 
-    if (proxyAgent) {
-        requestConfig.httpsAgent = proxyAgent
-        requestConfig.proxy = false
-    }
+    applyProxyToAxiosConfig(requestConfig, account);
 
     const responseData = await axios.get(contentUrl, requestConfig)
     return Buffer.from(responseData.data).toString('base64')
@@ -1003,7 +999,6 @@ const getChatDetail = async (chatID, token) => {
         const chatBaseUrl = getChatBaseUrl()
         // 通过 token 反查 account 解析账号级代理（找不到则回退到全局 PROXY_URL）
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {
@@ -1020,10 +1015,7 @@ const getChatDetail = async (chatID, token) => {
             headers
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const responseData = await axios.get(`${chatBaseUrl}/api/v2/chats/${chatID}`, requestConfig)
         return responseData.data || null
@@ -1334,7 +1326,6 @@ const generateImageVideoResult = async (payload) => {
         }
 
         const chatBaseUrl = getChatBaseUrl()
-        const proxyAgent = getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {
@@ -1365,10 +1356,7 @@ const generateImageVideoResult = async (payload) => {
             timeout: 1000 * 60 * 5
         }
 
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         let responseData = null
         const maxUpstreamAttempts = 2
@@ -1695,7 +1683,6 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
     try {
         const chatBaseUrl = getChatBaseUrl()
         const account = accountManager.getAccountByToken(token)
-        const proxyAgent = getProxyAgent(account)
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
         const headers = buildRequestHeaders(account, {
@@ -1712,11 +1699,7 @@ const getVideoTaskStatus = async (videoTaskID, token) => {
             headers
         }
 
-        // 添加代理配置
-        if (proxyAgent) {
-            requestConfig.httpsAgent = proxyAgent
-            requestConfig.proxy = false
-        }
+        applyProxyToAxiosConfig(requestConfig, account);
 
         const response_data = await axios.get(`${chatBaseUrl}/api/v1/tasks/status/${videoTaskID}`, requestConfig)
 

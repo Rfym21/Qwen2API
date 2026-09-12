@@ -37,7 +37,9 @@
     "mime-types": "^3.0.1",
     "multer": "^2.3.0",
     "proxy-agent": "^5.0.0",
-    "tiktoken": "^1.0.21"
+    "socks-proxy-agent": "^8.0.5",
+    "tiktoken": "^1.0.21",
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

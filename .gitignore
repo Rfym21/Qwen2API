@@ -12,3 +12,4 @@ pkg_dist/
 .idea
 /public/dist
 .vscode
+.bce-tool/
