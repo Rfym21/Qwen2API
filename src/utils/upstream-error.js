@@ -262,7 +262,8 @@ const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus =
  * HTTP 4xx/5xx) no enfria a proposito, y ese es justo el hueco.
  *
  * El require es perezoso: account.js arranca temporizadores al cargarse y no debe
- * entrar en la cadena de carga de este modulo, que es puro.
+ * entrar en la cadena de carga de este modulo, que no arranca ninguno (el unico estado
+ * que guarda es el cortacircuitos del chat challenge, mas abajo).
  * @param {unknown} error - Error capturado en el controlador
  * @param {{email?: string}|null} [account] - Cuenta que sirvio la peticion
  * @returns {boolean} true si se marco la cuenta
@@ -285,50 +286,102 @@ const noteRateLimitedAccount = (error, account) => {
  * historial siguen pasando. Medido en prod 2026-09-23..26: 477 de 502 envios desafiados,
  * todos entre 07:00Z y 22:00Z (el pico de Pekin); la misma cuenta pasa de noche y cae de
  * dia, asi que no es la cuenta ni el tamano del contexto. Cada reintento inmediato del
- * cliente agentico re-sube su historial y agota el limitador de parse en segundos. Tras
- * CHAT_BREAKER_STRIKES desafios seguidos se contesta 529/503 sin tocar Qwen durante
- * CHAT_BREAKER_SECONDS; pasado ese tiempo sale una sonda, y la primera respuesta con
- * `choices` lo cierra.
+ * cliente agentico re-sube su historial y agota el limitador de parse en segundos.
+ *
+ * Cortacircuitos (gemelo en intencion del de parse en upload.js, pero con media apertura):
+ * - cerrado: cada desafio suma un strike; una respuesta con `choices` los borra.
+ * - abierto: tras CHAT_BREAKER_STRIKES seguidos, sendChatRequest contesta 529/503 sin
+ *   tocar Qwen durante `chatChallengeBreakerSeconds`. Una respuesta de un stream que ya
+ *   estaba en curso borra strikes pero NO cierra: no prueba que Qwen acepte peticiones nuevas.
+ * - media apertura: la primera peticion tras el enfriamiento sale como UNICA sonda y
+ *   rearma la ventana para las demas. Si Qwen le contesta, cierra; si la desafia, reabre.
  */
-const CHAT_CHALLENGE_MESSAGE = 'Qwen 上游繁忙，触发风控验证（被挤爆啦），请稍后重试 / Qwen chat challenge: upstream busy, retry later';
+const CHAT_BUSY_MESSAGE = 'Qwen 上游繁忙，触发风控验证（被挤爆啦），请稍后重试 / Qwen chat challenge: upstream busy, retry later';
+const CHAT_CAPTCHA_MESSAGE = 'Qwen 上游要求人机验证（captcha），请稍后重试 / Qwen chat challenge: captcha required, retry later';
+const CHAT_BREAKER_MESSAGE = 'Qwen 上游连续触发风控验证，已暂停发送，请稍后重试 / Qwen chat challenge: repeated upstream challenges, requests paused, retry later';
+const CHAT_BUSY_SIGNAL_RE = /RGV587|被挤爆/;
 const CHAT_CHALLENGE_RETRY_AFTER_SECONDS = 30;
 const CHAT_BREAKER_STRIKES = 3;
 // ponytail: un breaker global, porque todas las cuentas salen por la misma egress; por egress cuando haya varias.
-const CHAT_BREAKER_SECONDS = 60;
-const chatBreaker = { strikes: 0, openUntil: 0 };
+const chatBreaker = { strikes: 0, openUntil: 0, probing: false };
+
+// Reloj inyectable, como parseClock en upload.js: los tests avanzan la ventana sin dormir.
+let chatClock = () => Date.now();
+const setChatChallengeClockForTests = (fn) => { chatClock = typeof fn === 'function' ? fn : () => Date.now(); };
+
+// Perezosos como el require de account.js: config valida el entorno al cargarse.
+const chatBreakerSeconds = () => Math.max(0, Number(require('../config/index.js').chatChallengeBreakerSeconds) || 0);
+const logger = () => require('./logger').logger;
 
 const resetChatChallengeBreaker = () => {
   chatBreaker.strikes = 0;
   chatBreaker.openUntil = 0;
+  chatBreaker.probing = false;
 };
 
 /** @returns {number} Retry-After (s) para el desafio que acaba de llegar */
 const noteChatChallenge = () => {
   chatBreaker.strikes += 1;
-  if (chatBreaker.strikes < CHAT_BREAKER_STRIKES) return CHAT_CHALLENGE_RETRY_AFTER_SECONDS;
-  chatBreaker.openUntil = Date.now() + CHAT_BREAKER_SECONDS * 1000;
-  return CHAT_BREAKER_SECONDS;
+  const seconds = chatBreakerSeconds();
+  if (seconds <= 0 || (!chatBreaker.probing && chatBreaker.strikes < CHAT_BREAKER_STRIKES)) {
+    return CHAT_CHALLENGE_RETRY_AFTER_SECONDS;
+  }
+  chatBreaker.openUntil = chatClock() + seconds * 1000;
+  chatBreaker.probing = false;
+  logger().warn(`Qwen chat challenge 连续 ${chatBreaker.strikes} 次，${seconds}s 内不再发送聊天请求`, 'UPSTREAM');
+  return seconds;
 };
 
-const chatChallengeError = (retryAfter, details) => {
-  const error = new UpstreamResponseError(CHAT_CHALLENGE_MESSAGE, WAF_CHALLENGE_CODE, details);
+const noteChatAnswer = () => {
+  chatBreaker.strikes = 0;
+  if (!chatBreaker.probing) return;
+  chatBreaker.openUntil = 0;
+  chatBreaker.probing = false;
+  logger().info('Qwen chat challenge 探测请求已正常返回，恢复发送聊天请求', 'UPSTREAM');
+};
+
+const chatChallengeError = (message, retryAfter, details) => {
+  const error = new UpstreamResponseError(message, WAF_CHALLENGE_CODE, details);
   error.retryAfter = retryAfter;
   return error;
 };
 
-/** sendChatRequest lo llama antes de crear el chat o subir el historial. */
+/**
+ * sendChatRequest y la ruta de imagen/video lo llaman antes de crear el chat o subir nada.
+ * Con el enfriamiento agotado deja pasar a quien llega primero como sonda.
+ */
 const assertChatChallengeBreakerClosed = () => {
-  const remaining = Math.ceil((chatBreaker.openUntil - Date.now()) / 1000);
-  if (remaining > 0) throw chatChallengeError(remaining, { breakerOpen: true });
+  if (!chatBreaker.openUntil) return;
+  const now = chatClock();
+  const remaining = Math.ceil((chatBreaker.openUntil - now) / 1000);
+  if (remaining > 0) throw chatChallengeError(CHAT_BREAKER_MESSAGE, remaining, { breakerOpen: true });
+  chatBreaker.openUntil = now + chatBreakerSeconds() * 1000;
+  chatBreaker.probing = true;
+};
+
+/**
+ * Si el frame es un chat challenge devuelve su error (y cuenta el strike); si no, null.
+ * "被挤爆啦" es saturacion; un captcha/punish sin ella es verificacion humana.
+ * Deteccion pura: detectWafChallenge (compartida con la ruta de imagen); aqui solo el strike.
+ * @param {object|string} payload - Frame ya parseado, o el cuerpo crudo (pagina HTML del captcha)
+ * @returns {UpstreamResponseError|null}
+ */
+const chatChallengeFrom = (payload) => {
+  const detected = detectWafChallenge(payload);
+  if (!detected) return null;
+  const busy = findWafChallengeSignals(payload).some(item => CHAT_BUSY_SIGNAL_RE.test(item));
+  return chatChallengeError(busy ? CHAT_BUSY_MESSAGE : CHAT_CAPTCHA_MESSAGE, noteChatChallenge(), detected.details);
 };
 
 /**
  * Qwen Web 有时以 HTTP 200 + 普通 JSON 返回 WAF/captcha 或业务失败。
  * 这些帧没有 choices，若直接跳过就会被误包装成空成功或正常 stop。
+ * Alimenta el cortacircuitos del chat challenge: cada desafio suma un strike y cada frame
+ * con `choices` cuenta como respuesta (ver noteChatAnswer).
  */
 const assertNoUpstreamFailure = (payload) => {
-  const wafChallenge = detectWafChallenge(payload);
-  if (wafChallenge) throw chatChallengeError(noteChatChallenge(), wafChallenge.details);
+  const challenge = chatChallengeFrom(payload);
+  if (challenge) throw challenge;
   if (!payload || typeof payload !== 'object') return;
 
   const explicitError = payload.error;
@@ -353,8 +406,7 @@ const assertNoUpstreamFailure = (payload) => {
     );
   }
 
-  // Qwen volvio a generar: la sonda paso.
-  if (Array.isArray(payload.choices)) resetChatChallengeBreaker();
+  if (Array.isArray(payload.choices)) noteChatAnswer();
 };
 
 module.exports = {
@@ -366,7 +418,9 @@ module.exports = {
   isWafChallengeError,
   isTransportInterruption,
   assertChatChallengeBreakerClosed,
+  chatChallengeFrom,
   resetChatChallengeBreaker,
+  setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,

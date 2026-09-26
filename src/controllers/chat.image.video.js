@@ -10,7 +10,7 @@ const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
-const { detectWafChallenge } = require('../utils/upstream-error.js')
+const { assertChatChallengeBreakerClosed, chatChallengeFrom } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -66,6 +66,17 @@ const buildAxiosErrorLog = (error) => ({
     data: formatPayloadForLog(error?.response?.data)
 })
 
+/**
+ * 图片/视频也走 /api/v2/chat/completions，同样会被 chat challenge 拦截：
+ * 转成可重试的 503（带 retry_after），与聊天接口一致。
+ */
+const imageChallengeError = (challenge) => ({
+    error: challenge.publicMessage,
+    code: challenge.code,
+    status: 503,
+    retry_after: challenge.retryAfter
+})
+
 const parseUpstreamImageError = (data) => {
     try {
         const rawPayload = formatPayloadForLog(data)
@@ -79,20 +90,10 @@ const parseUpstreamImageError = (data) => {
             payload = JSON.parse(payload)
         }
 
-        // WAF/captcha llega como HTTP 200 con una forma propia (`ret`), NO como
-        // `success:false`. Sin esta rama el paquete se colaba entero: la generación
-        // "tenía éxito" y se devolvía la imagen de relleno de Qwen como resultado.
-        const wafChallenge = detectWafChallenge(payload)
-        if (wafChallenge) {
-            logger.error('图片/视频上游触发 WAF/captcha，需人工验证', 'CHAT', '', {
-                parsed_error: wafChallenge.details,
-                raw_response_body: rawPayload
-            })
-            return {
-                error: wafChallenge.publicMessage,
-                code: wafChallenge.code,
-                status: 502
-            }
+        const challenge = chatChallengeFrom(payload)
+        if (challenge) {
+            logger.error('图片/视频请求被上游 WAF 拦截 (chat challenge)', 'CHAT', '', { raw_response_body: rawPayload })
+            return imageChallengeError(challenge)
         }
 
         // 只有明确 success=false 且带错误码时，才按上游错误包处理，避免误伤正常业务响应
@@ -164,16 +165,12 @@ const parseUpstreamErrorFromRawText = (text) => {
 
     // La página de captcha del WAF llega como HTML y no se deja ver por ninguna de las
     // ramas de abajo (no hay `data:`, no es JSON). Se comprueba primero.
-    const htmlChallenge = detectWafChallenge(trimmed)
+    const htmlChallenge = chatChallengeFrom(trimmed)
     if (htmlChallenge) {
-        logger.error('图片/视频上游返回 WAF/captcha HTML 页面，需人工验证', 'CHAT', '', {
+        logger.error('图片/视频上游返回 WAF/captcha HTML 页面 (chat challenge)', 'CHAT', '', {
             raw_preview: trimmed.slice(0, 200)
         })
-        return {
-            error: htmlChallenge.publicMessage,
-            code: htmlChallenge.code,
-            status: 502
-        }
+        return imageChallengeError(htmlChallenge)
     }
 
     const fromWholeText = parseUpstreamImageErrorFromText(trimmed)
@@ -598,6 +595,7 @@ const isRetryableUpstreamError = (upstreamError) => {
  */
 const sendUpstreamError = (res, upstreamError) => {
     const { status, ...payload } = upstreamError
+    if (Number(payload.retry_after) > 0) res.set({ 'Retry-After': String(payload.retry_after) })
     return res.status(status || 500).json(payload)
 }
 
@@ -682,6 +680,7 @@ const normalizeOpenAIImageVideoSize = (size) => {
 const sendOpenAIErrorResponse = (res, error) => {
     const status = error?.status || 500
     const message = error?.error || error?.message || 'Service error, please try again later'
+    if (Number(error?.retry_after) > 0) res.set({ 'Retry-After': String(error.retry_after) })
 
     return res.status(status).json({
         error: {
@@ -1296,6 +1295,12 @@ const generateImageVideoResult = async (payload) => {
             ]
         }
 
+        try {
+            assertChatChallengeBreakerClosed()
+        } catch (challenge) {
+            throw imageChallengeError(challenge)
+        }
+
         const chatID = await generateChatID(token, model, account, chat_type)
 
         if (!chatID) {
@@ -1435,6 +1440,8 @@ const generateImageVideoResult = async (payload) => {
                 responseData = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`, reqBody, requestConfig)
 
                 const inlineUpstreamError = parseUpstreamImageError(responseData.data)
+                // Ya contado como strike: no dejar que el resolver lo vuelva a parsear y contar.
+                if (inlineUpstreamError?.code === 'upstream_waf_challenge') throw inlineUpstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
                     logger.warn(`图片/视频请求上游返回业务错误包，准备第 ${attempt + 1} 次重试，请求ID: ${inlineUpstreamError.request_id || '未知'}`, 'CHAT')
                     await sleep(800)
@@ -1789,5 +1796,7 @@ module.exports = {
     handleImageVideoCompletion,
     handleOpenAIImagesGeneration,
     handleOpenAIImagesEdit,
-    handleOpenAIVideoGeneration
+    handleOpenAIVideoGeneration,
+    // 暴露内部辅助以便测试
+    parseUpstreamImageError
 }

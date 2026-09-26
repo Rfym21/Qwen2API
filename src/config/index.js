@@ -108,6 +108,13 @@ const config = {
         const raw = parseInt(process.env.AGENT_PARSE_BREAKER_SECONDS, 10)
         return Number.isFinite(raw) && raw >= 0 ? raw : 300
     })(),
+    // Cortacircuitos del chat challenge (src/utils/upstream-error.js): tras 3 desafios
+    // seguidos a la generacion no se envia nada durante estos segundos; luego sale una
+    // sola sonda. 0 lo desactiva.
+    chatChallengeBreakerSeconds: (() => {
+        const raw = parseInt(process.env.CHAT_CHALLENGE_BREAKER_SECONDS, 10)
+        return Number.isFinite(raw) && raw >= 0 ? raw : 60
+    })(),
     // Limitador de ritmo del parse (src/utils/upload.js): como maximo MAX upload+parse por
     // ventana de WINDOW segundos por proceso; el resto recibe 529 con Retry-After corto
     // ANTES de que el WAF (que cuenta por IP) empiece a desafiar. Medido 2026-09-10:

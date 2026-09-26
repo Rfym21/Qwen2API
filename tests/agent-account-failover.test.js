@@ -13,7 +13,7 @@ const accountManager = require('../src/utils/account')
 const AccountRotator = require('../src/utils/account-rotator')
 const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime')
 const { createAccountReplayBody } = require('../src/utils/agent-account-failover')
-const { assertNoUpstreamFailure, isRateLimitError, isWafChallengeError } = require('../src/utils/upstream-error')
+const { assertNoUpstreamFailure, isRateLimitError, isWafChallengeError, resetChatChallengeBreaker } = require('../src/utils/upstream-error')
 const { handleStreamResponse, handleNonStreamResponse } = require('../src/controllers/chat')
 
 const accounts = ['first', 'second', 'third'].map(name => ({ email: `${name}@example.invalid`, token: `${name}-test-token` }))
@@ -38,6 +38,8 @@ test.beforeEach(() => {
   accountManager.isInitialized = true
   accountManager.accountRotator = new AccountRotator()
   accountManager.accountRotator.setAccounts(accounts)
+  // WAF frames here feed the process-wide chat-challenge breaker; start every test closed.
+  resetChatChallengeBreaker()
 })
 test.after(() => { accountManager.destroy() })
 
@@ -127,14 +129,18 @@ test('no account rotation after client-visible final text or reasoning', async (
 
 test('WAF can switch once but never fans out through the entire account pool, and cools no account', async () => {
   let retries = 0
+  const prefixKeys = []
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
     agent_turn_max_attempts: 6,
+    upstreamOptions: { contextPrefixKey: 'session-prefix' },
     sendChatRequest: async (body, requestOptions) => {
       retries += 1
+      prefixKeys.push(requestOptions.contextPrefixKey)
       return { status: true, response: Readable.from([failureFrame('upstream_waf_challenge')]), currentAccount: requestOptions.currentAccount }
     }
   })), error => isWafChallengeError(error) && error.failedAccountEmail === accounts[1].email)
   assert.equal(retries, 1)
+  assert.deepEqual(prefixKeys, ['session-prefix'], 'Qwen refused before reading the history: the switch reuses it')
   // A chat challenge follows Qwen's load, not the account (prod 2026-09-23..26: the same
   // accounts were challenged by day and answered by night). Both stay in rotation.
   for (const account of accounts.slice(0, 2)) {
@@ -144,14 +150,18 @@ test('WAF can switch once but never fans out through the entire account pool, an
 
 test('quota failover respects the total attempt budget and preserves the final quota error', async () => {
   let retries = 0
+  const prefixKeys = []
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame()]), options({
     agent_turn_max_attempts: 2,
+    upstreamOptions: { contextPrefixKey: 'session-prefix' },
     sendChatRequest: async (body, requestOptions) => {
       retries += 1
+      prefixKeys.push(requestOptions.contextPrefixKey)
       return { status: true, response: Readable.from([failureFrame()]), currentAccount: requestOptions.currentAccount }
     }
   })), error => isRateLimitError(error) && error.failedAccountEmail === accounts[1].email)
   assert.equal(retries, 1)
+  assert.deepEqual(prefixKeys, [null], 'a quota switch re-uploads the full history on the new account')
 })
 
 test('no healthy replacement or disconnected client stops without new upstream requests', async () => {

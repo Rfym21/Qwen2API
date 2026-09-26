@@ -807,9 +807,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       if (challengeFailure) challengeFailovers += 1
       logger.warn(`Agent attempt ${attemptNumber}/${maxAttempts}: ${error.code}; retrying with a different healthy account`, 'AGENT')
       currentAccount = replacementAccount
-      // Re-externalize the original complete prompt. Do not reuse another
-      // account's conversation IDs, shortened prompt, or cached context attachment.
-      currentUpstreamOptions = { ...currentUpstreamOptions, contextPrefixKey: null, allowContextCompaction: false }
+      // Re-externalize the original complete prompt; never reuse another account's
+      // conversation IDs or a shortened prompt. A quota switch also re-uploads the history.
+      // A chat challenge keeps the history prefix: Qwen refused before reading it, the
+      // prefix is not tied to an account (normal rotation reuses it across accounts too),
+      // and re-uploading it on every challenge is what exhausts the parse budget.
+      currentUpstreamOptions = {
+        ...currentUpstreamOptions,
+        contextPrefixKey: challengeFailure ? currentUpstreamOptions.contextPrefixKey : null,
+        allowContextCompaction: false
+      }
       const retryResponse = await sendBoundRequest(replayBody, {
         ...currentUpstreamOptions,
         chatId: null,
