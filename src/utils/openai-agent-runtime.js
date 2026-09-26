@@ -795,7 +795,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       const replayBody = (quotaFailure || challengeFailure) && !deliveredOutput
         ? createAccountReplayBody(options.requestBody)
         : null
-      if (!replayBody || !currentAccount?.email || !error.accountFailureRecorded ||
+      if (!replayBody || !currentAccount?.email || !(error.accountFailureRecorded || challengeFailure) ||
           attemptNumber >= maxAttempts || typeof requestSender !== 'function' ||
           options.isClientDisconnected?.() || (challengeFailure && challengeFailovers >= 1)) {
         throw error

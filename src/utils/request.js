@@ -7,7 +7,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError, isTransportInterruption } = require('./upstream-error.js')
+const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
@@ -642,6 +642,8 @@ const externalizeOversizedAgentContext = async (
  * @returns {Promise<Object>} 响应结果
  */
 const sendChatRequest = async (body, options = {}) => {
+    // Qwen esta rechazando la generacion: ni chat nuevo ni upload, solo 529/503 al cliente.
+    assertChatChallengeBreakerClosed()
     // 获取可用的账户（包含 proxy 等完整字段）
     // excludeEmails：本次 HTTP 请求里已经烧掉的账户（流中途 failover）——轮换器跳过它们，
     // 即使它们对其他请求仍然可用。

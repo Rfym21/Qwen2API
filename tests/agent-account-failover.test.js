@@ -48,15 +48,10 @@ test('quota_limit is recognized without an English message; explicit WAF is not 
     isWafChallengeError(error) && !isRateLimitError(error))
 })
 
-test('exhausted or challenged pools never fall back to cooled accounts', () => {
+test('exhausted pools never fall back to cooled accounts', () => {
   const rotator = accountManager.accountRotator
   rotator.recordQuotaExhausted(accounts[0].email)
-  rotator.recordChallenge(accounts[1].email)
   for (let count = 0; count < rotator.maxFailures; count += 1) rotator.recordFailure(accounts[2].email, 'ECONNRESET')
-  assert.equal(rotator.getNextAccount(), null)
-  rotator.resetFailures(accounts[1].email)
-  assert.equal(rotator.getAccountByEmail(accounts[1].email), null, 'refreshing a token must not clear WAF cooldown')
-  rotator.challengeCooldownUntil.set(accounts[1].email, Date.now() - 1)
   assert.equal(rotator.getNextAccount().email, accounts[1].email)
   assert.equal(rotator.getNextAccount([accounts[1].email]), null)
 })
@@ -130,7 +125,7 @@ test('no account rotation after client-visible final text or reasoning', async (
   }
 })
 
-test('WAF can switch once but never fans out through the entire account pool', async () => {
+test('WAF can switch once but never fans out through the entire account pool, and cools no account', async () => {
   let retries = 0
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
     agent_turn_max_attempts: 6,
@@ -140,8 +135,11 @@ test('WAF can switch once but never fans out through the entire account pool', a
     }
   })), error => isWafChallengeError(error) && error.failedAccountEmail === accounts[1].email)
   assert.equal(retries, 1)
-  assert.equal(accountManager.accountRotator.challengeCooldownUntil.size, 2)
-  assert.equal(accountManager.accountRotator.getNextAccount().email, accounts[2].email)
+  // A chat challenge follows Qwen's load, not the account (prod 2026-09-23..26: the same
+  // accounts were challenged by day and answered by night). Both stay in rotation.
+  for (const account of accounts.slice(0, 2)) {
+    assert.ok(accountManager.accountRotator.getAccountByEmail(account.email), `${account.email} stays available`)
+  }
 })
 
 test('quota failover respects the total attempt budget and preserves the final quota error', async () => {
