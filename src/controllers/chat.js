@@ -1079,34 +1079,25 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         res.end()
     } catch (error) {
         logger.error('聊天处理错误', 'CHAT', '', error)
-        // Cuota agotada -> 429 `insufficient_quota`; adjunto caido -> 503 (529 es de
-        // Anthropic); cualquier otro fallo conserva su etiqueta de siempre. Deteccion
-        // unica en utils/upstream-error.js.
+        // Cuota agotada -> 429 `insufficient_quota`; adjunto caido o chat challenge -> 503
+        // `upstream_unavailable` (529 es de Anthropic); cualquier otro fallo conserva su
+        // etiqueta de siempre. Deteccion unica en utils/upstream-error.js; la forma, en
+        // upstreamErrorShape (la misma que el modo agente).
         const failure = describeUpstreamFailure(error, 502, 503)
+        const shape = upstreamErrorShape(error, '上游流式传输失败', 'upstream_stream_error')
         noteRateLimitedAccount(error, options.currentAccount)
         if (res.headersSent) {
             if (!res.writableEnded) {
                 writeOpenAIStreamError(
                     res,
-                    error.publicMessage || '上游流式传输失败',
-                    failure.rateLimited
-                        ? RATE_LIMIT_OPENAI_TYPE
-                        : (error.publicMessage ? error.code : 'upstream_stream_error'),
-                    failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error',
+                    shape.message,
+                    failure.rateLimited || failure.overloaded || error.publicMessage ? shape.code : 'upstream_stream_error',
+                    shape.type || 'upstream_stream_error',
                     failure.retryAfter
                 )
             }
         } else {
-            if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
-            res.status(failure.status).json({
-                error: {
-                    message: error.publicMessage || '上游流式传输失败',
-                    type: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_stream_error',
-                    code: failure.rateLimited
-                        ? RATE_LIMIT_OPENAI_TYPE
-                        : (error.code || 'upstream_stream_error')
-                }
-            })
+            writeOpenAIHttpError(res, { type: 'upstream_stream_error', ...shape })
         }
     }
 }
@@ -1434,18 +1425,8 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         res.json(bodyTemplate)
     } catch (error) {
         logger.error('非流式聊天处理错误', 'CHAT', '', error)
-        const failure = describeUpstreamFailure(error, 502, 503)
         noteRateLimitedAccount(error, options.currentAccount)
-        if (!res.headersSent) {
-            if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) })
-            res.status(failure.status).json({
-                error: {
-                    message: error.publicMessage || '上游响应处理失败',
-                    type: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : 'upstream_error',
-                    code: failure.rateLimited ? RATE_LIMIT_OPENAI_TYPE : (error.code || 'upstream_error')
-                }
-            })
-        }
+        if (!res.headersSent) writeOpenAIHttpError(res, upstreamErrorShape(error, '上游响应处理失败'))
     }
 }
 
