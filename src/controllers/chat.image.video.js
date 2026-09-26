@@ -1535,6 +1535,13 @@ const handleImageVideoCompletion = async (req, res) => {
 
         logger.error('图片视频资源处理错误', 'CHAT', '', error)
 
+        // chat challenge 且尚未提交：返回真正的 503 + Retry-After（t2v 预设了 text/event-stream，需改回 JSON），
+        // 而不是把错误文本当成 200 的流式正文。
+        if (downstreamStream && !res.headersSent && error?.code === 'upstream_waf_challenge') {
+            res.set({ 'Content-Type': 'application/json' })
+            return sendUpstreamError(res, error)
+        }
+
         if (downstreamStream) {
             return returnResponse(res, req.body.model, error?.error || error?.message || 'Service error, please try again later', true)
         }

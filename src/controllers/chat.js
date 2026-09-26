@@ -20,6 +20,8 @@ const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require
 const {
     assertNoUpstreamFailure,
     describeUpstreamFailure,
+    isRateLimitError,
+    isWafChallengeError,
     noteRateLimitedAccount,
     RATE_LIMIT_OPENAI_TYPE
 } = require('../utils/upstream-error.js')
@@ -258,13 +260,14 @@ const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
     }
 }
 
-const runWithSSEHeartbeat = async (res, work, intervalMs = 15000) => {
+const runWithSSEHeartbeat = async (res, work, intervalMs = 15000, beforeBeat = null) => {
     const heartbeatMs = Math.max(1, Number(intervalMs) || 15000)
     const heartbeat = setInterval(() => {
         if (res.writableEnded || res.destroyed) return
         try {
-            // SSE 已经提交 200 响应后，用注释帧保活。注释不会进入 OpenAI delta，
-            // 但能阻止反代在长 thinking 或纠正 attempt 期间把连接判为空闲。
+            // 用注释帧保活。注释不会进入 OpenAI delta，但能阻止反代在长 thinking 或纠正
+            // attempt 期间把连接判为空闲。beforeBeat 先提交 SSE 首帧（延迟提交的上限）。
+            if (typeof beforeBeat === 'function') beforeBeat()
             res.write(': qwen2api-agent-keepalive\n\n')
             if (typeof res.flush === 'function') res.flush()
         } catch (_) {
@@ -391,25 +394,31 @@ const handleOpenAIAgentStream = async (
     setResponseHeaders(res, true)
     const messageId = generateUUID()
     const created = Math.round(Date.now() / 1000)
-    let firstDelta = true
-    const writeDelta = (delta) => {
-        if (!delta || Object.keys(delta).length === 0) return
-        const normalizedDelta = firstDelta ? { role: 'assistant', ...delta } : delta
-        firstDelta = false
+    const writeChunk = (delta) => {
         res.write(`data: ${JSON.stringify({
             id: `chatcmpl-${messageId}`,
             object: 'chat.completion.chunk',
             created,
-            choices: [{ index: 0, delta: normalizedDelta, finish_reason: null }]
+            choices: [{ index: 0, delta, finish_reason: null }]
         })}\n\n`)
         if (typeof res.flush === 'function') res.flush()
     }
-
-    // 立即提交标准 SSE 首帧，不能等整个上游 attempt 收完后才让客户端看到响应。
-    // 裸正文/工具调用仍由下方门禁缓冲；安全思考与已确认进入 final/blocked
-    // 包装体的正式正文会按上游节奏增量输出。
-    if (typeof res.flushHeaders === 'function') res.flushHeaders()
-    writeDelta({ role: 'assistant' })
+    // SSE 首帧（role 单独一块）在上游第一帧通过校验时提交，不等整个 attempt 收完；
+    // 裸正文/工具调用仍由下方门禁缓冲，安全思考与已确认的正文按上游节奏增量输出。
+    // Compromiso perezoso: si el primer frame de Qwen es un chat challenge o la cuota, la
+    // respuesta sigue libre y sale un 503/429 real con Retry-After en vez de un frame de error.
+    let committed = false
+    const commitStream = () => {
+        if (committed) return
+        committed = true
+        if (typeof res.flushHeaders === 'function') res.flushHeaders()
+        writeChunk({ role: 'assistant' })
+    }
+    const writeDelta = (delta) => {
+        if (!delta || Object.keys(delta).length === 0) return
+        commitStream()
+        writeChunk(delta)
+    }
 
     const liveReasoningByAttempt = new Map()
     const onReasoningDelta = enableThinking && !config.legacyReasoningInContent
@@ -443,20 +452,26 @@ const handleOpenAIAgentStream = async (
                 sendChatRequest: options.sendChatRequest || sendChatRequest,
                 on_reasoning_delta: onReasoningDelta,
                 on_content_delta: onContentDelta,
+                on_upstream_frame: commitStream,
                 isClientDisconnected: () => res.destroyed || res.writableEnded
             }),
-            options.agent_processing_heartbeat_ms
+            options.agent_processing_heartbeat_ms,
+            commitStream
         )
     } catch (error) {
         logger.error('OpenAI Agent 回合处理失败', 'AGENT', '', error)
         if (!error.accountFailureRecorded) {
             noteRateLimitedAccount(error, error.failedAccountEmail ? { email: error.failedAccountEmail } : options.currentAccount)
         }
+        // Solo el chat challenge y la cuota salen como status real sin compromiso previo; el
+        // resto conserva el frame de error de siempre (no un 5xx que los SDK reintentan).
+        if (!isWafChallengeError(error) && !isRateLimitError(error)) commitStream()
         writeOpenAIHttpError(res, upstreamErrorShape(
             error, '上游 Agent 回合处理失败', 'upstream_stream_error'
         ))
         return
     }
+    commitStream()
     if (!runtime.ok) {
         writeOpenAIHttpError(res, runtime.error)
         return

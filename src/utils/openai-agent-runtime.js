@@ -332,6 +332,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     const decoded = isJson(frame.data) ? JSON.parse(frame.data) : null
     if (decoded === null) return
     assertNoUpstreamFailure(decoded)
+    // The frame passed: the controller may now commit its stream (see chat.js#commitStream).
+    if (typeof options.on_upstream_frame === 'function') options.on_upstream_frame()
 
     const created = normalizeCreatedMetadata(decoded)
     if (created) {
@@ -824,6 +826,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         agentRetry: true
       })
       if (!retryResponse?.status || !retryResponse.response) {
+        // A challenge switch that could not even start keeps the challenge: it is still a
+        // retryable 503 with Retry-After, not an opaque 502.
+        if (challengeFailure) throw error
         return {
           ok: false,
           error: { status: 502, message: retryResponse?.message || 'Account failover request failed', code: 'upstream_retry_failed' },
