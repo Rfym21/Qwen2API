@@ -1,13 +1,11 @@
-const { isRateLimitError, isWafChallengeError, noteRateLimitedAccount } = require('./upstream-error')
+const { isRateLimitError, noteRateLimitedAccount } = require('./upstream-error')
 
 function recordFailedAccount(error, account) {
   // Errors are logged; never attach the account object containing its token/password.
   error.failedAccountEmail = account?.email || null
+  // A chat challenge follows Qwen's load, not the account: nothing to record against it.
   if (isRateLimitError(error)) {
     error.accountFailureRecorded = noteRateLimitedAccount(error, account)
-  } else if (isWafChallengeError(error) && account?.email) {
-    require('./account').recordAccountChallenge(account.email)
-    error.accountFailureRecorded = true
   }
 }
 

@@ -126,10 +126,18 @@ const rateLimitRetryAfterSeconds = (error) => {
  * repetir la deteccion; el `type` de cable lo pone cada uno con su constante de arriba.
  * @param {unknown} error - Error capturado
  * @param {number} [fallbackStatus] - Status cuando NO es cuota (500 Anthropic / 502 OpenAI)
- * @param {number} [overloadedStatus] - Status del adjunto de contexto caido (529 Anthropic / 503 OpenAI)
+ * @param {number} [overloadedStatus] - Status del adjunto de contexto caido o del chat challenge (529 Anthropic / 503 OpenAI)
  * @returns {{ rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null }}
  */
 const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus = 529) => {
+  if (isWafChallengeError(error)) {
+    return {
+      rateLimited: false,
+      overloaded: true,
+      status: overloadedStatus,
+      retryAfter: Number(error.retryAfter) || CHAT_CHALLENGE_RETRY_AFTER_SECONDS
+    };
+  }
   if (isContextAttachmentError(error)) {
     return {
       rateLimited: false,
@@ -173,6 +181,48 @@ const noteRateLimitedAccount = (error, account) => {
 };
 
 /**
+ * Chat challenge: Qwen se niega a GENERAR ("被挤爆啦") mientras crear el chat y subir el
+ * historial siguen pasando. Medido en prod 2026-09-23..26: 477 de 502 envios desafiados,
+ * todos entre 07:00Z y 22:00Z (el pico de Pekin); la misma cuenta pasa de noche y cae de
+ * dia, asi que no es la cuenta ni el tamano del contexto. Cada reintento inmediato del
+ * cliente agentico re-sube su historial y agota el limitador de parse en segundos. Tras
+ * CHAT_BREAKER_STRIKES desafios seguidos se contesta 529/503 sin tocar Qwen durante
+ * CHAT_BREAKER_SECONDS; pasado ese tiempo sale una sonda, y la primera respuesta con
+ * `choices` lo cierra.
+ */
+const CHAT_CHALLENGE_MESSAGE = 'Qwen 上游繁忙，触发风控验证（被挤爆啦），请稍后重试 / Qwen chat challenge: upstream busy, retry later';
+const CHAT_CHALLENGE_RETRY_AFTER_SECONDS = 30;
+const CHAT_BREAKER_STRIKES = 3;
+// ponytail: un breaker global, porque todas las cuentas salen por la misma egress; por egress cuando haya varias.
+const CHAT_BREAKER_SECONDS = 60;
+const chatBreaker = { strikes: 0, openUntil: 0 };
+
+const resetChatChallengeBreaker = () => {
+  chatBreaker.strikes = 0;
+  chatBreaker.openUntil = 0;
+};
+
+/** @returns {number} Retry-After (s) para el desafio que acaba de llegar */
+const noteChatChallenge = () => {
+  chatBreaker.strikes += 1;
+  if (chatBreaker.strikes < CHAT_BREAKER_STRIKES) return CHAT_CHALLENGE_RETRY_AFTER_SECONDS;
+  chatBreaker.openUntil = Date.now() + CHAT_BREAKER_SECONDS * 1000;
+  return CHAT_BREAKER_SECONDS;
+};
+
+const chatChallengeError = (retryAfter, details) => {
+  const error = new UpstreamResponseError(CHAT_CHALLENGE_MESSAGE, WAF_CHALLENGE_CODE, details);
+  error.retryAfter = retryAfter;
+  return error;
+};
+
+/** sendChatRequest lo llama antes de crear el chat o subir el historial. */
+const assertChatChallengeBreakerClosed = () => {
+  const remaining = Math.ceil((chatBreaker.openUntil - Date.now()) / 1000);
+  if (remaining > 0) throw chatChallengeError(remaining, { breakerOpen: true });
+};
+
+/**
  * Qwen Web 有时以 HTTP 200 + 普通 JSON 返回 WAF/captcha 或业务失败。
  * 这些帧没有 choices，若直接跳过就会被误包装成空成功或正常 stop。
  */
@@ -190,11 +240,7 @@ const assertNoUpstreamFailure = (payload) => {
     payload.error?.code
   ].filter(Boolean).map(String);
   if (upstreamSignals.some(item => item.toLowerCase() === WAF_CHALLENGE_CODE || /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i.test(item))) {
-    throw new UpstreamResponseError(
-      'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
-      WAF_CHALLENGE_CODE,
-      { ret }
-    );
+    throw chatChallengeError(noteChatChallenge(), { ret });
   }
 
   const explicitError = payload.error;
@@ -218,6 +264,9 @@ const assertNoUpstreamFailure = (payload) => {
       waitHours === undefined || waitHours === null ? null : { waitHours }
     );
   }
+
+  // Qwen volvio a generar: la sonda paso.
+  if (Array.isArray(payload.choices)) resetChatChallengeBreaker();
 };
 
 module.exports = {
@@ -225,6 +274,8 @@ module.exports = {
   assertNoUpstreamFailure,
   isRateLimitError,
   isWafChallengeError,
+  assertChatChallengeBreakerClosed,
+  resetChatChallengeBreaker,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,

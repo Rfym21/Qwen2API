@@ -14,7 +14,6 @@ class AccountRotator {
     this.lastErrorCode = new Map() // 最近一次错误码（HTTP status 或 transport err.code）
     this.cooldownStartedAt = new Map() // 进入 cooldown 的起始时间戳（failureCounts 达阈值时刻）
     this.quotaCooldownUntil = new Map() // 日额度耗尽的账户 -> 解禁时间戳（见 recordQuotaExhausted）
-    this.challengeCooldownUntil = new Map()
     this.maxFailures = 3 // 最大失败次数
     this.cooldownPeriod = 5 * 60 * 1000 // 5分钟冷却期
     // 额度耗尽的默认静默期。上游给了 `data.num`（小时）时用那个，这是没给时的回退。
@@ -172,13 +171,6 @@ class AccountRotator {
     )
   }
 
-  recordChallenge(email) {
-    if (!email) return
-    // Keep this separate from transport failures and quota cooldowns.
-    this.challengeCooldownUntil.set(email, Date.now() + this.cooldownPeriod)
-    this.recordError(email, 'upstream_waf_challenge')
-  }
-
   /**
    * 重置账户失败计数（清除 cooldown）
    * 注意：不清理 lastErrorAt/lastErrorCode——它们由 endpoint 的 15 分钟窗口管理
@@ -212,10 +204,7 @@ class AccountRotator {
         available: this._isAccountAvailable(account),
         lastErrorAt: this.lastErrorAt.get(email) || null,
         lastErrorCode: this.lastErrorCode.get(email) || null,
-        cooldownEndsAt: Math.max(
-          cooldownStart ? cooldownStart + this.cooldownPeriod : 0,
-          this.challengeCooldownUntil.get(email) || 0
-        ) || null,
+        cooldownEndsAt: cooldownStart ? cooldownStart + this.cooldownPeriod : null,
         quotaCooldownEndsAt: this.quotaCooldownUntil.get(email) || null
       }
     })
@@ -246,13 +235,6 @@ class AccountRotator {
   _isAccountAvailable(account) {
     if (!account.token) {
       return false
-    }
-
-    // A token refresh does not resolve an upstream verification challenge.
-    const challengeUntil = this.challengeCooldownUntil.get(account.email)
-    if (challengeUntil) {
-      if (Date.now() < challengeUntil) return false
-      this.challengeCooldownUntil.delete(account.email)
     }
 
     // 额度流放优先于一切：这个账户对上游来说今天已经没有配额，再选它就是白烧一轮。
@@ -321,8 +303,7 @@ class AccountRotator {
       this.lastErrorAt,
       this.lastErrorCode,
       this.cooldownStartedAt,
-      this.quotaCooldownUntil,
-      this.challengeCooldownUntil
+      this.quotaCooldownUntil
     ]
     for (const map of maps) {
       for (const email of map.keys()) {
@@ -344,7 +325,6 @@ class AccountRotator {
     this.lastErrorCode.clear()
     this.cooldownStartedAt.clear()
     this.quotaCooldownUntil.clear()
-    this.challengeCooldownUntil.clear()
   }
 }
 

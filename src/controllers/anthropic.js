@@ -57,6 +57,7 @@ const { logger } = require('../utils/logger');
 const {
   assertNoUpstreamFailure,
   describeUpstreamFailure,
+  isWafChallengeError,
   noteRateLimitedAccount,
   RATE_LIMIT_ANTHROPIC_TYPE,
   UpstreamResponseError
@@ -2709,8 +2710,10 @@ const handleAnthropicMessages = async (req, res) => {
     noteRateLimitedAccount(error, currentAccount);
     // Un prefijo de historial reutilizado pudo ser la causa (file_id que Qwen ya no
     // reconoce): se olvida y el reintento del cliente hornea uno nuevo. Un 529 por
-    // ContextExternalizationError nunca llega aqui con contextPrefixReused.
-    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError) {
+    // ContextExternalizationError nunca llega aqui con contextPrefixReused. Un chat
+    // challenge tampoco culpa al prefijo: Qwen rechazo antes de leerlo, y olvidarlo haria
+    // que cada reintento del cliente volviera a subir y parsear el historial entero.
+    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError && !isWafChallengeError(error)) {
       invalidateContextPrefix(contextPrefixKey);
     }
     if (!res.headersSent) {
