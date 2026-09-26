@@ -826,9 +826,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         agentRetry: true
       })
       if (!retryResponse?.status || !retryResponse.response) {
-        // A challenge switch that could not even start keeps the challenge: it is still a
-        // retryable 503 with Retry-After, not an opaque 502.
-        if (challengeFailure) throw error
+        // A switch that could not even start keeps its cause: a challenge is still a
+        // retryable 503 and quota a 429, both with Retry-After — not an opaque 502.
+        if (challengeFailure || quotaFailure) throw error
         return {
           ok: false,
           error: { status: 502, message: retryResponse?.message || 'Account failover request failed', code: 'upstream_retry_failed' },

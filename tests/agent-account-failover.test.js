@@ -256,10 +256,14 @@ test('agent stream: challenged on both accounts is a real 503 with Retry-After, 
   assert.equal(JSON.parse(response.output).error.code, 'upstream_unavailable')
 })
 
-test('a challenge switch that cannot start keeps the challenge instead of an opaque 502', async () => {
+test('a switch that cannot start keeps its cause (challenge or quota) instead of an opaque 502', async () => {
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
     sendChatRequest: async () => ({ status: false, message: 'chat creation failed' })
   })), isWafChallengeError)
+  accountManager.accountRotator.reset()
+  await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame()]), options({
+    sendChatRequest: async () => ({ status: false, message: 'chat creation failed' })
+  })), isRateLimitError)
 })
 
 test('OpenAI controllers attribute successful JSON and SSE usage to the replacement only', async context => {
