@@ -230,6 +230,38 @@ function createResponse() {
   }
 }
 
+test('agent stream: a first-frame challenge switches accounts before anything is committed', async () => {
+  const response = createResponse()
+  await handleStreamResponse(response, Readable.from([failureFrame('upstream_waf_challenge')]), false, false, requestBody, options({
+    sendChatRequest: async (body, requestOptions) => ({ status: true, response: finishedStream(), currentAccount: requestOptions.currentAccount })
+  }))
+  assert.equal(response.statusCode, 200)
+  const chunks = response.output.split('\n\n').filter(block => block.startsWith('data: {')).map(block => JSON.parse(block.slice(6)))
+  const roles = chunks.filter(chunk => chunk.choices?.[0]?.delta?.role)
+  assert.equal(roles.length, 1, 'exactly one role chunk')
+  assert.equal(chunks[0].choices[0].delta.role, 'assistant', 'and it comes first')
+  assert.doesNotMatch(response.output, /"error"/)
+  assert.match(response.output, /OK/)
+})
+
+test('agent stream: challenged on both accounts is a real 503 with Retry-After, not a 200 error frame', async () => {
+  const response = createResponse()
+  await handleStreamResponse(response, Readable.from([failureFrame('upstream_waf_challenge')]), false, false, requestBody, options({
+    sendChatRequest: async (body, requestOptions) => ({
+      status: true, response: Readable.from([failureFrame('upstream_waf_challenge')]), currentAccount: requestOptions.currentAccount
+    })
+  }))
+  assert.equal(response.statusCode, 503)
+  assert.ok(Number(response.headers['Retry-After']) > 0)
+  assert.equal(JSON.parse(response.output).error.code, 'upstream_unavailable')
+})
+
+test('a challenge switch that cannot start keeps the challenge instead of an opaque 502', async () => {
+  await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
+    sendChatRequest: async () => ({ status: false, message: 'chat creation failed' })
+  })), isWafChallengeError)
+})
+
 test('OpenAI controllers attribute successful JSON and SSE usage to the replacement only', async context => {
   const recorded = []
   context.mock.method(accountManager, 'accumulateStats', (email, kind, usage) => recorded.push({ email, kind, usage }))

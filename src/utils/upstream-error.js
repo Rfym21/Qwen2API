@@ -99,26 +99,31 @@ const rateLimitRetryAfterSeconds = (error) => {
 /**
  * MATRIZ DE ALCANZABILIDAD — que recibe el cliente de verdad, por camino y por fase.
  *
- * El 429 solo es alcanzable mientras las cabeceras siguen libres. En streaming los dos
- * controladores comprometen el 200 ANTES de leer un byte del upstream, asi que un
- * paquete de cuota —que llega como PRIMER frame— nunca puede cambiar el status:
+ * Un status (y la cabecera Retry-After, la unica que los SDK respetan) solo es alcanzable
+ * mientras la respuesta sigue libre. Los caminos en streaming comprometen de forma perezosa:
+ * nada sale hasta que el PRIMER frame de Qwen pasa assertNoUpstreamFailure, asi que un
+ * chat challenge o un paquete de cuota —que llegan como primer frame— si cambian el status:
  *
- *   camino                          fase             status  senal para el cliente
- *   /v1/messages        stream:false  libre           429     body.error.type
- *   /v1/messages        stream:true   comprometida    200     evento error.type (+retry_after)
- *   /v1/chat/... llano  stream:false  libre           429     body.error.type
- *   /v1/chat/... llano  stream:true   libre 1er byte  429     body.error.type
- *   /v1/chat/... agente stream:true   comprometida    200     frame error.type (+retry_after)
+ *   camino                          se compromete en                       fallo en el 1er frame
+ *   /v1/messages        stream:false  al final                             429/529 + Retry-After
+ *   /v1/messages        stream:true   1er frame valido o 1er ping          429/529 + Retry-After
+ *                                     (anthropic.js#handleAnthropicStream, ensureMessageStart)
+ *   /v1/chat/... llano  stream:false  al final                             429/503 + Retry-After
+ *   /v1/chat/... llano  stream:true   1er byte escrito                     429/503 + Retry-After
+ *   /v1/chat/... agente stream:true   1er frame valido o 1er latido        429/503 + Retry-After
+ *                                     (chat.js#handleOpenAIAgentStream, commitStream)
+ *   imagen              stream:true   al entregar el resultado             503 + Retry-After
+ *   video (t2v)         stream:true   1er keep-alive (15 s; las cabeceras  503 + Retry-After
+ *                                     SSE se fijan antes pero no se envian)
  *
- * La fila que importa es la segunda: Claude Code habla /v1/messages con stream:true, y
- * las 149 negativas de cuota de los logs del usuario salen todas de ahi. Decir que este
- * cambio "mapea la cuota a 429 en los dos caminos" es falso justo para el modo que el
- * usuario ejecuta; lo que hace es que la negativa sea RECONOCIBLE en los dos caminos y
- * en las dos fases. anthropic.js:1203/1211 y chat.js:407 son las lineas que comprometen
- * la respuesta, y adelantarlas es deliberado: sin cabeceras enviadas no se pueden mandar
- * `ping` dentro del protocolo (anthropic.js:1156-1160), que es como se elimino el falso
- * "stream muerto" del puente. Por eso la espera viaja DENTRO del evento/frame: es el
- * unico canal que queda cuando la cabecera Retry-After ya no se puede poner.
+ * Solo el chat challenge y la cuota se quedan sin comprometer; cualquier otro fallo antes
+ * del primer frame compromete y sale como antes, dentro del stream (convertirlo en 5xx
+ * haria que los SDK lo reintenten contra upload/parse). Tras el compromiso —p. ej. cuota a
+ * mitad de respuesta, las 149 negativas de los logs del usuario— la espera viaja DENTRO del
+ * evento/frame (`retry_after`): es el unico canal que queda. El compromiso perezoso no
+ * reabre el falso "stream muerto" del puente: los `ping`/latidos lo comprometen como mucho
+ * un intervalo despues, y el silencio largo que resolvian era el del reintento de correccion,
+ * que ocurre ya comprometido.
  */
 
 /**
@@ -241,9 +246,14 @@ const noteChatAnswer = () => {
   logger().info('Qwen chat challenge 探测请求已正常返回，恢复发送聊天请求', 'UPSTREAM');
 };
 
+// Los SDK de Anthropic y OpenAI solo respetan un Retry-After por debajo de 60 s; con 60 o mas
+// vuelven a su backoff corto. La ventana del breaker puede ser 60: el cliente vuelve 1 s antes
+// y, si aun esta abierto, recibe el segundo que falta.
+const CHAT_CHALLENGE_MAX_RETRY_AFTER_SECONDS = 59;
+
 const chatChallengeError = (message, retryAfter, details) => {
   const error = new UpstreamResponseError(message, WAF_CHALLENGE_CODE, details);
-  error.retryAfter = retryAfter;
+  error.retryAfter = Math.min(retryAfter, CHAT_CHALLENGE_MAX_RETRY_AFTER_SECONDS);
   return error;
 };
 

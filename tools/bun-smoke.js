@@ -77,6 +77,7 @@ async function main() {
   let completionRequests = 0
   let replyDelayMilliseconds = 20
   let failoverMode = false
+  let challengeMode = false
   const failoverTokens = []
   const upstreamServer = createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname
@@ -101,6 +102,11 @@ async function main() {
     } else if (pathname === '/api/v2/chat/completions') {
       completionRequests += 1
       response.setHeader('Content-Type', 'text/event-stream')
+      if (challengeMode) {
+        // The one frame Qwen sends on a chat challenge (prod, 2026-09-23..26).
+        response.end(`data: ${JSON.stringify({ ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试'] })}\n\n`)
+        return
+      }
       if (failoverMode) {
         const accountToken = request.headers.cookie?.split(';').find(part => part.trim().startsWith('token='))?.trim().slice(6)
         failoverTokens.push(accountToken)
@@ -329,6 +335,36 @@ async function main() {
     assert.ok(failoverTokens.every(token => smokeAccounts.some(account => account.token === token)))
     assert.equal(new Set(failoverTokens).size, 2, 'Failover must send a different account token upstream')
     console.log('PASS: Agent mid-stream quota failover with distinct account credentials')
+
+    // A chat challenge on the first frame must reach streaming clients as a real status with a
+    // Retry-After header over real Bun HTTP: SDKs ignore an in-stream error's retry_after.
+    challengeMode = true
+    const challengedMessages = await request('/v1/messages', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+      body: JSON.stringify({ model: MODEL, max_tokens: 16, stream: true, messages: [{ role: 'user', content: '你好' }] })
+    })
+    const challengedMessagesText = await challengedMessages.text()
+    assert.equal(challengedMessages.status, 529, challengedMessagesText)
+    assert.match(challengedMessages.headers.get('content-type') || '', /application\/json/)
+    assert.equal(challengedMessages.headers.get('retry-after'), '30')
+    assert.equal(JSON.parse(challengedMessagesText).error.type, 'overloaded_error')
+    const challengedAgent = await request('/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+      body: JSON.stringify({
+        model: MODEL, stream: true, messages: [{ role: 'user', content: '你好' }],
+        tools: [{ type: 'function', function: { name: 'get_time', parameters: { type: 'object', properties: {} } } }]
+      })
+    })
+    const challengedAgentText = await challengedAgent.text()
+    assert.equal(challengedAgent.status, 503, challengedAgentText)
+    assert.match(challengedAgent.headers.get('content-type') || '', /application\/json/)
+    assert.ok(Number(challengedAgent.headers.get('retry-after')) > 0)
+    assert.equal(JSON.parse(challengedAgentText).error.code, 'upstream_unavailable')
+    // The quota failover above cooled the other smoke account, so the agent has no account to
+    // switch to: one challenged send per request.
+    assert.equal(completionRequests, 8, 'one challenged send each for /v1/messages and the agent')
+    challengeMode = false
+    console.log('PASS: chat challenge on the first frame is a real 529/503 with Retry-After on streams')
     if (standalone) {
       const settingsResponse = await request('/api/setRetryConfig', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },

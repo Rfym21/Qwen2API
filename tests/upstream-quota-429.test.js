@@ -233,9 +233,9 @@ describe('/v1/messages: la cuota agotada sale como 429 rate_limit_error', () => 
   });
 
   it('streaming: a media transmision sale el EVENTO de error, no un cierre pelado', async () => {
-    // Aqui las cabeceras ya salieron (message_start se escribe antes de consumir el
-    // upstream), asi que el status HTTP ya no se puede cambiar: el unico canal que le
-    // queda al cliente para distinguir cuota de averia es el `type` del evento.
+    // Aqui las cabeceras ya salieron (el primer frame valido comprometio message_start),
+    // asi que el status HTTP ya no se puede cambiar: el unico canal que le queda al
+    // cliente para distinguir cuota de averia es el `type` del evento.
     upstreamFactory = () => streamOf([answerFrame('Voy a mirar'), quotaFrame()]);
     const res = streamRes();
     await handleAnthropicMessages({
@@ -351,17 +351,26 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
     assert.equal(String(res.headers['Retry-After']), '14400', '4 h == 14400 s');
   });
 
-  it('agentico streaming: el 429 es INALCANZABLE, y por eso el frame carga la senal', async () => {
-    // handleOpenAIAgentStream escribe el delta de apertura ({role:'assistant'}, chat.js:407)
-    // ANTES de consumir el upstream, asi que cuando llega el paquete de cuota la respuesta
-    // ya esta comprometida con 200 y el status HTTP no se puede cambiar. Para un cliente
-    // agentico con tools y stream el `type` del frame es el UNICO canal que queda. De ahi
-    // que arreglar el frame sea la mitad que de verdad sostiene este camino, no un extra.
-    // El gemelo de /v1/messages tiene la misma inalcanzabilidad, y por la misma razon:
-    // ver 'MATRIZ DE ALCANZABILIDAD' mas abajo.
+  it('agentico streaming: la cuota en el 1er frame es un 429 real, sin delta de apertura', async () => {
+    // handleOpenAIAgentStream compromete el delta de apertura ({role:'assistant'}) con el
+    // primer frame valido del upstream (commitStream). La cuota como primer frame llega antes:
+    // la respuesta sigue libre y sale un 429 real. Gemelo de /v1/messages.
     const res = streamRes();
     await handleStreamResponse(
       res, streamOf([quotaFrame()]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] }, AGENT_OPTS
+    );
+    assert.equal(res.statusCode, 429);
+    assert.doesNotMatch(res.output, /"role":"assistant"/, 'nada se comprometio');
+    assert.equal(JSON.parse(res.output).error?.type, 'insufficient_quota');
+  });
+
+  it('agentico streaming: a mitad de respuesta el frame carga la senal', async () => {
+    // Tras el primer frame valido la respuesta ya esta comprometida con 200: para un cliente
+    // agentico con tools y stream el `type` del frame es el UNICO canal que queda.
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([answerFrame('Voy a mirar'), quotaFrame()]), false, false,
       { messages: [{ role: 'user', content: 'hola' }] }, AGENT_OPTS
     );
     assert.equal(res.headersSent, true, 'el delta de apertura ya comprometio la respuesta');
@@ -407,28 +416,23 @@ describe('/v1/chat/completions: la cuota agotada sale como 429 insufficient_quot
 // ===================================================================================
 // MATRIZ DE ALCANZABILIDAD — lo que el cliente recibe DE VERDAD, por camino y por fase.
 //
-// El commit original se titulaba "map ... to 429 on both API paths". Es falso para el
-// unico modo que el usuario ejecuta. Claude Code habla /v1/messages con `stream: true`,
-// y las 149 negativas de cuota de sus logs son TODAS "mid-stream". En ese modo el 429
-// no existe: handleAnthropicStream fija las cabeceras (anthropic.js:1203) y escribe
-// message_start (:1211) ANTES de leer un solo byte del upstream, asi que cuando el
-// paquete de cuota llega `res.headersSent` ya es true y el catch del controlador
-// (:2659) solo puede tomar la rama del evento.
+// Claude Code habla /v1/messages con `stream: true`. Antes, handleAnthropicStream fijaba
+// las cabeceras y escribia message_start ANTES de leer un byte del upstream, asi que una
+// cuota en el primer frame salia como 200 + evento. Ahora el compromiso es perezoso (primer
+// frame valido o primer ping): la cuota —o un chat challenge— en el PRIMER frame es un 429
+// real con Retry-After; a mitad de respuesta (las 149 negativas de los logs del usuario son
+// todas "mid-stream") el evento sigue siendo todo el canal y carga la espera.
 //
-//   camino                         fase                     status   senal
-//   /v1/messages       stream:false  cabeceras aun libres    429      body.error.type
-//   /v1/messages       stream:true   SIEMPRE comprometida    200      evento error.type
-//   /v1/chat/... llano stream:false  cabeceras aun libres    429      body.error.type
-//   /v1/chat/... llano stream:true   libre hasta el 1er byte 429      body.error.type
-//   /v1/chat/... agente stream:true  SIEMPRE comprometida    200      frame error.type
+//   camino                         cuota en el 1er frame     cuota a mitad de respuesta
+//   /v1/messages       stream:false  429 + Retry-After         —
+//   /v1/messages       stream:true   429 + Retry-After         200 + evento error.type (+retry_after)
+//   /v1/chat/... llano stream:false  429 + Retry-After         —
+//   /v1/chat/... llano stream:true   429 + Retry-After         200 + frame error.type (+retry_after)
+//   /v1/chat/... agente stream:true  429 + Retry-After         200 + frame error.type (+retry_after)
 //
-// Estos casos clavan la fila que la frase original negaba. Que el 429 sea inalcanzable
-// no es un defecto a tapar: adelantar las cabeceras es lo que permite mandar `ping`
-// dentro del protocolo (anthropic.js:1156-1160), que es como se elimino el falso
-// "stream muerto" del puente ccproxy. Lo que SI era un defecto es que, sin cabecera,
-// la espera se perdia — eso se arregla abajo.
-describe('/v1/messages en streaming: el 429 es inalcanzable y el evento es todo el canal', () => {
-  it('con tools y la cuota como PRIMER frame: 200 comprometido, evento rate_limit_error', async () => {
+// La tabla completa, por funcion, esta en src/utils/upstream-error.js.
+describe('/v1/messages en streaming: la cuota en el 1er frame es un 429 real; despues, el evento', () => {
+  it('con tools y la cuota como PRIMER frame: 429 rate_limit_error, nada comprometido', async () => {
     upstreamFactory = () => streamOf([quotaFrame()]);
     const res = streamRes();
     await handleAnthropicMessages({
@@ -441,21 +445,28 @@ describe('/v1/messages en streaming: el 429 es inalcanzable y el evento es todo 
       }
     }, res);
 
-    assert.equal(res.headersSent, true, 'message_start ya comprometio la respuesta');
-    assert.equal(res.statusCode, 200, 'el 429 NO es alcanzable en el modo que usa Claude Code');
-
-    const events = sseEvents(res.output);
-    assert.equal(events[0]?.event, 'message_start', 'las cabeceras salen antes que el upstream');
-    const err = events.filter(e => e.event === 'error');
-    assert.equal(err.length, 1);
-    assert.equal(err[0].data?.error?.type, 'rate_limit_error', 'el type es el unico canal que queda');
-    assert.equal(res.headers['Retry-After'], undefined, 'ya no hay cabecera que poner');
+    assert.equal(res.statusCode, 429, 'el primer frame llega antes del compromiso');
+    assert.equal(sseEvents(res.output).length, 0, 'ni message_start ni evento: la respuesta es JSON');
+    assert.notEqual(res.headers['Content-Type'], 'text/event-stream');
+    assert.equal(JSON.parse(res.output).error?.type, 'rate_limit_error');
+    assert.equal(res.headers['Retry-After'], undefined, 'sin espera real, sin cabecera');
   });
 
-  it('la espera del upstream viaja DENTRO del evento, que es donde el cliente puede verla', async () => {
-    // Si el evento es el unico canal, tiene que cargar todo lo que la cabecera ya no
-    // puede llevar. `data.num` viene en HORAS (misma lectura que chat.image.video.js:88).
+  it('cuota en el 1er frame con la espera del upstream: la cabecera Retry-After la lleva', async () => {
     upstreamFactory = () => streamOf([quotaFrame({ num: 3 })]);
+    const res = streamRes();
+    await handleAnthropicMessages({
+      body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
+    }, res);
+
+    assert.equal(res.statusCode, 429);
+    assert.equal(String(res.headers['Retry-After']), '10800', '3 h == 10800 s, en la cabecera');
+  });
+
+  it('a mitad de respuesta la espera del upstream viaja DENTRO del evento', async () => {
+    // Ya comprometida, el evento es el unico canal: tiene que cargar todo lo que la cabecera
+    // ya no puede llevar. `data.num` viene en HORAS (misma lectura que chat.image.video.js:88).
+    upstreamFactory = () => streamOf([answerFrame('Voy a mirar'), quotaFrame({ num: 3 })]);
     const res = streamRes();
     await handleAnthropicMessages({
       body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
@@ -467,7 +478,7 @@ describe('/v1/messages en streaming: el 429 es inalcanzable y el evento es todo 
   });
 
   it('sin espera real el evento no se inventa ninguna', async () => {
-    upstreamFactory = () => streamOf([quotaFrame()]);
+    upstreamFactory = () => streamOf([answerFrame('Voy a mirar'), quotaFrame()]);
     const res = streamRes();
     await handleAnthropicMessages({
       body: { model: 'qwen3-max', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hola' }] }
@@ -508,10 +519,10 @@ describe('/v1/chat/completions en streaming: el frame carga la misma espera (gem
     assert.equal(errs[0].error.retry_after, 7200, '2 h == 7200 s, dentro del frame');
   });
 
-  it('agentico: el frame de error lleva retry_after — aqui el 429 no existe', async () => {
+  it('agentico: a mitad de respuesta el frame de error lleva retry_after', async () => {
     const res = streamRes();
     await handleStreamResponse(
-      res, streamOf([quotaFrame({ num: 5 })]), false, false,
+      res, streamOf([answerFrame('Voy a mirar'), quotaFrame({ num: 5 })]), false, false,
       { messages: [{ role: 'user', content: 'hola' }] },
       { has_tools: true, tool_choice: 'auto', allowed_tool_names: ['get_time'], agent_turn_max_attempts: 2 }
     );
@@ -519,6 +530,17 @@ describe('/v1/chat/completions en streaming: el frame carga la misma espera (gem
     const errs = sseFrames(res.output).filter(f => f && f.error);
     assert.equal(errs.length, 1);
     assert.equal(errs[0].error.retry_after, 18000, '5 h == 18000 s');
+  });
+
+  it('agentico: en el 1er frame la espera va en la cabecera Retry-After', async () => {
+    const res = streamRes();
+    await handleStreamResponse(
+      res, streamOf([quotaFrame({ num: 5 })]), false, false,
+      { messages: [{ role: 'user', content: 'hola' }] },
+      { has_tools: true, tool_choice: 'auto', allowed_tool_names: ['get_time'], agent_turn_max_attempts: 2 }
+    );
+    assert.equal(res.statusCode, 429);
+    assert.equal(String(res.headers['Retry-After']), '18000');
   });
 
   it('un fallo que NO es de cuota no lleva retry_after en el frame', async () => {
