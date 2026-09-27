@@ -1,4 +1,7 @@
 const config = require('../config')
+const rateLimit = require('express-rate-limit')
+
+const normalizeApiKey = providedKey => providedKey.startsWith('Bearer ') ? providedKey.slice(7) : providedKey
 
 /**
  * 验证API Key是否有效
@@ -11,7 +14,7 @@ const validateApiKey = (providedKey) => {
   }
 
   // 移除Bearer前缀
-  const cleanKey = providedKey.startsWith('Bearer ') ? providedKey.slice(7) : providedKey
+  const cleanKey = normalizeApiKey(providedKey)
 
   // 检查是否在有效的API keys列表中
   const isValid = config.apiKeys.includes(cleanKey)
@@ -46,7 +49,7 @@ const apiKeyVerify = (req, res, next) => {
 
   // 将权限信息附加到请求对象
   req.isAdmin = isAdmin
-  req.apiKey = apiKey
+  req.apiKey = normalizeApiKey(apiKey)
   next()
 }
 
@@ -62,13 +65,50 @@ const adminKeyVerify = (req, res, next) => {
   }
 
   req.isAdmin = isAdmin
-  req.apiKey = apiKey
+  req.apiKey = normalizeApiKey(apiKey)
   next()
+}
+
+const HEAVY_ENDPOINT_PATHS = [
+  '/v1/chat/completions',
+  '/v1/images/generations',
+  '/v1/images/edits',
+  '/v1/videos',
+  '/v1/messages',
+  '/cli/v1/chat/completions'
+]
+
+const heavyEndpointLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => req.apiKey,
+  handler: (req, res, _next, options) => {
+    const untilReset = req.rateLimit?.resetTime instanceof Date
+      ? req.rateLimit.resetTime.getTime() - Date.now()
+      : options.windowMs
+    res.set('Retry-After', String(Math.max(1, Math.ceil(untilReset / 1000))))
+    const message = 'Too many requests; retry after the current rate-limit window'
+    if (req.path.toLowerCase().startsWith('/v1/messages')) {
+      return res.status(429).json({ type: 'error', error: { type: 'rate_limit_error', message } })
+    }
+    return res.status(429).json({ error: { type: 'rate_limit_error', code: 'rate_limit_exceeded', message } })
+  }
+})
+
+/**
+ * Protect expensive API routes before global body parsers allocate request memory.
+ * @param {import('express').Express} app - Express application receiving API routes.
+ * @returns {void}
+ */
+const registerHeavyEndpointLimit = app => {
+  app.post(HEAVY_ENDPOINT_PATHS, apiKeyVerify, heavyEndpointLimiter)
 }
 
 module.exports = {
   apiKeyVerify,
   adminKeyVerify,
-  validateApiKey
+  validateApiKey,
+  registerHeavyEndpointLimit
 }
-
