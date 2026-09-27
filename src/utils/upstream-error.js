@@ -23,6 +23,83 @@ const RATE_LIMIT_CODE = 'RateLimited';
 const QUOTA_LIMIT_CODE = 'quota_limit';
 const WAF_CHALLENGE_CODE = 'upstream_waf_challenge';
 const isWafChallengeError = (error) => String(error?.code || '').toLowerCase() === WAF_CHALLENGE_CODE;
+/**
+ * Señales con las que Qwen Web anuncia el WAF/captcha. Vive aquí porque hay DOS rutas que
+ * tienen que reconocerlo —los controladores de texto vía assertNoUpstreamFailure, y el de
+ * imagen/vídeo vía parseUpstreamImageError— y separarlas ya costó un fallo silencioso: la
+ * ruta de imagen no reconocía este paquete y entregaba un 200 con la imagen de relleno del
+ * propio Qwen (img.alicdn.com) como si la generación hubiera salido bien.
+ */
+const WAF_SIGNAL_RE = /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i;
+/**
+ * Señales de la MISMA página de captcha pero cuando el upstream la manda como HTML.
+ *
+ * Caso real (2026-09-19): `/api/v2/chat/completions` contestó 200 con 16 KB de
+ * `<!doctype html> <meta name="aliyun_waf_aa" ...>`. El detector solo miraba el paquete
+ * JSON `{ret:[...]}`, así que el HTML pasaba entero: `parseSsePayloads` no encontraba
+ * ninguna línea `data:`, `JSON.parse` fallaba, y `extractResourceUrlFromPayload` sacaba
+ * del propio HTML la primera URL que hubiera — que resultó ser la imagen de relleno de
+ * Qwen — y la devolvía como generación correcta.
+ *
+ * Ancladas a marcadores que solo existen en el challenge, no a la palabra suelta
+ * "captcha": el texto normal del modelo puede nombrarla.
+ */
+const WAF_HTML_SIGNAL_RE = /aliyun_waf_|aliyunCaptcha|_waf_is_mobile|id=["']captcha-element|<title>Verification<\/title>/i;
+/**
+ * ¿El cuerpo CRUDO del upstream (texto o buffer) es la página de captcha del WAF?
+ * @param {unknown} rawText - Cuerpo sin parsear
+ * @returns {boolean}
+ */
+const isWafChallengeBody = (rawText) => {
+  if (typeof rawText !== 'string' || rawText === '') return false;
+  return WAF_HTML_SIGNAL_RE.test(rawText);
+};
+/**
+ * ¿Este payload de upstream (HTTP 200, JSON normal) es en realidad el WAF pidiendo captcha?
+ *
+ * Qwen contesta 200 con `{"ret":["FAIL_SYS_USER_VALIDATE",...],"data":{"url":".../punish?..."}}`
+ * en vez de un error HTTP. Sin reconocerlo, el llamador lo trata como respuesta buena.
+ * @param {unknown} payload - Cuerpo JSON del upstream
+ * @returns {string[]} Señales encontradas (vacío si no es un challenge)
+ */
+const findWafChallengeSignals = (payload) => {
+  if (!payload || typeof payload !== 'object') return [];
+  const ret = Array.isArray(payload.ret)
+    ? payload.ret.map(String)
+    : (payload.ret ? [String(payload.ret)] : []);
+  return [
+    ...ret,
+    payload.code,
+    payload.data?.code,
+    payload.data?.url,
+    payload.error?.code
+  ].filter(Boolean).map(String).filter(item => WAF_SIGNAL_RE.test(item));
+};
+/**
+ * Detecta el challenge y devuelve el error canónico, o null si el payload no lo es.
+ * @param {unknown} payload - Cuerpo JSON del upstream
+ * @returns {UpstreamResponseError|null}
+ */
+const detectWafChallenge = (payload) => {
+  // El cuerpo crudo llega a veces tal cual (HTML). Se comprueba primero porque un HTML
+  // no tiene forma de objeto que inspeccionar.
+  if (typeof payload === 'string' && isWafChallengeBody(payload)) {
+    return new UpstreamResponseError(
+      'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
+      WAF_CHALLENGE_CODE,
+      { ret: [] }
+    );
+  }
+  if (!payload || typeof payload !== 'object') return null;
+  const signals = findWafChallengeSignals(payload);
+  if (signals.length === 0) return null;
+  const ret = Array.isArray(payload?.ret) ? payload.ret.map(String) : [];
+  return new UpstreamResponseError(
+    'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
+    WAF_CHALLENGE_CODE,
+    { ret }
+  );
+};
 /** Vocabulario de cable de cada API. Juntos aqui para que los gemelos no se separen. */
 const RATE_LIMIT_ANTHROPIC_TYPE = 'rate_limit_error';
 const RATE_LIMIT_OPENAI_TYPE = 'insufficient_quota';
@@ -177,25 +254,9 @@ const noteRateLimitedAccount = (error, account) => {
  * 这些帧没有 choices，若直接跳过就会被误包装成空成功或正常 stop。
  */
 const assertNoUpstreamFailure = (payload) => {
+  const wafChallenge = detectWafChallenge(payload);
+  if (wafChallenge) throw wafChallenge;
   if (!payload || typeof payload !== 'object') return;
-
-  const ret = Array.isArray(payload.ret)
-    ? payload.ret.map(String)
-    : (payload.ret ? [String(payload.ret)] : []);
-  const upstreamSignals = [
-    ...ret,
-    payload.code,
-    payload.data?.code,
-    payload.data?.url,
-    payload.error?.code
-  ].filter(Boolean).map(String);
-  if (upstreamSignals.some(item => item.toLowerCase() === WAF_CHALLENGE_CODE || /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i.test(item))) {
-    throw new UpstreamResponseError(
-      'Qwen 网页上游触发 WAF/captcha；Agent 上下文可能过大或账号需要验证',
-      WAF_CHALLENGE_CODE,
-      { ret }
-    );
-  }
 
   const explicitError = payload.error;
   if (explicitError && !Array.isArray(payload.choices)) {
@@ -223,6 +284,8 @@ const assertNoUpstreamFailure = (payload) => {
 module.exports = {
   UpstreamResponseError,
   assertNoUpstreamFailure,
+  detectWafChallenge,
+  isWafChallengeBody,
   isRateLimitError,
   isWafChallengeError,
   rateLimitRetryAfterSeconds,

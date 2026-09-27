@@ -10,6 +10,7 @@ const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
+const { detectWafChallenge } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -78,6 +79,22 @@ const parseUpstreamImageError = (data) => {
             payload = JSON.parse(payload)
         }
 
+        // WAF/captcha llega como HTTP 200 con una forma propia (`ret`), NO como
+        // `success:false`. Sin esta rama el paquete se colaba entero: la generación
+        // "tenía éxito" y se devolvía la imagen de relleno de Qwen como resultado.
+        const wafChallenge = detectWafChallenge(payload)
+        if (wafChallenge) {
+            logger.error('图片/视频上游触发 WAF/captcha，需人工验证', 'CHAT', '', {
+                parsed_error: wafChallenge.details,
+                raw_response_body: rawPayload
+            })
+            return {
+                error: wafChallenge.publicMessage,
+                code: wafChallenge.code,
+                status: 502
+            }
+        }
+
         // 只有明确 success=false 且带错误码时，才按上游错误包处理，避免误伤正常业务响应
         if (!payload || payload.success !== false || !payload.data?.code) {
             return null
@@ -124,6 +141,54 @@ const parseUpstreamImageErrorFromText = (text) => {
     } catch (e) {
         return null
     }
+}
+
+/**
+ * 流结束后的兜底：从整段原始文本里找出可识别的上游错误。
+ *
+ * 不能只试 `JSON.parse(整段)`：上游有时把 JSON 包在 `data:` 前缀里发（额度耗尽的
+ * 非流式响应就是这样），整段 JSON.parse 会失败，WAF/业务错误就整个滑过去被当成成功。
+ * 这里复用流式路径同一个 parseSsePayloads，两种形态都拆得开。
+ * @param {string} text - 上游原始文本
+ * @returns {object|null} 上游错误，未识别到则为 null
+ */
+const parseUpstreamErrorFromRawText = (text) => {
+    if (!text || typeof text !== 'string') {
+        return null
+    }
+
+    const trimmed = text.trim()
+    if (!trimmed) {
+        return null
+    }
+
+    // La página de captcha del WAF llega como HTML y no se deja ver por ninguna de las
+    // ramas de abajo (no hay `data:`, no es JSON). Se comprueba primero.
+    const htmlChallenge = detectWafChallenge(trimmed)
+    if (htmlChallenge) {
+        logger.error('图片/视频上游返回 WAF/captcha HTML 页面，需人工验证', 'CHAT', '', {
+            raw_preview: trimmed.slice(0, 200)
+        })
+        return {
+            error: htmlChallenge.publicMessage,
+            code: htmlChallenge.code,
+            status: 502
+        }
+    }
+
+    const fromWholeText = parseUpstreamImageErrorFromText(trimmed)
+    if (fromWholeText) {
+        return fromWholeText
+    }
+
+    for (const payload of parseSsePayloads(trimmed, true).payloads) {
+        const parsed = parseUpstreamImageError(payload)
+        if (parsed) {
+            return parsed
+        }
+    }
+
+    return null
 }
 
 /**
@@ -882,7 +947,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 
     const trimmedRawText = rawText.trim()
     if (!upstreamError) {
-        upstreamError = parseUpstreamImageErrorFromText(trimmedRawText) || parseUpstreamImageError(trimmedRawText)
+        upstreamError = parseUpstreamErrorFromRawText(trimmedRawText)
     }
 
     if (!contentUrl) {
@@ -969,7 +1034,7 @@ const readImageUpstreamResult = async (responseStream) => {
 
     const trimmedRawText = rawText.trim()
     if (!upstreamError) {
-        upstreamError = parseUpstreamImageErrorFromText(trimmedRawText) || parseUpstreamImageError(trimmedRawText)
+        upstreamError = parseUpstreamErrorFromRawText(trimmedRawText)
     }
 
     if (!contentUrl) {
@@ -1328,6 +1393,12 @@ const generateImageVideoResult = async (payload) => {
         const chatBaseUrl = getChatBaseUrl()
         // Antidetect: per-account fingerprint headers replace static block
         const ssxmod = getSsxmodForAccount(account)
+        // The Accept header depends on whether the upstream call streams, so the
+        // flag has to be resolved before the headers are built. Declaring it after
+        // this block put it in the temporal dead zone and threw
+        // "Cannot access 'upstreamStream' before initialization" on every call.
+        const newChatType = reqBody.messages[0]?.chat_type
+        const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
         const headers = buildRequestHeaders(account, {
             chatBaseUrl,
             token,
@@ -1344,8 +1415,6 @@ const generateImageVideoResult = async (payload) => {
         logger.info(`选择图片: ${selectedImageList[selectedImageList.length - 1] || '未选择图片，切换生成图/视频模式'}`, 'CHAT')
         logger.info(`使用提示: ${reqBody.messages[0].content}`, 'CHAT')
 
-        const newChatType = reqBody.messages[0].chat_type
-        const upstreamStream = newChatType === 't2i' || newChatType === 'image_edit'
         reqBody.stream = upstreamStream
 
         logger.info(`图片视频流策略: upstream=${upstreamStream} downstream=${payload.stream === true}`, 'CHAT')
