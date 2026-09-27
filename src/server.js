@@ -19,6 +19,7 @@ const accountsRouter = require('./routes/accounts.js')
 const settingsRouter = require('./routes/settings.js')
 const { resolveRuntimePath } = require('./utils/runtime-paths')
 const { mountFrontend } = require('./utils/frontend.js')
+const { registerHeavyEndpointLimit } = require('./middlewares/authorization.js')
 
 if (config.dataSaveMode === 'file') {
   const dataFilePath = resolveRuntimePath('data', 'data.json')
@@ -30,18 +31,7 @@ if (config.dataSaveMode === 'file') {
 
 // SSXMOD initialization is now lazy (per-account); no startup side effect
 
-app.use(bodyParser.json({ limit: '128mb' }))
-app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))
 app.use(cors())
-
-// CSRF token endpoint: browser clients GET a token tied to a per-request secret
-app.get('/api/csrf-token', (req, res) => {
-  const secret = csrfTokens.secretSync()
-  const token = csrfTokens.create(secret)
-  // Return both so the client can store the secret in sessionStorage and send
-  // both back on state-changing requests via X-CSRF-Token and X-CSRF-Secret headers
-  res.json({ csrfToken: token, csrfSecret: secret })
-})
 
 // 没有凭证可用的公开端点：管理面板登录接口
 const CSRF_EXEMPT_PATHS = new Set(['/verify'])
@@ -70,7 +60,21 @@ const csrfProtect = (req, res, next) => {
   }
   return res.status(403).json({ error: 'Invalid CSRF token' })
 }
+// Reject browser requests before the large body parsers allocate memory.
 app.use(csrfProtect)
+
+registerHeavyEndpointLimit(app)
+app.use(bodyParser.json({ limit: '128mb' }))
+app.use(bodyParser.urlencoded({ limit: '128mb', extended: true }))
+
+// CSRF token endpoint: browser clients GET a token tied to a per-request secret
+app.get('/api/csrf-token', (req, res) => {
+  const secret = csrfTokens.secretSync()
+  const token = csrfTokens.create(secret)
+  // Return both so the client can store the secret in sessionStorage and send
+  // both back on state-changing requests via X-CSRF-Token and X-CSRF-Secret headers
+  res.json({ csrfToken: token, csrfSecret: secret })
+})
 
 // API路由
 app.use(modelsRouter)

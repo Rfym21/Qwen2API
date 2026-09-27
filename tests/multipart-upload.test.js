@@ -6,12 +6,18 @@ const path = require('node:path')
 const Module = require('node:module')
 const { request: requestHttp } = require('node:http')
 const express = require('express')
+const cors = require('cors')
 const { createUploadMiddleware } = require('../src/middlewares/upload')
 
 const API_KEY = 'multipart-test-key'
+const RATE_LIMIT_KEY = 'multipart-rate-limit-key'
 const BOUNDARY = 'qwen-multipart-test-boundary'
 const CONTENT_TYPE = `multipart/form-data; boundary=${BOUNDARY}`
 const MEDIA_ROUTES = ['/v1/images/edits', '/v1/videos']
+const HEAVY_ROUTES = [
+    '/v1/chat/completions', '/v1/images/generations', '/v1/images/edits',
+    '/v1/videos', '/v1/messages', '/cli/v1/chat/completions'
+]
 let handledRequests = 0
 
 function echoUpload(request, response) {
@@ -38,18 +44,23 @@ function loadOfflineRouter() {
             handleOpenAIImagesGeneration: echoUpload,
             handleOpenAIImagesEdit: echoUpload,
             handleOpenAIVideoGeneration: echoUpload
-        }
+        },
+        '../src/controllers/anthropic.js': { handleAnthropicMessages: echoUpload },
+        '../src/controllers/cli.chat.js': { handleCliChatCompletion: echoUpload },
+        '../src/utils/account.js': { accountTokens: [{ cli_info: { request_number: 0 } }] },
+        '../src/utils/cli-support.js': { DEFAULT_CLI_QUOTA_LIMIT: 100 }
     }
     const isolatedModules = [
         ...Object.keys(stubs), '../src/config/index.js',
-        '../src/middlewares/authorization.js', '../src/routes/chat.js'
+        '../src/middlewares/authorization.js', '../src/routes/chat.js',
+        '../src/routes/anthropic.js', '../src/routes/cli.chat.js'
     ].map(moduleName => require.resolve(moduleName))
     const originalModules = new Map(isolatedModules.map(modulePath => [modulePath, require.cache[modulePath]]))
     const originalDirectory = process.cwd()
     const originalApiKey = process.env.API_KEY
     const temporaryDirectory = mkdtempSync(path.join(tmpdir(), 'qwen-multipart-'))
     try {
-        writeFileSync(path.join(temporaryDirectory, '.env'), `API_KEY=${API_KEY}\n`)
+        writeFileSync(path.join(temporaryDirectory, '.env'), 'API_KEY=' + API_KEY + ',' + RATE_LIMIT_KEY + '\n')
         process.chdir(temporaryDirectory)
         delete process.env.API_KEY
         for (const modulePath of isolatedModules) delete require.cache[modulePath]
@@ -63,7 +74,10 @@ function loadOfflineRouter() {
         }
         return {
             router: require('../src/routes/chat.js'),
-            apiKeyVerify: require('../src/middlewares/authorization.js').apiKeyVerify
+            anthropicRouter: require('../src/routes/anthropic.js'),
+            cliChatRouter: require('../src/routes/cli.chat.js'),
+            apiKeyVerify: require('../src/middlewares/authorization.js').apiKeyVerify,
+            registerHeavyEndpointLimit: require('../src/middlewares/authorization.js').registerHeavyEndpointLimit
         }
     } finally {
         process.chdir(originalDirectory)
@@ -92,10 +106,14 @@ function buildMultipart(parts, complete = true) {
 let server
 let baseUrl
 before(async () => {
-    const { router, apiKeyVerify } = loadOfflineRouter()
+    const { router, anthropicRouter, cliChatRouter, apiKeyVerify, registerHeavyEndpointLimit } = loadOfflineRouter()
     const application = express()
-    application.use(express.json())
+    application.use(cors())
+    registerHeavyEndpointLimit(application)
+    application.use(express.json({ limit: '1kb' }))
     application.use(router)
+    application.use(anthropicRouter)
+    application.use(cliChatRouter)
     // Small limits exercise the same parser without allocating 100 MiB test files.
     application.post('/limited', apiKeyVerify, createUploadMiddleware({
         fileSize: 8, files: 2, fields: 3, parts: 8,
@@ -254,4 +272,79 @@ test('authentication rejects malformed uploads before parsing or waiting for a b
     }
     assert.equal(handledRequests, previouslyHandled)
     await assertResponsive()
+})
+
+test('all expensive routes share a canonical key limit before JSON parsing', async () => {
+    const origin = 'https://client.example'
+    const preflight = await fetch(baseUrl + '/v1/chat/completions', {
+        method: 'OPTIONS',
+        headers: { Origin: origin, 'Access-Control-Request-Method': 'POST' }
+    })
+    assert.equal(preflight.status, 204)
+    assert.equal(preflight.headers.get('access-control-allow-origin'), '*')
+
+    const unauthorized = await fetch(baseUrl + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer invalid-key', 'Content-Type': 'application/json' },
+        body: 'x'.repeat(2048)
+    })
+    assert.equal(unauthorized.status, 401, 'authentication must reject before the 1 KiB parser')
+
+    for (let index = 0; index < 30; index += 1) {
+        const route = HEAVY_ROUTES[index % HEAVY_ROUTES.length]
+        const authorization = index % 2 === 0 ? 'Bearer ' + RATE_LIMIT_KEY : RATE_LIMIT_KEY
+        const response = await fetch(baseUrl + route, {
+            method: 'POST',
+            headers: { Authorization: authorization, 'Content-Type': 'application/json' },
+            body: '{}'
+        })
+        assert.equal(response.status, 200, route + ' request ' + index)
+        await response.arrayBuffer()
+    }
+
+    const previouslyHandled = handledRequests
+    const blockedOpenAI = await fetch(baseUrl + '/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: RATE_LIMIT_KEY, 'Content-Type': 'application/json', Origin: origin },
+        body: 'x'.repeat(2048)
+    })
+    assert.equal(blockedOpenAI.status, 429, 'the limiter must run before the 1 KiB parser')
+    assert.equal(blockedOpenAI.headers.get('access-control-allow-origin'), '*')
+    assert.match(String(blockedOpenAI.headers.get('content-type')), /application\/json/)
+    assert.ok(Number(blockedOpenAI.headers.get('retry-after')) > 0)
+    assert.equal((await blockedOpenAI.json()).error.type, 'rate_limit_error')
+
+    const blockedAnthropic = await fetch(baseUrl + '/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': RATE_LIMIT_KEY, 'Content-Type': 'application/json' },
+        body: '{}'
+    })
+    assert.equal(blockedAnthropic.status, 429)
+    const anthropicError = await blockedAnthropic.json()
+    assert.equal(anthropicError.type, 'error')
+    assert.equal(anthropicError.error.type, 'rate_limit_error')
+    assert.ok(Number(blockedAnthropic.headers.get('retry-after')) > 0)
+
+    const trailingSlash = await fetch(baseUrl + '/v1/messages/', {
+        method: 'POST',
+        headers: { 'x-api-key': RATE_LIMIT_KEY, 'Content-Type': 'application/json' },
+        body: '{}'
+    })
+    assert.equal(trailingSlash.status, 429)
+    assert.equal((await trailingSlash.json()).error.type, 'rate_limit_error')
+
+    const blockedCli = await fetch(baseUrl + '/cli/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + RATE_LIMIT_KEY, 'Content-Type': 'application/json' },
+        body: '{}'
+    })
+    assert.equal(blockedCli.status, 429)
+    assert.equal((await blockedCli.json()).error.type, 'rate_limit_error')
+    assert.equal(handledRequests, previouslyHandled)
+
+    const otherKey = await sendRequest('/v1/images/generations', '{}', {
+        contentType: 'application/json', apiKey: API_KEY
+    })
+    assert.equal(otherKey.status, 200, 'another valid key keeps its own quota')
+    await otherKey.arrayBuffer()
 })
