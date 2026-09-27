@@ -30,6 +30,7 @@
     "csrf": "^3.1.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "express-rate-limit": "^8.3.1",
     "form-data": "^4.0.6",
     "https-proxy-agent": "^7.0.6",
     "ioredis": "^5.6.1",
