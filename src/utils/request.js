@@ -7,28 +7,22 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError } = require('./upstream-error.js')
+const { ContextExternalizationError, isTransportInterruption } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
 } = require('./agent-turn.js')
 
-// 传输层（非 HTTP）错误码 — 这些重试的, HTTP 响应不重试
-const RETRYABLE_ERROR_CODES = new Set([
-    'ECONNRESET',
-    'ECONNREFUSED',
-    'ETIMEDOUT',
-    'ECONNABORTED',
-    'EAI_AGAIN'
-])
+// 连接阶段失败（拒绝 / DNS 暂时不可用）。传输中断（socket 关闭、超时）的判定在
+// upstream-error.js#isTransportInterruption，这里只补连接前的两个码，不再各自维护一份。
+const CONNECT_FAILURE_CODES = new Set(['ECONNREFUSED', 'EAI_AGAIN'])
 
 const isRetryableNetworkError = (error) => {
-    if (!error) return false
+    if (!error || typeof error !== 'object') return false
+    if (isTransportInterruption(error)) return true
     // 已收到 HTTP 响应 = 上游回包了, 不是传输问题
     if (error.response) return false
-    if (error.code && RETRYABLE_ERROR_CODES.has(error.code)) return true
-    if (typeof error.message === 'string' && error.message.includes('socket hang up')) return true
-    return false
+    return CONNECT_FAILURE_CODES.has(String(error.code || error.cause?.code || ''))
 }
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
@@ -649,9 +643,12 @@ const externalizeOversizedAgentContext = async (
  */
 const sendChatRequest = async (body, options = {}) => {
     // 获取可用的账户（包含 proxy 等完整字段）
+    // excludeEmails：本次 HTTP 请求里已经烧掉的账户（流中途 failover）——轮换器跳过它们，
+    // 即使它们对其他请求仍然可用。
+    const excludeEmails = Array.isArray(options.excludeEmails) ? options.excludeEmails : []
     const currentAccount = options.currentAccount?.token
         ? options.currentAccount
-        : accountManager.getAccount()
+        : accountManager.getAccount(excludeEmails)
     const currentToken = currentAccount ? currentAccount.token : null
 
     if (!currentToken) {
@@ -884,5 +881,6 @@ module.exports = {
     compactAgentContextFallback,
     externalizeOversizedAgentContext,
     buildPrefixReusePrompt,
-    invalidateContextPrefix
+    invalidateContextPrefix,
+    isRetryableNetworkError
 }

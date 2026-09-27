@@ -120,7 +120,7 @@
     "forceRefreshAllFailed": "Ошибка принудительного обновления: ",
     "proxyUpdateSuccess": "Proxy обновлён",
     "proxyUpdateFailed": "Ошибка обновления proxy: ",
-    "proxyInvalid": "Неверный формат: ожидается http://, https:// или socks5://"
+    "proxyInvalid": "Неверный формат: ожидается http://, https://, socks5:// или socks5h://"
   },
   "settings": {
     "title": "Настройки",

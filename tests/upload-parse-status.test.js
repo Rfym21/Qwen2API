@@ -55,7 +55,10 @@ const axiosStub = {
         }
       };
     }
-    if (url.endsWith('/api/v2/files/parse')) return parseResponse
+    if (url.endsWith('/api/v2/files/parse')) {
+      if (parseResponse instanceof Error) throw parseResponse
+      return parseResponse
+    }
     if (url.endsWith('/api/v2/files/parse/status')) {
       return statusQueue.length > 1 ? statusQueue.shift() : statusQueue[0]
     }
@@ -115,6 +118,24 @@ test('parse POST answering with an error code fails before any status poll', asy
   await assert.rejects(
     parseUploadedTextFile('f1', 'token', {}, { intervalMs: 10 }),
     (error) => error.code === 'qwen_parse_unavailable'
+  )
+  assert.equal(statusCalls(), 0)
+})
+
+test('a transport failure on the parse POST names the egress, credentials dropped', async (context) => {
+  reset()
+  const account = { email: 'egress@example.invalid', proxy: 'socks5h://user:s3cr3t@lohari-warp-qwen:9091' }
+  context.after(() => invalidateProxyAgent(account.proxy))
+  parseResponse = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+  await assert.rejects(
+    parseUploadedTextFile('f1', 'token', account, { intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, 'ECONNRESET')
+      assert.equal(error.egress, 'socks5h://lohari-warp-qwen:9091')
+      assert.match(error.message, /socket hang up \(f1, via socks5h:\/\/lohari-warp-qwen:9091\)/)
+      assert.doesNotMatch(error.message, /s3cr3t/)
+      return true
+    }
   )
   assert.equal(statusCalls(), 0)
 })

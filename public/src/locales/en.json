@@ -118,7 +118,7 @@
     "forceRefreshAllConfirm": "Are you sure you want to force refresh the tokens of all accounts? \nThis will refresh all accounts, regardless of whether they are about to expire, and may take a long time.",
     "forceRefreshAllFailed": "Forced refresh failed:",
     "progressRetry": "Progress query failed, retrying...",
-    "proxyInvalid": "Format error: must start with http://, https:// or socks5://",
+    "proxyInvalid": "Format error: must start with http://, https://, socks5:// or socks5h://",
     "proxyUpdateFailed": "Agent update failed:",
     "proxyUpdateSuccess": "Agent updated successfully",
     "refreshAllComplete": "Batch refresh completed, {n} accounts were successfully refreshed",

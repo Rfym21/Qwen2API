@@ -124,6 +124,29 @@ const isRateLimitError = (error) => {
 };
 
 /**
+ * ¿El transporte se cayo antes o a mitad de la respuesta? Cierres de socket y timeouts tal
+ * y como los emiten Node (`ECONNRESET`), undici (`UND_ERR_SOCKET: other side closed` —
+ * 3 de 70 peticiones en 8 h el 2026-09-16 en qwen-next, con 63–90 KiB ya escritos) y los
+ * streams (`ERR_STREAM_PREMATURE_CLOSE`). NO incluye la cancelacion del propio cliente
+ * (`ERR_CANCELED` / AbortError): si quien corto fue el cliente no hay a quien reintentarle.
+ * Tampoco un error con respuesta HTTP: eso lo decidio el upstream, no la red.
+ */
+const TRANSPORT_INTERRUPTION_CODES = new Set([
+  'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
+  'UND_ERR_SOCKET', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  'ERR_STREAM_PREMATURE_CLOSE'
+]);
+const TRANSPORT_INTERRUPTION_MESSAGE_RE = /other side closed|socket hang up|premature close/i;
+const isTransportInterruption = (error) => {
+  if (!error || typeof error !== 'object') return false;
+  if (error.response) return false;
+  if (error.name === 'AbortError' || error.code === 'ERR_CANCELED') return false;
+  const code = String(error.code || error.cause?.code || '');
+  if (TRANSPORT_INTERRUPTION_CODES.has(code)) return true;
+  return TRANSPORT_INTERRUPTION_MESSAGE_RE.test(String(error.message || error.cause?.message || ''));
+};
+
+/**
  * El adjunto de contexto largo (upload + parse en Qwen) fallo en una peticion que NO
  * puede compactarse (lleva tools). Es una averia temporal del upstream —el servicio de
  * parse cae a ratos durante minutos u horas; 4 episodios en 9 dias de prod, el del
@@ -288,6 +311,7 @@ module.exports = {
   isWafChallengeBody,
   isRateLimitError,
   isWafChallengeError,
+  isTransportInterruption,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,

@@ -37,7 +37,7 @@ Qwen-Proxy 是一个将 `https://chat.qwen.ai` 和 `Qwen Code / Qwen Cli` 转换
 
 **优先级：** `account.proxy` > 全局 `PROXY_URL` > 不使用代理
 
-**支持的代理协议：** HTTP / HTTPS / SOCKS5（与 `PROXY_URL` 一致）
+**支持的代理协议：** HTTP / HTTPS / SOCKS5 / SOCKS5H（与 `PROXY_URL` 一致）
 
 **前端配置（推荐）：**
 打开管理面板 → 添加账号时填写 "代理地址" 字段，或在已有账号卡片上点击 "修改代理" 按钮。
@@ -108,7 +108,7 @@ AGENT_CONTEXT_LIVE_PROMPT_BYTES=49152     # 外置后仍内联保留的关键任
 # 🌐 代理与反代配置
 QWEN_CHAT_PROXY_URL=          # 自定义 Chat API 反代URL (默认: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # 自定义 CLI API 反代URL (默认: https://portal.qwen.ai)
-PROXY_URL=                    # HTTP/HTTPS/SOCKS5 代理地址 (例如: http://127.0.0.1:7890)
+PROXY_URL=                    # HTTP/HTTPS/SOCKS5/SOCKS5H 代理地址 (例如: http://127.0.0.1:7890)
 
 # 🗄️ 数据存储
 DATA_SAVE_MODE=none           # 数据保存模式 (none/file/redis)
@@ -140,7 +140,7 @@ CACHE_MODE=default            # 图片缓存模式 (default/file)
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | 上下文外置后，实时请求中保留的工具协议、system/developer 指令、原始任务、最近工具进度和当前结果的最大大小 | `49152`（48 KiB） |
 | `QWEN_CHAT_PROXY_URL` | 自定义 Chat API 反代地址 | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | 自定义 CLI API 反代地址 | `https://your-cli-proxy.com` |
-| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `PROXY_URL` | 出站请求代理地址，支持 HTTP/HTTPS/SOCKS5/SOCKS5H | `http://127.0.0.1:7890` |
 | `DATA_SAVE_MODE` | 数据持久化方式 | `none`/`file`/`redis` |
 | `REDIS_URL` | Redis 数据库连接地址，使用TLS加密时需使用 `rediss://` 协议 | `redis://localhost:6379` 或 `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | 批量添加账号时的登录并发数，可在前端系统设置中动态调整 | `5` |

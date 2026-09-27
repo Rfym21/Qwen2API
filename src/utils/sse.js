@@ -154,6 +154,7 @@ const consumeSSEStream = async (stream, onFrame, options = {}) => {
     const decoder = new SSEDecoder()
     let sawDone = false
     let eventCount = 0
+    let bytesRead = 0
     let stopped = false
 
     const consumeFrames = async (frames) => {
@@ -168,16 +169,28 @@ const consumeSSEStream = async (stream, onFrame, options = {}) => {
         }
     }
 
-    for await (const chunk of stream) {
-        await consumeFrames(decoder.push(chunk))
-        if (stopped) {
-            if (typeof stream.on === 'function') stream.on('error', () => {})
-            break
+    try {
+        for await (const chunk of stream) {
+            bytesRead += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length
+            await consumeFrames(decoder.push(chunk))
+            if (stopped) {
+                if (typeof stream.on === 'function') stream.on('error', () => {})
+                break
+            }
         }
+        if (!stopped) await consumeFrames(decoder.end())
+    } catch (error) {
+        // 中途失败带上"上游走到了哪"：控制器据此判断重试是否安全（已转发多少），
+        // egress 日志据此区分早断（几 KB）与晚断（几十 KB）。onFrame 抛出的业务错误
+        // （RateLimited 帧）同样经过这里，同样标注。
+        if (error && typeof error === 'object') {
+            error.upstreamBytesRead = bytesRead
+            error.upstreamEventCount = eventCount
+        }
+        throw error
     }
-    if (!stopped) await consumeFrames(decoder.end())
 
-    return { sawDone, eventCount, completed: true, stopped }
+    return { sawDone, eventCount, bytesRead, completed: true, stopped }
 }
 
 /**

@@ -5,16 +5,26 @@ dotenv.config()
  * 解析API_KEY环境变量，支持逗号分隔的多个key
  * @returns {Object} 包含apiKeys数组和adminKey的对象
  */
-const parseApiKeys = () => {
-    const apiKeyEnv = process.env.API_KEY
+const parseApiKeys = (apiKeyEnv = process.env.API_KEY) => {
     if (!apiKeyEnv) {
         return { apiKeys: [], adminKey: null }
     }
 
-    const keys = apiKeyEnv.split(',').map(key => key.trim()).filter(key => key.length > 0)
+    const slots = apiKeyEnv.split(',').map(key => key.trim())
+    // 空槽位 = 变量没展开（`API_KEY=${A},${B}` 里 A 未定义就变成 `,B`）。旧代码把空槽
+    // 过滤掉照常启动：admin key 静默变成了后面那个客户端 key，dashboard 用真正的 admin
+    // key 反而报 "invalid"。2026-09-16 qwen-next 就是这样丢掉后台访问的。没人会故意写
+    // 出空槽，所以这里直接拒绝启动，而不是带着残缺的密钥表跑下去。
+    const emptyAt = slots.map((key, index) => (key.length === 0 ? index + 1 : 0)).filter(Boolean)
+    if (emptyAt.length > 0) {
+        throw new Error(
+            `API_KEY 有 ${emptyAt.length} 个空槽位（第 ${emptyAt.join('、')} 位，共 ${slots.length} 位）——` +
+            '多半是环境变量没有展开。请检查部署时是否注入了全部密钥（例如 compose 的 ${...} 是否有值）。'
+        )
+    }
     return {
-        apiKeys: keys,
-        adminKey: keys.length > 0 ? keys[0] : null
+        apiKeys: slots,
+        adminKey: slots.length > 0 ? slots[0] : null
     }
 }
 
@@ -136,5 +146,8 @@ const config = {
         parseInt(process.env.ANTHROPIC_PING_INTERVAL_MS, 10) || 15000
     )
 }
+
+// 暴露解析器本身以便测试空槽位的拒绝逻辑（config 对象是模块级单例，无法重复解析）。
+config.parseApiKeys = parseApiKeys
 
 module.exports = config

@@ -37,9 +37,18 @@ const requestModule = require('../src/utils/request.js');
 let upstreamFactory = null;
 /** La cuenta que el upstream dice haber usado. Sin esto no hay a quien culpar del gasto. */
 let upstreamAccount = null;
-requestModule.sendChatRequest = async () => (upstreamFactory
-  ? { status: true, response: upstreamFactory(), currentAccount: upstreamAccount }
-  : { status: false });
+requestModule.sendChatRequest = async (_body, options = {}) => {
+  // Como el rotador real: una cuenta excluida (ya quemada en este mismo request por el
+  // failover a mitad de stream) no vuelve a salir. Con una sola cuenta eso es "no hay
+  // alternativa", y el controlador debe entregar el fallo original.
+  const excluded = Array.isArray(options.excludeEmails) ? options.excludeEmails : [];
+  if (upstreamAccount?.email && excluded.includes(upstreamAccount.email)) {
+    return { status: false, response: null, message: 'offline test: no alternative account' };
+  }
+  return upstreamFactory
+    ? { status: true, response: upstreamFactory(), currentAccount: upstreamAccount }
+    : { status: false };
+};
 
 const {
   UpstreamResponseError,

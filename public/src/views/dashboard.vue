@@ -576,7 +576,7 @@ const editProxy = ref({ email: '', proxy: '' })
 const isSavingProxy = ref(false)
 
 // 与后端 src/utils/proxy-helper.js#PROXY_URL_REGEX 保持一致
-const PROXY_URL_REGEX = /^(https?|socks5):\/\/[^\s]+$/i
+const PROXY_URL_REGEX = /^(https?|socks5h?):\/\/[^\s]+$/i
 const isValidProxy = (value) => {
   if (!value) return true
   const trimmed = String(value).trim()

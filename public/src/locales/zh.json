@@ -120,7 +120,7 @@
     "forceRefreshAllFailed": "强制刷新失败: ",
     "proxyUpdateSuccess": "代理更新成功",
     "proxyUpdateFailed": "代理更新失败: ",
-    "proxyInvalid": "格式错误：必须以 http://、https:// 或 socks5:// 开头"
+    "proxyInvalid": "格式错误：必须以 http://、https://、socks5:// 或 socks5h:// 开头"
   },
   "settings": {
     "title": "系统设置",

@@ -37,7 +37,7 @@ Each account can be configured with its own outbound proxy, allowing multiple ac
 
 **Priority:** `account.proxy` > Global `PROXY_URL` > No proxy
 
-**Supported Proxy Protocols:** HTTP / HTTPS / SOCKS5 (consistent with `PROXY_URL`)
+**Supported Proxy Protocols:** HTTP / HTTPS / SOCKS5 / SOCKS5H (consistent with `PROXY_URL`)
 
 **Frontend Configuration (Recommended):**
 Open the management panel → Fill in the "Proxy Address" field when adding accounts, or click the "Modify Proxy" button on existing account cards.
@@ -103,7 +103,7 @@ AGENT_TURN_MAX_TOOL_CALLS=24  # Anthropic path: text-channel tool_use cap per ag
 # 🌐 Proxy and Reverse Proxy Configuration
 QWEN_CHAT_PROXY_URL=          # Custom Chat API reverse proxy URL (default: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # Custom CLI API reverse proxy URL (default: https://portal.qwen.ai)
-PROXY_URL=                    # HTTP/HTTPS/SOCKS5 proxy address (example: http://127.0.0.1:7890)
+PROXY_URL=                    # HTTP/HTTPS/SOCKS5/SOCKS5H proxy address (example: http://127.0.0.1:7890)
 
 # 🗄️ Data Storage
 DATA_SAVE_MODE=none           # Data save mode (none/file/redis)
@@ -132,7 +132,7 @@ CACHE_MODE=default            # Image cache mode (default/file)
 | `AGENT_CONTEXT_LIVE_PROMPT_BYTES` | Maximum size of the tool protocol and current turn kept in the live request after context externalization | `49152` (48 KiB) |
 | `QWEN_CHAT_PROXY_URL` | Custom Chat API reverse proxy address | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Custom CLI API reverse proxy address | `https://your-cli-proxy.com` |
-| `PROXY_URL` | Outbound request proxy address, supports HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `PROXY_URL` | Outbound request proxy address, supports HTTP/HTTPS/SOCKS5/SOCKS5H | `http://127.0.0.1:7890` |
 | `DATA_SAVE_MODE` | Data persistence method | `none`/`file`/[redis](file://d:\Code\Qwen2API\src\utils\logger.js#L294-L296) |
 | `REDIS_URL` | Redis database connection address, use `rediss://` protocol when using TLS encryption | `redis://localhost:6379` or `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | Login concurrency during batch account addition, can be adjusted dynamically in frontend system settings | `5` |

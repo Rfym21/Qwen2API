@@ -57,7 +57,7 @@ QWEN_CHAT_PROXY_URL=http://127.0.0.1:8000/qwen  # Адрес обратного 
 
 **Приоритет:** `account.proxy` > глобальный `PROXY_URL` > без прокси
 
-**Поддерживаемые протоколы:** HTTP / HTTPS / SOCKS5 (как у `PROXY_URL`)
+**Поддерживаемые протоколы:** HTTP / HTTPS / SOCKS5 / SOCKS5H (как у `PROXY_URL`)
 
 **Через панель (рекомендуется):**
 Откройте dashboard → при добавлении аккаунта заполните поле «Proxy URL», либо нажмите кнопку «Изменить proxy» на карточке существующего аккаунта.
@@ -123,7 +123,7 @@ AGENT_TURN_MAX_TOOL_CALLS=24  # Anthropic: лимит tool_use по тексто
 # 🌐 Прокси и обратный прокси
 QWEN_CHAT_PROXY_URL=          # Пользовательский URL обратного прокси Chat API (по умолчанию: https://chat.qwen.ai)
 QWEN_CLI_PROXY_URL=           # Пользовательский URL обратного прокси CLI API (по умолчанию: https://portal.qwen.ai)
-PROXY_URL=                    # Адрес HTTP/HTTPS/SOCKS5 прокси (например: http://127.0.0.1:7890)
+PROXY_URL=                    # Адрес HTTP/HTTPS/SOCKS5/SOCKS5H прокси (например: http://127.0.0.1:7890)
 
 # 🗄️ Хранение данных
 DATA_SAVE_MODE=none           # Режим сохранения данных (none/file/redis)
@@ -150,7 +150,7 @@ CACHE_MODE=default            # Режим кэширования изображ
 | `AGENT_TURN_MAX_TOOL_CALLS` | Путь Anthropic: лимит блоков `tool_use` по текстовому каналу за один ход агента (4–256). Если модель «идёт вразнос» после нарративного `[TOOL CALL]` (сотни повторов одного вызова, выдуманная сессия целиком), upstream обрывается сразу после N-го принятого вызова, а принятые вызовы отдаются со `stop_reason=tool_use`; после уже принятого в более раннем delta вызова дубликат, отклонённый вызов или проза/размышление также обрывают ход | `24` |
 | `QWEN_CHAT_PROXY_URL` | Пользовательский адрес обратного прокси Chat API | `https://your-proxy.com` |
 | `QWEN_CLI_PROXY_URL` | Пользовательский адрес обратного прокси CLI API | `https://your-cli-proxy.com` |
-| `PROXY_URL` | Адрес прокси для исходящих запросов, поддержка HTTP/HTTPS/SOCKS5 | `http://127.0.0.1:7890` |
+| `PROXY_URL` | Адрес прокси для исходящих запросов, поддержка HTTP/HTTPS/SOCKS5/SOCKS5H | `http://127.0.0.1:7890` |
 | `DATA_SAVE_MODE` | Способ персистентного хранения данных | `none`/`file`/`redis` |
 | `REDIS_URL` | Адрес подключения к Redis, при использовании TLS-шифрования необходим протокол `rediss://` | `redis://localhost:6379` или `rediss://xxx.upstash.io` |
 | `BATCH_LOGIN_CONCURRENCY` | Параллельность входа при массовом добавлении аккаунтов, можно динамически менять в системных настройках фронтенда | `5` |

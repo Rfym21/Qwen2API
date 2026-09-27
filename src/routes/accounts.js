@@ -11,7 +11,7 @@ const { isValidProxyUrl } = require('../utils/proxy-helper')
 const { DEFAULT_CLI_QUOTA_LIMIT, getAccountCliState } = require('../utils/cli-support')
 
 // 仅在 proxy 字段存在时触发；空字符串/null 一律视为"清除代理"，无需校验
-const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https:// 或 socks5:// 开头'
+const PROXY_FORMAT_ERROR = '代理 URL 格式无效，应以 http://、https://、socks5:// 或 socks5h:// 开头'
 
 const batchAccountTasks = new Map()
 const BATCH_TASK_RETENTION_MS = 1000 * 60 * 30

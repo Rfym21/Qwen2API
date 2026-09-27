@@ -3,7 +3,7 @@ const OSS = require('ali-oss')
 const mimetypes = require('mime-types')
 const { logger } = require('./logger')
 const { generateUUID } = require('./tools.js')
-const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig } = require('./proxy-helper')
+const { getProxyAgent, getChatBaseUrl, applyProxyToAxiosConfig, describeEgress } = require('./proxy-helper')
 const { buildRequestHeaders } = require('./header-profile')
 const config = require('../config/index.js')
 
@@ -391,17 +391,22 @@ const parseServiceFailureCode = (response) => {
     return null
 }
 
-const throwIfParseServiceFailed = (response, fileId) => {
+// `egress` names the proxy (or 'direct') the parse left through. The WAF
+// challenge is per egress IP, so this is the field that tells one burnt proxy
+// apart from a Qwen-side outage.
+const throwIfParseServiceFailed = (response, fileId, egress = 'unknown') => {
     const code = parseServiceFailureCode(response)
     if (code === null) return
-    const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId})`)
+    const error = new Error(`Qwen 文档解析服务失败: ${code} (${fileId}, via ${egress})`)
     error.code = code === WAF_CAPTCHA_CODE ? 'qwen_parse_waf_challenge' : 'qwen_parse_unavailable'
     error.parseCode = code
+    error.egress = egress
     throw error
 }
 
 const parseUploadedTextFile = async (fileId, authToken, account, options = {}) => {
     if (!fileId || !authToken) throw new Error('解析文档缺少 fileId 或认证 Token')
+    const egress = describeEgress(account)
 
     const baseUrl = getChatBaseUrl()
     const requestConfig = applyProxyToAxiosConfig({
@@ -409,19 +414,29 @@ const parseUploadedTextFile = async (fileId, authToken, account, options = {}) =
         timeout: Math.max(1000, Number(options.timeoutMs) || 30000)
     }, account)
 
-    const parseResponse = await axios.post(`${baseUrl}/api/v2/files/parse`, { file_id: fileId }, requestConfig)
-    throwIfParseServiceFailed(parseResponse, fileId)
+    // Transport failures (dead proxy, reset, timeout) never reach the JSON checks in
+    // throwIfParseServiceFailed; tag them with the egress too, or a burnt proxy logs as a bare ECONNRESET.
+    const postViaEgress = async (path, body) => {
+        try {
+            return await axios.post(`${baseUrl}${path}`, body, requestConfig)
+        } catch (error) {
+            if (error && typeof error === 'object' && !error.egress) {
+                error.egress = egress
+                error.message = `${error.message} (${fileId}, via ${egress})`
+            }
+            throw error
+        }
+    }
+
+    const parseResponse = await postViaEgress('/api/v2/files/parse', { file_id: fileId })
+    throwIfParseServiceFailed(parseResponse, fileId, egress)
 
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 30)
     const intervalMs = Math.max(50, Number(options.intervalMs) || 500)
     let lastStatus = ''
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const response = await axios.post(
-            `${baseUrl}/api/v2/files/parse/status`,
-            { file_id_list: [fileId] },
-            requestConfig
-        )
-        throwIfParseServiceFailed(response, fileId)
+        const response = await postViaEgress('/api/v2/files/parse/status', { file_id_list: [fileId] })
+        throwIfParseServiceFailed(response, fileId, egress)
         const payload = unwrapApiData(response)
         const records = Array.isArray(payload) ? payload : (payload?.list || payload?.items || [])
         const record = records.find(item => item?.file_id === fileId) || records[0]
@@ -519,16 +534,18 @@ const noteParseOutcome = (error) => {
     if (cooldownSeconds > 0 && parseBreaker.strikes >= PARSE_BREAKER_STRIKES) {
         parseBreaker.openUntil = nowMs() + cooldownSeconds * 1000
         error.retryAfterSeconds = cooldownSeconds
-        logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传`, 'UPLOAD')
+        logger.warn(`Agent 上下文解析被 WAF 连续拦截 ${parseBreaker.strikes} 次，${cooldownSeconds}s 内不再上传 (egress ${error.egress || 'unknown'})`, 'UPLOAD')
     }
 }
 
-const assertParseBreakerClosed = () => {
+const assertParseBreakerClosed = (account) => {
     const remaining = parseBreakerRemainingSeconds()
     if (remaining <= 0) return
-    const error = new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (breaker open, ${remaining}s left, upload skipped)`)
+    const egress = describeEgress(account)
+    const error = new Error(`Qwen 文档解析服务失败: ${WAF_CAPTCHA_CODE} (breaker open, ${remaining}s left, upload skipped, via ${egress})`)
     error.code = 'qwen_parse_waf_challenge'
     error.parseCode = WAF_CAPTCHA_CODE
+    error.egress = egress
     error.retryAfterSeconds = remaining
     error.breakerOpen = true
     throw error
@@ -550,7 +567,7 @@ const parseWindow = []
 
 const resetParseRateLimiter = () => { parseWindow.length = 0 }
 
-const takeParseSlot = () => {
+const takeParseSlot = (account) => {
     const max = Math.max(0, parseInt(config.agentParseMaxPerWindow, 10) || 0)
     if (max <= 0) return
     const windowSeconds = Math.max(1, parseInt(config.agentParseWindowSeconds, 10) || 120)
@@ -563,10 +580,12 @@ const takeParseSlot = () => {
     }
     const untilFree = Math.ceil((parseWindow[0] + windowMs - now) / 1000)
     const retryAfter = Math.min(PARSE_RATE_RETRY_MAX_SECONDS, Math.max(PARSE_RATE_RETRY_MIN_SECONDS, untilFree))
-    logger.warn(`Agent 上下文解析已达速率上限 (${max}/${windowSeconds}s)，${retryAfter}s 后重试`, 'UPLOAD')
-    const error = new Error(`Qwen 文档解析服务失败: ${PARSE_RATE_LIMITED_CODE} (${max}/${windowSeconds}s reached, upload skipped)`)
+    const egress = describeEgress(account)
+    logger.warn(`Agent 上下文解析已达速率上限 (${max}/${windowSeconds}s)，${retryAfter}s 后重试 (egress ${egress})`, 'UPLOAD')
+    const error = new Error(`Qwen 文档解析服务失败: ${PARSE_RATE_LIMITED_CODE} (${max}/${windowSeconds}s reached, upload skipped, via ${egress})`)
     error.code = 'qwen_parse_rate_limited'
     error.parseCode = PARSE_RATE_LIMITED_CODE
+    error.egress = egress
     error.retryAfterSeconds = retryAfter
     error.breakerOpen = false
     throw error
@@ -575,8 +594,8 @@ const takeParseSlot = () => {
 const uploadAgentContextFile = async (text, authToken, account, options = {}) => {
     const content = Buffer.from(String(text || ''), 'utf8')
     if (content.length === 0) throw new Error('Agent 上下文为空')
-    assertParseBreakerClosed()
-    takeParseSlot()
+    assertParseBreakerClosed(account)
+    takeParseSlot(account)
     const filename = options.filename || `QWEN2API_AGENT_CONTEXT_${Date.now()}.txt`
     const uploaded = await uploadFileToQwenOss(content, filename, authToken, account)
     try {

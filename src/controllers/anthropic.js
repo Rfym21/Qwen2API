@@ -57,10 +57,14 @@ const { logger } = require('../utils/logger');
 const {
   assertNoUpstreamFailure,
   describeUpstreamFailure,
+  isRateLimitError,
+  isTransportInterruption,
   noteRateLimitedAccount,
   RATE_LIMIT_ANTHROPIC_TYPE,
   UpstreamResponseError
 } = require('../utils/upstream-error.js');
+const { describeEgress } = require('../utils/proxy-helper.js');
+const { recordFailedAccount } = require('../utils/agent-account-failover.js');
 const {
   analyzeAnthropicCompatibility,
   buildAnthropicCompatibilityHeaders
@@ -1209,6 +1213,44 @@ const runWithAnthropicPing = async (res, work, intervalMs) => {
   }
 };
 
+// Reintento por cuenta cuando el upstream se cae ANTES de que el cliente haya visto un solo
+// bloque de contenido. Dos causas, una regla:
+//   - transporte: el socket se cerro a mitad del SSE (`UND_ERR_SOCKET: other side closed`,
+//     3 de 70 peticiones en 8 h el 2026-09-16 en qwen-next; sing-box sin un solo error, asi
+//     que no se sabe si corto WARP o Qwen);
+//   - cuota: el primer frame util es `RateLimited` — la cuenta se pausa (recordFailedAccount)
+//     y otra sirve el turno en vez de devolverle al cliente un 429 a medio stream.
+// El guard es "cero content_block emitidos": con uno ya en el cable, reenviar duplicaria
+// texto en la pantalla del cliente, asi que ahi el error sigue saliendo como hasta ahora y
+// el cliente (Claude Code) reintenta el. Una sola vuelta por peticion: la segunda caida
+// consecutiva es senal, no ruido.
+const MID_STREAM_FAILOVER_MAX_RETRIES = 1;
+
+const classifyMidStreamFailure = (error) => {
+  if (isRateLimitError(error)) return 'quota';
+  if (isTransportInterruption(error)) return 'transport';
+  return null;
+};
+
+/**
+ * Una linea por interrupcion, se reintente o no. Es la medida que faltaba: sin tasa de
+ * cierres por egress no hay forma de saber si WARP los empeora respecto a salir directo.
+ * `bytes`/`frames` los anota consumeSSEStream en el error; `proxy` nunca lleva credenciales
+ * (describeEgress).
+ */
+const logEgressInterruption = (kind, error, account, { emittedBlocks, action }) => {
+  logger.warn(
+    `mid_stream_${kind} code=${error?.code || 'unknown'}` +
+    ` bytes=${Number(error?.upstreamBytesRead) || 0}` +
+    ` frames=${Number(error?.upstreamEventCount) || 0}` +
+    ` emitted_blocks=${emittedBlocks}` +
+    ` account=${account?.email || 'none'}` +
+    ` proxy=${describeEgress(account)}` +
+    ` action=${action}`,
+    'EGRESS'
+  );
+};
+
 /**
  * 处理流式 Anthropic 响应
  * @param {object} res - Express 响应
@@ -1701,12 +1743,14 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
 
   let currentUpstream = upstream;
+  // Vueltas en las que el modelo llego a responder. Un failover no cuenta: el modelo aun no
+  // hablo, y el cupo de correccion de protocolo (maxAttempts) es para lo que SI dijo.
   let attemptsMade = 0;
   let retriedAfterVisibleText = false;
   let protocolRecoveryRetried = false;
+  let failoverRetries = 0;
 
   for (;;) {
-    attemptsMade += 1;
     startAttempt();
 
     try {
@@ -1717,9 +1761,53 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       upstreamCompleted = result.completed;
       upstreamEventCount = result.eventCount;
     } catch (e) {
-      logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
-      throw e;
+      const kind = classifyMidStreamFailure(e);
+      const emittedBlocks = blockIndex + 1;
+      const canFailover = kind !== null
+        && emittedBlocks === 0
+        && failoverRetries < MID_STREAM_FAILOVER_MAX_RETRIES
+        && !res.writableEnded && !res.destroyed;
+      if (kind) {
+        logEgressInterruption(kind, e, ctx.currentAccount, {
+          emittedBlocks,
+          action: canFailover ? 'failover' : 'deliver_error'
+        });
+      }
+      if (!canFailover) {
+        // Quien servia cuando se cayo, para que el catch del handler marque ESA cuenta si el
+        // error es de cuota (tras un failover ya no es la del sorteo inicial). Solo el email:
+        // el error se loguea y no debe arrastrar el token. Mismo campo que recordFailedAccount.
+        if (e && typeof e === 'object' && !e.failedAccountEmail) {
+          e.failedAccountEmail = ctx.currentAccount?.email || null;
+        }
+        logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
+        throw e;
+      }
+
+      failoverRetries += 1;
+      const failedEmail = ctx.currentAccount?.email || null;
+      // Cuota: pausa la cuenta antes de sortear otra. Transporte: solo anota el email; un
+      // cierre a mitad de stream no es culpa de la cuenta y no debe acercarla al cooldown.
+      recordFailedAccount(e, ctx.currentAccount);
+      let retryResp = null;
+      try {
+        await runWithAnthropicPing(res, async () => {
+          retryResp = await sendRequest(requestBody, {
+            ...upstreamOptions,
+            excludeEmails: failedEmail ? [failedEmail] : []
+          });
+        });
+      } catch (retryError) {
+        logger.error('Anthropic 流式 failover 重试失败', 'ANTHROPIC', '', retryError);
+        throw retryError.publicMessage ? retryError : e;
+      }
+      if (!retryResp?.status || !retryResp.response) throw e;
+      currentUpstream = retryResp.response;
+      // Stats y un eventual 429 posterior se atribuyen a quien sirvio de verdad.
+      if (retryResp.currentAccount) ctx.currentAccount = retryResp.currentAccount;
+      continue;
     }
+    attemptsMade += 1;
 
     // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。文本通道截断之后例外：
     // 根本不 flush —— 解析器里压着的只是失控那一 push 的残余（半个触发器 / 半截负载），
@@ -2702,7 +2790,16 @@ const handleAnthropicMessages = async (req, res) => {
       : (failure.overloaded ? 'overloaded_error' : 'api_error');
     // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
     // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
-    noteRateLimitedAccount(error, currentAccount);
+    // Si el failover a mitad de stream ya paso la cuenta a cooldown (recordFailedAccount)
+    // y luego no hubo otra cuenta a la que saltar, el error que llega aqui es el mismo:
+    // no se marca dos veces. Tras un failover la cuenta que fallo no es la del sorteo
+    // inicial: el stream la deja en error.failedAccountEmail. Gemelo: chat.js.
+    if (!error?.accountFailureRecorded) {
+      noteRateLimitedAccount(
+        error,
+        error?.failedAccountEmail ? { email: error.failedAccountEmail } : currentAccount
+      );
+    }
     // Un prefijo de historial reutilizado pudo ser la causa (file_id que Qwen ya no
     // reconoce): se olvida y el reintento del cliente hornea uno nuevo. Un 529 por
     // ContextExternalizationError nunca llega aqui con contextPrefixReused.
