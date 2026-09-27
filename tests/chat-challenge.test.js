@@ -37,6 +37,7 @@ requestModule.sendChatRequest = async () => ({
   contextPrefixReused: true
 })
 requestModule.invalidateContextPrefix = key => { invalidatedPrefixes.push(key) }
+requestModule.generateChatID = async () => 'image-test-chat'
 const { handleAnthropicMessages } = require('../src/controllers/anthropic')
 const { handleNonStreamResponse, handleStreamResponse } = require('../src/controllers/chat')
 const { parseUpstreamImageError, handleImageVideoCompletion } = require('../src/controllers/chat.image.video')
@@ -114,6 +115,11 @@ test('a slider captcha is still a chat challenge, but is not reported as a busy 
   assert.ok(isWafChallengeError(error))
   assert.match(error.publicMessage, /captcha required/)
   assert.doesNotMatch(error.publicMessage, /被挤爆|busy/)
+})
+
+test('busy wording without RGV587 still reports upstream overload', () => {
+  const error = caught(() => assertNoUpstreamFailure({ ret: ['FAIL_SYS_USER_VALIDATE', '哎哟喂,被挤爆啦,请稍后重试'] }))
+  assert.match(error.publicMessage, /upstream busy/)
 })
 
 test('three chat challenges in a row stop new requests before they reach Qwen', () => {
@@ -376,4 +382,163 @@ test('image and video generation map a chat challenge to a retryable 503', () =>
     status: 503,
     retry_after: 30
   })
+})
+
+const captchaPage = '<!doctype html><html><head><meta name="aliyun_waf_aa" content="1"><title>Verification</title></head>' +
+  '<body><div id="captcha-element"></div><script>var _waf_is_mobile = false;</script></body></html>'
+const postReturning = (contentType, body) => async () => ({
+  status: 200,
+  headers: { 'content-type': contentType },
+  data: Readable.from([Buffer.from(body)])
+})
+const sendToQwen = () => sendChatRequest(
+  { model: 'qwen3-max', messages: [{ role: 'user', content: '你好' }] },
+  { chatId: 'html-test-chat', currentAccount: { email: 'html@example.invalid', token: 'html-test-token' } }
+)
+const withPost = async (post, fn) => {
+  const original = axios.post
+  axios.post = post
+  try { return await fn() } finally { axios.post = original }
+}
+
+test('a text/html captcha page produces one retryable challenge', async () => {
+  await withPost(postReturning('text/html; charset=utf-8', captchaPage), async () => {
+    await assert.rejects(sendToQwen(), error =>
+      isWafChallengeError(error) && describeUpstreamFailure(error, 500).status === 529)
+  })
+  strike(2)
+  assert.ok(breakerOpen(), 'the page counted as exactly one strike')
+})
+
+test('other text/html is replayed byte for byte without a challenge strike', async () => {
+  const body = '<html><body>502 Bad Gateway</body></html>'
+  await withPost(postReturning('text/html', body), async () => {
+    const result = await sendToQwen()
+    assert.equal(result.status, true)
+    const chunks = []
+    for await (const chunk of result.response) chunks.push(Buffer.from(chunk))
+    assert.equal(Buffer.concat(chunks).toString(), body)
+  })
+  strike(2)
+  assert.equal(breakerOpen(), false)
+})
+
+test('a captcha page cut off mid-body does not retry or penalize the account', async () => {
+  const originalFailure = accountManager.recordAccountFailure
+  const failures = []
+  let posts = 0
+  accountManager.recordAccountFailure = (...args) => { failures.push(args) }
+  try {
+    await withPost(async () => {
+      posts += 1
+      return { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, data: Readable.from((async function* () {
+        yield Buffer.from(captchaPage)
+        throw Object.assign(new Error('aborted'), { code: 'ECONNRESET' })
+      })()) }
+    }, async () => assert.rejects(sendToQwen(), isWafChallengeError))
+    assert.equal(posts, 1)
+    assert.deepEqual(failures, [])
+  } finally {
+    accountManager.recordAccountFailure = originalFailure
+  }
+})
+
+const t2v = { stream: false, chat_type: 't2v', model: 'qwen3-max', messages: [{ role: 'user', content: 'a cat' }] }
+const t2i = { stream: false, chat_type: 't2i', model: 'qwen3-max', messages: [{ role: 'user', content: 'a cat' }] }
+const okImage = () => Readable.from([Buffer.from(frame({
+  choices: [{ delta: { phase: 'image_gen', content: '![image](https://cdn.example.com/a.png)' } }]
+}))])
+
+for (const [form, body] of [
+  ['HTML captcha page', captchaPage.replace('</head>', '<script src="https://g.alicdn.com/AWSC/awsc.js"></script></head>')],
+  ['data-wrapped captcha', frame(captcha)]
+]) {
+  test('t2v: ' + form + ' returns one retryable 503, never a video', async () => {
+    const res = mockResponse()
+    await withPost(async () => ({ status: 200, data: body }),
+      () => handleImageVideoCompletion({ body: t2v }, res))
+    assert.equal(res.statusCode, 503)
+    assert.ok(Number(res.headers['Retry-After']) > 0)
+    assert.doesNotMatch(res.output, /alicdn|punish/)
+    strike(2)
+    assert.ok(breakerOpen(), 'the video request counted exactly one strike')
+  })
+}
+
+test('a non-2xx t2v challenge counts one strike', async () => {
+  const res = mockResponse()
+  await withPost(async () => { throw Object.assign(new Error('Request failed with status code 403'), {
+    response: { status: 403, data: busy }
+  }) }, () => handleImageVideoCompletion({ body: t2v }, res))
+  assert.equal(res.statusCode, 503)
+  strike(1)
+  assert.equal(breakerOpen(), false)
+  strike(1)
+  assert.ok(breakerOpen())
+})
+
+test('an answered image request closes the probe and clears strikes', async () => {
+  strike(3)
+  now += 60_000
+  const res = mockResponse()
+  await withPost(async () => ({ status: 200, data: okImage() }),
+    () => handleImageVideoCompletion({ body: t2i }, res))
+  assert.equal(res.statusCode, 200)
+  assert.equal(breakerOpen(), false)
+  strike(1)
+  await withPost(async () => ({ status: 200, data: okImage() }),
+    () => handleImageVideoCompletion({ body: t2i }, mockResponse()))
+  strike(2)
+  assert.equal(breakerOpen(), false)
+})
+
+test('an image request without a prompt leaves the next probe available', async () => {
+  strike(3)
+  now += 60_000
+  const res = mockResponse()
+  await withPost(async () => assert.fail('invalid request must not reach Qwen'),
+    () => handleImageVideoCompletion({ body: { ...t2i, messages: [{ role: 'user', content: '' }] } }, res))
+  assert.equal(res.statusCode, 400)
+  assert.equal(breakerOpen(), false)
+})
+
+test('a text request without an account leaves the next probe available', async () => {
+  strike(3)
+  now += 60_000
+  const result = await withPost(async () => assert.fail('no account: nothing reaches Qwen'),
+    () => sendChatRequest({ model: 'qwen3-max', messages: [{ role: 'user', content: '你好' }] }, {}))
+  assert.equal(result.status, false)
+  assert.equal(breakerOpen(), false)
+})
+
+test('an image edit without text releases its unused probe', async () => {
+  strike(3)
+  now += 60_000
+  const res = mockResponse()
+  await withPost(async () => assert.fail('invalid edit must not reach Qwen'), () => handleImageVideoCompletion({ body: {
+    stream: false, chat_type: 'image_edit', model: 'qwen3-max',
+    messages: [{ role: 'user', content: [{ type: 'image', image: 'https://cdn.example.com/a.png' }] }]
+  } }, res))
+  assert.equal(res.statusCode, 400)
+  assert.equal(breakerOpen(), false)
+})
+
+test('t2v closes its probe when Qwen accepts a task, before polling finishes', async () => {
+  strike(3)
+  now += 60_000
+  const originalGet = axios.get
+  let closedWhilePolling = null
+  axios.get = async () => {
+    closedWhilePolling = !breakerOpen()
+    return { data: { task_status: 'success', content: 'https://cdn.example.com/v.mp4' } }
+  }
+  try {
+    const res = mockResponse()
+    await withPost(async () => ({ status: 200, data: { success: true, data: { task_id: 'task-123' } } }),
+      () => handleImageVideoCompletion({ body: t2v }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(closedWhilePolling, true)
+  } finally {
+    axios.get = originalGet
+  }
 })

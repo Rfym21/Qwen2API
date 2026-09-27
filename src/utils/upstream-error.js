@@ -401,16 +401,30 @@ const assertChatChallengeBreakerClosed = (account) => {
 };
 
 /**
+ * Release a probe that failed before Qwen returned an answer or challenge.
+ * @param {object} source - Probe context returned by assertChatChallengeBreakerClosed
+ * @returns {void}
+ */
+const releaseChatProbe = (source) => {
+  const context = challengeContext(source);
+  if (context.probeId === null) return;
+  const breaker = breakerFor(context.egress);
+  if (breaker.probeId !== context.probeId) return;
+  breaker.probeId = null;
+  breaker.openUntil = Math.max(1, chatClock());
+};
+
+/**
  * Si el frame es un chat challenge devuelve su error (y cuenta el strike); si no, null.
  * "被挤爆啦" es saturacion; un captcha/punish sin ella es verificacion humana.
- * @param {object} payload - Frame ya parseado
+ * @param {object|string} payload - Frame ya parseado o pagina HTML del captcha
+ * @param {object} source - Respuesta o contexto de la sonda
  * @returns {UpstreamResponseError|null}
  */
 const chatChallengeFrom = (payload, source) => {
   const detected = detectWafChallenge(payload);
   if (!detected) return null;
-  const ret = Array.isArray(payload?.ret) ? payload.ret.map(String) : [];
-  const busy = [...ret, ...findWafChallengeSignals(payload)].some(item => CHAT_BUSY_SIGNAL_RE.test(item));
+  const busy = CHAT_BUSY_SIGNAL_RE.test(typeof payload === 'string' ? payload : JSON.stringify(payload));
   return chatChallengeError(busy ? CHAT_BUSY_MESSAGE : CHAT_CAPTCHA_MESSAGE,
     noteChatChallenge(source), detected.details);
 };
@@ -463,6 +477,7 @@ module.exports = {
   bindChatChallengeContext,
   chatChallengeFrom,
   noteChatChallengeAnswer,
+  releaseChatProbe,
   resetChatChallengeBreaker,
   setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,

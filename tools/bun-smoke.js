@@ -102,6 +102,11 @@ async function main() {
     } else if (pathname === '/api/v2/chat/completions') {
       completionRequests += 1
       response.setHeader('Content-Type', 'text/event-stream')
+      if (challengeMode === 'html') {
+        response.setHeader('Content-Type', 'text/html; charset=utf-8')
+        response.end('<!doctype html><meta name="aliyun_waf_aa" content="1"><title>Verification</title><div id="captcha-element"></div>')
+        return
+      }
       if (challengeMode) {
         // The one frame Qwen sends on a chat challenge (prod, 2026-09-23..26).
         response.end(`data: ${JSON.stringify({ ret: ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试'] })}\n\n`)
@@ -363,6 +368,15 @@ async function main() {
     // The quota failover above cooled the other smoke account, so the agent has no account to
     // switch to: one challenged send per request.
     assert.equal(completionRequests, 8, 'one challenged send each for /v1/messages and the agent')
+    challengeMode = 'html'
+    const htmlChallenged = await request('/v1/messages', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+      body: JSON.stringify({ model: MODEL, max_tokens: 16, stream: true, messages: [{ role: 'user', content: '你好' }] })
+    })
+    const htmlChallengedText = await htmlChallenged.text()
+    assert.equal(htmlChallenged.status, 529, htmlChallengedText)
+    assert.ok(Number(htmlChallenged.headers.get('retry-after')) > 0)
+    assert.equal(completionRequests, 9, 'an HTML challenge is one send, not an empty-answer retry loop')
     challengeMode = false
     console.log('PASS: chat challenge on the first frame is a real 529/503 with Retry-After on streams')
     if (standalone) {

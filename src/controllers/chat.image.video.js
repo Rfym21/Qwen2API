@@ -11,7 +11,8 @@ const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
 const {
-    assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom, noteChatChallengeAnswer
+    assertChatChallengeBreakerClosed, bindChatChallengeContext, chatChallengeFrom,
+    isWafChallengeError, noteChatChallengeAnswer, releaseChatProbe
 } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
@@ -190,6 +191,11 @@ const parseUpstreamErrorFromRawText = (text, source) => {
 
     return null
 }
+
+// t2v may return HTML or a data:-wrapped frame despite asking Axios for JSON.
+const parseUpstreamBody = (data, source = data) => (
+    typeof data === 'string' ? parseUpstreamErrorFromRawText(data, source) : parseUpstreamImageError(data, source)
+)
 
 /**
  * 收集对象中的所有值
@@ -879,7 +885,7 @@ const readVideoUpstreamResult = async (responseStream) => {
         const videoTaskCandidates = extractVideoTaskIdentifiersFromPayload(responseStream)
         const responseIDs = extractResponseIDsFromPayload(responseStream)
         return {
-            upstreamError: parseUpstreamImageError(responseStream, responseStream),
+            upstreamError: parseUpstreamBody(responseStream, responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             videoTaskID: videoTaskCandidates[0] || null,
             videoTaskCandidates,
@@ -978,7 +984,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 const readImageUpstreamResult = async (responseStream) => {
     if (!responseStream || typeof responseStream.on !== 'function') {
         return {
-            upstreamError: parseUpstreamImageError(responseStream, responseStream),
+            upstreamError: parseUpstreamBody(responseStream, responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             responseIDs: extractResponseIDsFromPayload(responseStream),
             rawPreview: typeof responseStream === 'string' ? responseStream.slice(0, 400) : ''
@@ -1201,6 +1207,9 @@ const resolveVideoResultContentUrl = async (responseStream, token, chatID) => {
         throw upstreamError
     }
 
+    // Qwen accepted the video task; do not hold the sole probe throughout polling.
+    if (upstreamContentUrl || videoTaskCandidates.length > 0) noteChatChallengeAnswer(responseStream)
+
     if (upstreamContentUrl) {
         return upstreamContentUrl
     }
@@ -1299,6 +1308,14 @@ const generateImageVideoResult = async (payload) => {
             ]
         }
 
+        const userPrompt = messages?.[messages.length - 1]?.content
+        if (!userPrompt) {
+            throw {
+                status: 400,
+                error: '缺少有效的提示词'
+            }
+        }
+
         try {
             breakerContext = assertChatChallengeBreakerClosed(account)
         } catch (challenge) {
@@ -1312,14 +1329,6 @@ const generateImageVideoResult = async (payload) => {
         }
 
         reqBody.chat_id = chatID
-
-        const userPrompt = messages?.[messages.length - 1]?.content
-        if (!userPrompt) {
-            throw {
-                status: 400,
-                error: '缺少有效的提示词'
-            }
-        }
 
         const messagesHistory = messages.filter(item => item.role === 'user' || item.role === 'assistant')
         const selectedImageList = []
@@ -1444,7 +1453,7 @@ const generateImageVideoResult = async (payload) => {
                 responseData = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`, reqBody, requestConfig)
 
                 bindChatChallengeContext(responseData.data, breakerContext)
-                const inlineUpstreamError = parseUpstreamImageError(responseData.data, breakerContext)
+                const inlineUpstreamError = parseUpstreamBody(responseData.data, breakerContext)
                 // Ya contado como strike: no dejar que el resolver lo vuelva a parsear y contar.
                 if (inlineUpstreamError?.code === 'upstream_waf_challenge') throw inlineUpstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
@@ -1456,7 +1465,8 @@ const generateImageVideoResult = async (payload) => {
                 break
             } catch (error) {
                 logger.error('图片/视频请求失败', 'CHAT', '', buildAxiosErrorLog(error))
-                const upstreamError = parseUpstreamImageError(error.response?.data, breakerContext)
+                const upstreamError = parseUpstreamBody(error.response?.data, breakerContext)
+                if (isWafChallengeError(upstreamError)) throw upstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(upstreamError)) {
                     logger.warn(`图片/视频请求上游返回瞬时内部错误，准备第 ${attempt + 1} 次重试`, 'CHAT')
                     await sleep(800)
@@ -1494,14 +1504,17 @@ const generateImageVideoResult = async (payload) => {
         logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
 
         if (error?.error) {
+            if (!isWafChallengeError(error)) releaseChatProbe(breakerContext)
             throw error
         }
 
-        const upstreamError = parseUpstreamImageError(error.response?.data, breakerContext)
+        const upstreamError = parseUpstreamBody(error.response?.data, breakerContext)
         if (upstreamError) {
+            if (!isWafChallengeError(upstreamError)) releaseChatProbe(breakerContext)
             throw upstreamError
         }
 
+        releaseChatProbe(breakerContext)
         throw {
             status: 500,
             error: error?.message || 'Service error, please try again later'

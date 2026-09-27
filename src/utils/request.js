@@ -1,4 +1,5 @@
 const axios = require('axios')
+const { Readable } = require('node:stream')
 const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
@@ -7,7 +8,10 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed, bindChatChallengeContext } = require('./upstream-error.js')
+const {
+    ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
+    bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe
+} = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
@@ -26,6 +30,37 @@ const isRetryableNetworkError = (error) => {
 }
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+const HTML_BODY_MAX_BYTES = 256 * 1024
+
+/**
+ * Check a text/html captcha before returning the stream; a partial page can identify it.
+ * @param {object} response - Axios response from Qwen
+ * @param {object} breakerContext - Egress and probe identity for this request
+ * @returns {Promise<*>} Original stream or a replayable non-challenge HTML body
+ */
+const screenHtmlChallenge = async (response, breakerContext) => {
+    if (!/text\/html/i.test(String(response.headers?.['content-type'] || ''))) return response.data
+    const chunks = []
+    let size = 0
+    let readError = null
+    try {
+        for await (const chunk of response.data) {
+            const bytes = Buffer.from(chunk)
+            chunks.push(bytes)
+            size += bytes.length
+            if (size >= HTML_BODY_MAX_BYTES) break
+        }
+    } catch (error) {
+        readError = error
+    }
+    const bytes = Buffer.concat(chunks)
+    const challenge = chatChallengeFrom(bytes.toString('utf8'), breakerContext)
+    if (challenge) throw challenge
+    if (readError) throw readError
+    if (size >= HTML_BODY_MAX_BYTES) throw new Error('Upstream HTML body exceeded challenge screening limit')
+    return Readable.from([bytes])
+}
 
 const HISTORY_MARKER = '# Conversation history (JSONL)'
 const CURRENT_MESSAGE_MARKER = '# Current message'
@@ -639,6 +674,7 @@ const externalizeOversizedAgentContext = async (
 /**
  * 发送聊天请求
  * @param {Object} body - 请求体
+ * @param {Object} [options] - Cuenta y continuidad de la solicitud
  * @returns {Promise<Object>} 响应结果
  */
 const sendChatRequest = async (body, options = {}) => {
@@ -665,7 +701,17 @@ const sendChatRequest = async (body, options = {}) => {
 
     // La clave de egress debe usar la cuenta elegida; la sonda queda ligada a su respuesta.
     const breakerContext = assertChatChallengeBreakerClosed(currentAccount)
+    try {
+        const result = await postChatRequest(body, options, currentAccount, currentToken, breakerContext)
+        if (!result.status) releaseChatProbe(breakerContext)
+        return result
+    } catch (error) {
+        if (!isWafChallengeError(error)) releaseChatProbe(breakerContext)
+        throw error
+    }
+}
 
+const postChatRequest = async (body, options, currentAccount, currentToken, breakerContext) => {
     const chatBaseUrl = getChatBaseUrl()
 
     // Antidetect: per-account fingerprint headers replace static block
@@ -769,7 +815,7 @@ const sendChatRequest = async (body, options = {}) => {
                     contextPrefixReused: contextResult.reusedPrefix === true,
                     contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
-                    response: bindChatChallengeContext(response.data, breakerContext)
+                    response: bindChatChallengeContext(await screenHtmlChallenge(response, breakerContext), breakerContext)
                 }
             }
             // 非 200 但是没抛——退出循环, 走下面错误分类
@@ -777,6 +823,7 @@ const sendChatRequest = async (body, options = {}) => {
             lastError.response = { status: response.status }
             break
         } catch (error) {
+            if (isWafChallengeError(error)) throw error
             lastError = error
             if (isRetryableNetworkError(error) && attempt < totalAttempts) {
                 logger.warn(
