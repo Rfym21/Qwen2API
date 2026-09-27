@@ -363,14 +363,28 @@ const chatChallengeError = (message, retryAfter, details) => {
 /**
  * sendChatRequest y la ruta de imagen/video lo llaman antes de crear el chat o subir nada.
  * Con el enfriamiento agotado deja pasar a quien llega primero como sonda.
+ * @returns {boolean} true si quien llama es la sonda
  */
 const assertChatChallengeBreakerClosed = () => {
-  if (!chatBreaker.openUntil) return;
+  if (!chatBreaker.openUntil) return false;
   const now = chatClock();
   const remaining = Math.ceil((chatBreaker.openUntil - now) / 1000);
   if (remaining > 0) throw chatChallengeError(CHAT_BREAKER_MESSAGE, remaining, { breakerOpen: true });
   chatBreaker.openUntil = now + chatBreakerSeconds() * 1000;
   chatBreaker.probing = true;
+  return true;
+};
+
+/**
+ * La sonda cayo antes de que Qwen contestara o la desafiara (validacion, chat_id, upload,
+ * transporte): sin esto bloquearia a todos otra ventana entera. La siguiente peticion sonda.
+ * ponytail: una sonda que llega a Qwen y termina sin respuesta ni desafio (stream vacio)
+ * sigue costando una ventana; soltarla ahi exigiria seguir cada stream hasta el final.
+ */
+const releaseChatProbe = () => {
+  if (!chatBreaker.probing) return;
+  chatBreaker.probing = false;
+  chatBreaker.openUntil = chatClock();
 };
 
 /**
@@ -435,6 +449,7 @@ module.exports = {
   assertChatChallengeBreakerClosed,
   chatChallengeFrom,
   noteChatAnswer,
+  releaseChatProbe,
   resetChatChallengeBreaker,
   setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,

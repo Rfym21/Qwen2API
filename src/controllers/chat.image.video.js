@@ -10,7 +10,7 @@ const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
-const { assertChatChallengeBreakerClosed, chatChallengeFrom, noteChatAnswer } = require('../utils/upstream-error.js')
+const { assertChatChallengeBreakerClosed, chatChallengeFrom, noteChatAnswer, releaseChatProbe } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -1283,6 +1283,7 @@ const generateImageVideoResult = async (payload) => {
     // 一次取出账户对象，确保 token 与 proxy 走同一个账号
     const account = accountManager.getAccount()
     const token = account ? account.token : null
+    let probe = false
 
     try {
         const reqBody = {
@@ -1314,7 +1315,7 @@ const generateImageVideoResult = async (payload) => {
         }
 
         try {
-            assertChatChallengeBreakerClosed()
+            probe = assertChatChallengeBreakerClosed()
         } catch (challenge) {
             throw imageChallengeError(challenge)
         }
@@ -1486,8 +1487,10 @@ const generateImageVideoResult = async (payload) => {
         }
 
         if (newChatType === 't2v') {
-            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID)
+            // El cuerpo t2v ya se reviso entero arriba sin desafio: Qwen acepto la tarea. No esperar
+            // al sondeo del video (minutos) para cerrar una media apertura.
             noteChatAnswer()
+            const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID)
             return {
                 model,
                 chatType: newChatType,
@@ -1499,6 +1502,7 @@ const generateImageVideoResult = async (payload) => {
         throw new Error('不支持的图片/视频类型')
     } catch (error) {
         logger.error('图片/视频主流程异常', 'CHAT', '', buildAxiosErrorLog(error))
+        if (probe && error?.code !== 'upstream_waf_challenge') releaseChatProbe()
 
         if (error?.error) {
             throw error

@@ -8,7 +8,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed, chatChallengeFrom, isWafChallengeError } = require('./upstream-error.js')
+const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed, chatChallengeFrom, isWafChallengeError, releaseChatProbe } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
@@ -674,7 +674,18 @@ const externalizeOversizedAgentContext = async (
  */
 const sendChatRequest = async (body, options = {}) => {
     // Qwen esta rechazando la generacion: ni chat nuevo ni upload, solo 529/503 al cliente.
-    assertChatChallengeBreakerClosed()
+    const probe = assertChatChallengeBreakerClosed()
+    try {
+        const result = await postChatRequest(body, options)
+        if (probe && !result.status) releaseChatProbe()
+        return result
+    } catch (error) {
+        if (probe && !isWafChallengeError(error)) releaseChatProbe()
+        throw error
+    }
+}
+
+const postChatRequest = async (body, options = {}) => {
     // 获取可用的账户（包含 proxy 等完整字段）
     // excludeEmails：本次 HTTP 请求里已经烧掉的账户（流中途 failover）——轮换器跳过它们，
     // 即使它们对其他请求仍然可用。

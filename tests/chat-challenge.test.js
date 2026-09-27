@@ -467,3 +467,43 @@ test('an image request without a prompt does not take the single half-open probe
   assert.equal(res.statusCode, 400)
   assert.equal(breakerOpen(), false, 'the next caller still gets to be the probe')
 })
+
+test('a text probe that fails before asking Qwen hands the probe to the next request', async () => {
+  strike(3)
+  now += 60_000
+  const result = await withPost(async () => assert.fail('no account: nothing reaches Qwen'),
+    () => sendChatRequest({ model: 'qwen3-max', messages: [{ role: 'user', content: '你好' }] }, {}))
+  assert.equal(result.status, false)
+  assert.equal(breakerOpen(), false, 'released: the next caller is the probe, not refused for a window')
+})
+
+test('an image_edit without a text part does not keep the probe', async () => {
+  strike(3)
+  now += 60_000
+  const res = mockResponse()
+  await withPost(async () => assert.fail('an invalid request must not reach Qwen'), () => handleImageVideoCompletion({ body: {
+    stream: false, chat_type: 'image_edit', model: 'qwen3-max', messages: [{ role: 'user', content: [{ type: 'image', image: 'https://cdn.example.com/a.png' }] }]
+  } }, res))
+  assert.equal(res.statusCode, 400)
+  assert.equal(breakerOpen(), false)
+})
+
+test('t2v closes a half-open breaker when Qwen accepts the task, not minutes later when the video is ready', async () => {
+  strike(3)
+  now += 60_000
+  const realGet = axios.get
+  let closedWhilePolling = null
+  axios.get = async () => {
+    closedWhilePolling = !breakerOpen()
+    return { data: { task_status: 'success', content: 'https://cdn.example.com/v.mp4' } }
+  }
+  try {
+    const res = mockResponse()
+    await withPost(async () => ({ status: 200, data: { success: true, data: { task_id: 'task-123' } } }),
+      () => handleImageVideoCompletion({ body: t2v }, res))
+    assert.equal(res.statusCode, 200)
+    assert.equal(closedWhilePolling, true)
+  } finally {
+    axios.get = realGet
+  }
+})
