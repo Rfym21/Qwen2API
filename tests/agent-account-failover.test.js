@@ -13,7 +13,7 @@ const accountManager = require('../src/utils/account')
 const AccountRotator = require('../src/utils/account-rotator')
 const { runOpenAIAgentTurn } = require('../src/utils/openai-agent-runtime')
 const { createAccountReplayBody } = require('../src/utils/agent-account-failover')
-const { assertNoUpstreamFailure, isRateLimitError, isWafChallengeError } = require('../src/utils/upstream-error')
+const { assertNoUpstreamFailure, isRateLimitError, isWafChallengeError, resetChatChallengeBreaker } = require('../src/utils/upstream-error')
 const { handleStreamResponse, handleNonStreamResponse } = require('../src/controllers/chat')
 
 const accounts = ['first', 'second', 'third'].map(name => ({ email: `${name}@example.invalid`, token: `${name}-test-token` }))
@@ -38,6 +38,8 @@ test.beforeEach(() => {
   accountManager.isInitialized = true
   accountManager.accountRotator = new AccountRotator()
   accountManager.accountRotator.setAccounts(accounts)
+  // WAF frames here feed the process-wide chat-challenge breaker; start every test closed.
+  resetChatChallengeBreaker()
 })
 test.after(() => { accountManager.destroy() })
 
@@ -48,15 +50,10 @@ test('quota_limit is recognized without an English message; explicit WAF is not 
     isWafChallengeError(error) && !isRateLimitError(error))
 })
 
-test('exhausted or challenged pools never fall back to cooled accounts', () => {
+test('exhausted pools never fall back to cooled accounts', () => {
   const rotator = accountManager.accountRotator
   rotator.recordQuotaExhausted(accounts[0].email)
-  rotator.recordChallenge(accounts[1].email)
   for (let count = 0; count < rotator.maxFailures; count += 1) rotator.recordFailure(accounts[2].email, 'ECONNRESET')
-  assert.equal(rotator.getNextAccount(), null)
-  rotator.resetFailures(accounts[1].email)
-  assert.equal(rotator.getAccountByEmail(accounts[1].email), null, 'refreshing a token must not clear WAF cooldown')
-  rotator.challengeCooldownUntil.set(accounts[1].email, Date.now() - 1)
   assert.equal(rotator.getNextAccount().email, accounts[1].email)
   assert.equal(rotator.getNextAccount([accounts[1].email]), null)
 })
@@ -130,30 +127,41 @@ test('no account rotation after client-visible final text or reasoning', async (
   }
 })
 
-test('WAF can switch once but never fans out through the entire account pool', async () => {
+test('WAF can switch once but never fans out through the entire account pool, and cools no account', async () => {
   let retries = 0
+  const prefixKeys = []
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
     agent_turn_max_attempts: 6,
+    upstreamOptions: { contextPrefixKey: 'session-prefix' },
     sendChatRequest: async (body, requestOptions) => {
       retries += 1
+      prefixKeys.push(requestOptions.contextPrefixKey)
       return { status: true, response: Readable.from([failureFrame('upstream_waf_challenge')]), currentAccount: requestOptions.currentAccount }
     }
   })), error => isWafChallengeError(error) && error.failedAccountEmail === accounts[1].email)
   assert.equal(retries, 1)
-  assert.equal(accountManager.accountRotator.challengeCooldownUntil.size, 2)
-  assert.equal(accountManager.accountRotator.getNextAccount().email, accounts[2].email)
+  assert.deepEqual(prefixKeys, ['session-prefix'], 'Qwen refused before reading the history: the switch reuses it')
+  // A chat challenge follows Qwen's load, not the account (prod 2026-09-23..26: the same
+  // accounts were challenged by day and answered by night). Both stay in rotation.
+  for (const account of accounts.slice(0, 2)) {
+    assert.ok(accountManager.accountRotator.getAccountByEmail(account.email), `${account.email} stays available`)
+  }
 })
 
 test('quota failover respects the total attempt budget and preserves the final quota error', async () => {
   let retries = 0
+  const prefixKeys = []
   await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame()]), options({
     agent_turn_max_attempts: 2,
+    upstreamOptions: { contextPrefixKey: 'session-prefix' },
     sendChatRequest: async (body, requestOptions) => {
       retries += 1
+      prefixKeys.push(requestOptions.contextPrefixKey)
       return { status: true, response: Readable.from([failureFrame()]), currentAccount: requestOptions.currentAccount }
     }
   })), error => isRateLimitError(error) && error.failedAccountEmail === accounts[1].email)
   assert.equal(retries, 1)
+  assert.deepEqual(prefixKeys, [null], 'a quota switch re-uploads the full history on the new account')
 })
 
 test('no healthy replacement or disconnected client stops without new upstream requests', async () => {
@@ -221,6 +229,42 @@ function createResponse() {
     json(payload) { this.output = JSON.stringify(payload); this.headersSent = true; this.writableEnded = true }
   }
 }
+
+test('agent stream: a first-frame challenge switches accounts before anything is committed', async () => {
+  const response = createResponse()
+  await handleStreamResponse(response, Readable.from([failureFrame('upstream_waf_challenge')]), false, false, requestBody, options({
+    sendChatRequest: async (body, requestOptions) => ({ status: true, response: finishedStream(), currentAccount: requestOptions.currentAccount })
+  }))
+  assert.equal(response.statusCode, 200)
+  const chunks = response.output.split('\n\n').filter(block => block.startsWith('data: {')).map(block => JSON.parse(block.slice(6)))
+  const roles = chunks.filter(chunk => chunk.choices?.[0]?.delta?.role)
+  assert.equal(roles.length, 1, 'exactly one role chunk')
+  assert.equal(chunks[0].choices[0].delta.role, 'assistant', 'and it comes first')
+  assert.doesNotMatch(response.output, /"error"/)
+  assert.match(response.output, /OK/)
+})
+
+test('agent stream: challenged on both accounts is a real 503 with Retry-After, not a 200 error frame', async () => {
+  const response = createResponse()
+  await handleStreamResponse(response, Readable.from([failureFrame('upstream_waf_challenge')]), false, false, requestBody, options({
+    sendChatRequest: async (body, requestOptions) => ({
+      status: true, response: Readable.from([failureFrame('upstream_waf_challenge')]), currentAccount: requestOptions.currentAccount
+    })
+  }))
+  assert.equal(response.statusCode, 503)
+  assert.ok(Number(response.headers['Retry-After']) > 0)
+  assert.equal(JSON.parse(response.output).error.code, 'upstream_unavailable')
+})
+
+test('a switch that cannot start keeps its cause (challenge or quota) instead of an opaque 502', async () => {
+  await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame('upstream_waf_challenge')]), options({
+    sendChatRequest: async () => ({ status: false, message: 'chat creation failed' })
+  })), isWafChallengeError)
+  accountManager.accountRotator.reset()
+  await assert.rejects(runOpenAIAgentTurn(Readable.from([failureFrame()]), options({
+    sendChatRequest: async () => ({ status: false, message: 'chat creation failed' })
+  })), isRateLimitError)
+})
 
 test('OpenAI controllers attribute successful JSON and SSE usage to the replacement only', async context => {
   const recorded = []

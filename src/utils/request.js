@@ -7,7 +7,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError, isTransportInterruption } = require('./upstream-error.js')
+const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed, bindChatChallengeContext } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
@@ -663,6 +663,9 @@ const sendChatRequest = async (body, options = {}) => {
         }
     }
 
+    // La clave de egress debe usar la cuenta elegida; la sonda queda ligada a su respuesta.
+    const breakerContext = assertChatChallengeBreakerClosed(currentAccount)
+
     const chatBaseUrl = getChatBaseUrl()
 
     // Antidetect: per-account fingerprint headers replace static block
@@ -766,7 +769,7 @@ const sendChatRequest = async (body, options = {}) => {
                     contextPrefixReused: contextResult.reusedPrefix === true,
                     contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
-                    response: response.data
+                    response: bindChatChallengeContext(response.data, breakerContext)
                 }
             }
             // 非 200 但是没抛——退出循环, 走下面错误分类

@@ -59,6 +59,7 @@ const {
   describeUpstreamFailure,
   isRateLimitError,
   isTransportInterruption,
+  isWafChallengeError,
   noteRateLimitedAccount,
   RATE_LIMIT_ANTHROPIC_TYPE,
   UpstreamResponseError
@@ -1085,7 +1086,7 @@ const consumeUpstream = async (upstream, onDelta, options) => consumeSSEStream(u
   if (!payload || payload.trim() === '[DONE]') return;
   if (!isJson(payload)) return;
   const parsed = JSON.parse(payload);
-  assertNoUpstreamFailure(parsed);
+  assertNoUpstreamFailure(parsed, upstream);
   await onDelta(parsed);
 }, options);
 
@@ -1188,17 +1189,20 @@ const pingIntervalMs = () => require('../config/index.js').anthropicPingInterval
  * 反向代理的空闲计时器，但 SDK 会在读取行时直接丢弃以 `:` 开头的行，客户端因此
  * 什么都收不到。ccproxy 网桥当初正是靠改发真正的 ping 事件才消除同样的假死。
  *
- * 只能在 message_start 之后调用——此时响应头已提交，ping 是合法的流内事件。
+ * ping 是流内事件，必须跟在 message_start 之后：handleAnthropicStream 延迟提交响应，
+ * 通过 beforePing 在第一个 ping 之前补发 message_start（也就是延迟提交的上限）。
  * @param {object} res - Express 响应
  * @param {Function} work - 被包裹的异步任务
  * @param {number} [intervalMs] - 发送间隔，缺省取 config.anthropicPingIntervalMs
+ * @param {Function} [beforePing] - 每次 ping 之前调用
  * @returns {Promise<*>} work 的返回值
  */
-const runWithAnthropicPing = async (res, work, intervalMs) => {
+const runWithAnthropicPing = async (res, work, intervalMs, beforePing) => {
   const everyMs = Math.max(1, Number(intervalMs) || pingIntervalMs());
   const timer = setInterval(() => {
     if (res.writableEnded || res.destroyed) return;
     try {
+      if (typeof beforePing === 'function') beforePing();
       writeAnthropicEvent(res, 'ping', { type: 'ping' });
       if (typeof res.flush === 'function') res.flush();
     } catch (_) {
@@ -1270,35 +1274,44 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     upstreamOptions = {}
   } = ctx;
 
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
-  });
-
   const createdAt = new Date().toISOString();
 
-  // message_start
-  writeAnthropicEvent(res, 'message_start', {
-    type: 'message_start',
-    message: {
-      id: message_id,
-      type: 'message',
-      role: 'assistant',
-      model,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      created_at: createdAt,
-      metadata: {},
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0
+  // Compromiso perezoso: las cabeceras SSE y message_start esperan al primer frame de Qwen que
+  // pasa assertNoUpstreamFailure (o al primer ping, o al final de una ronda). Si ese primer
+  // frame es un chat challenge o la cuota agotada, la respuesta sigue libre y el catch de
+  // handleAnthropicMessages contesta un 529/429 real con Retry-After: la cabecera es lo unico
+  // que los SDK respetan; un evento de error dentro del stream lo reintentan a los 5 s.
+  let messageStarted = false;
+  const ensureMessageStart = () => {
+    if (messageStarted) return;
+    messageStarted = true;
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    writeAnthropicEvent(res, 'message_start', {
+      type: 'message_start',
+      message: {
+        id: message_id,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        created_at: createdAt,
+        metadata: {},
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0
+        }
       }
-    }
-  });
+    });
+  };
+  const withPing = (work) => runWithAnthropicPing(res, work, undefined, ensureMessageStart);
 
   let blockIndex = -1;
   let textBlockOpen = false;
@@ -1754,9 +1767,11 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     startAttempt();
 
     try {
-      const result = await runWithAnthropicPing(
-        res,
-        () => consumeUpstream(currentUpstream, onUpstreamDelta, { shouldStop: () => stopRequested })
+      const result = await withPing(
+        () => consumeUpstream(currentUpstream, (json) => {
+          ensureMessageStart();
+          return onUpstreamDelta(json);
+        }, { shouldStop: () => stopRequested })
       );
       upstreamCompleted = result.completed;
       upstreamEventCount = result.eventCount;
@@ -1781,6 +1796,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
           e.failedAccountEmail = ctx.currentAccount?.email || null;
         }
         logger.error('Anthropic 流式心跳包装失败', 'ANTHROPIC', '', e);
+        if (!isWafChallengeError(e) && !isRateLimitError(e)) ensureMessageStart();
         throw e;
       }
 
@@ -1791,7 +1807,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       recordFailedAccount(e, ctx.currentAccount);
       let retryResp = null;
       try {
-        await runWithAnthropicPing(res, async () => {
+        await withPing(async () => {
           retryResp = await sendRequest(requestBody, {
             ...upstreamOptions,
             excludeEmails: failedEmail ? [failedEmail] : []
@@ -1799,15 +1815,21 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
         });
       } catch (retryError) {
         logger.error('Anthropic 流式 failover 重试失败', 'ANTHROPIC', '', retryError);
-        throw retryError.publicMessage ? retryError : e;
+        const failure = retryError.publicMessage ? retryError : e;
+        if (!isWafChallengeError(failure) && !isRateLimitError(failure)) ensureMessageStart();
+        throw failure;
       }
-      if (!retryResp?.status || !retryResp.response) throw e;
+      if (!retryResp?.status || !retryResp.response) {
+        if (!isWafChallengeError(e) && !isRateLimitError(e)) ensureMessageStart();
+        throw e;
+      }
       currentUpstream = retryResp.response;
       // Stats y un eventual 429 posterior se atribuyen a quien sirvio de verdad.
       if (retryResp.currentAccount) ctx.currentAccount = retryResp.currentAccount;
       continue;
     }
     attemptsMade += 1;
+    ensureMessageStart();
 
     // 本轮收尾。解析器的尾巴属于这一轮，必须在判定之前放出来。文本通道截断之后例外：
     // 根本不 flush —— 解析器里压着的只是失控那一 push 的残余（半个触发器 / 半截负载），
@@ -1955,7 +1977,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
     let retryResp = null;
     try {
-      await runWithAnthropicPing(res, async () => {
+      await withPing(async () => {
         retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)), upstreamOptions);
       });
     } catch (e) {
@@ -2802,8 +2824,10 @@ const handleAnthropicMessages = async (req, res) => {
     }
     // Un prefijo de historial reutilizado pudo ser la causa (file_id que Qwen ya no
     // reconoce): se olvida y el reintento del cliente hornea uno nuevo. Un 529 por
-    // ContextExternalizationError nunca llega aqui con contextPrefixReused.
-    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError) {
+    // ContextExternalizationError nunca llega aqui con contextPrefixReused. Un chat
+    // challenge tampoco culpa al prefijo: Qwen rechazo antes de leerlo, y olvidarlo haria
+    // que cada reintento del cliente volviera a subir y parsear el historial entero.
+    if (upstreamResp?.contextPrefixReused && error instanceof UpstreamResponseError && !isWafChallengeError(error)) {
       invalidateContextPrefix(contextPrefixKey);
     }
     if (!res.headersSent) {

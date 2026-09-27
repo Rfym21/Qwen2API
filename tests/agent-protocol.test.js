@@ -19,7 +19,7 @@ const {
   externalizeOversizedAgentContext,
   compactAgentContextFallback
 } = require('../src/utils/request.js')
-const { assertNoUpstreamFailure } = require('../src/utils/upstream-error.js')
+const { assertNoUpstreamFailure, resetChatChallengeBreaker } = require('../src/utils/upstream-error.js')
 const {
   shouldEnableToolRuntime,
   ensureAgentCurrentEnvelope
@@ -34,6 +34,9 @@ const { logger } = require('../src/utils/logger.js')
 test.after(() => {
   require('../src/utils/account.js').destroy()
 })
+
+// WAF frames feed the process-wide chat-challenge breaker; every test starts closed.
+test.beforeEach(() => resetChatChallengeBreaker())
 
 const createMockResponse = () => ({
   output: '',
@@ -1106,9 +1109,11 @@ test('Qwen HTTP-200 bare JSON WAF response reaches OpenAI clients explicitly', a
     { messages: [] },
     {}
   )
-  assert.equal(res.statusCode, 502)
-  assert.match(res.output, /upstream_waf_challenge/)
-  assert.match(res.output, /WAF\\u002fcaptcha|WAF\/captcha/)
+  // A chat challenge is Qwen saying "busy, retry later": retryable 503 with a wait, not a 502.
+  assert.equal(res.statusCode, 503)
+  assert.equal(res.headers['Retry-After'], '30')
+  assert.match(res.output, /upstream_unavailable/)
+  assert.match(res.output, /chat challenge/)
 })
 
 test('Anthropic stream emits thinking signature, max_tokens and tool parse errors', async () => {

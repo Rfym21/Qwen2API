@@ -30,7 +30,7 @@ const isWafChallengeError = (error) => String(error?.code || '').toLowerCase() =
  * ruta de imagen no reconocía este paquete y entregaba un 200 con la imagen de relleno del
  * propio Qwen (img.alicdn.com) como si la generación hubiera salido bien.
  */
-const WAF_SIGNAL_RE = /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?/i;
+const WAF_SIGNAL_RE = /FAIL_SYS_USER_VALIDATE|RGV587|captcha|\/punish\?|upstream_waf_challenge/i;
 /**
  * Señales de la MISMA página de captcha pero cuando el upstream la manda como HTML.
  *
@@ -199,26 +199,31 @@ const rateLimitRetryAfterSeconds = (error) => {
 /**
  * MATRIZ DE ALCANZABILIDAD — que recibe el cliente de verdad, por camino y por fase.
  *
- * El 429 solo es alcanzable mientras las cabeceras siguen libres. En streaming los dos
- * controladores comprometen el 200 ANTES de leer un byte del upstream, asi que un
- * paquete de cuota —que llega como PRIMER frame— nunca puede cambiar el status:
+ * Un status (y la cabecera Retry-After, la unica que los SDK respetan) solo es alcanzable
+ * mientras la respuesta sigue libre. Los caminos en streaming comprometen de forma perezosa:
+ * nada sale hasta que el PRIMER frame de Qwen pasa assertNoUpstreamFailure, asi que un
+ * chat challenge o un paquete de cuota —que llegan como primer frame— si cambian el status:
  *
- *   camino                          fase             status  senal para el cliente
- *   /v1/messages        stream:false  libre           429     body.error.type
- *   /v1/messages        stream:true   comprometida    200     evento error.type (+retry_after)
- *   /v1/chat/... llano  stream:false  libre           429     body.error.type
- *   /v1/chat/... llano  stream:true   libre 1er byte  429     body.error.type
- *   /v1/chat/... agente stream:true   comprometida    200     frame error.type (+retry_after)
+ *   camino                          se compromete en                       fallo en el 1er frame
+ *   /v1/messages        stream:false  al final                             429/529 + Retry-After
+ *   /v1/messages        stream:true   1er frame valido o 1er ping          429/529 + Retry-After
+ *                                     (anthropic.js#handleAnthropicStream, ensureMessageStart)
+ *   /v1/chat/... llano  stream:false  al final                             429/503 + Retry-After
+ *   /v1/chat/... llano  stream:true   1er byte escrito                     429/503 + Retry-After
+ *   /v1/chat/... agente stream:true   1er frame valido o 1er latido        429/503 + Retry-After
+ *                                     (chat.js#handleOpenAIAgentStream, commitStream)
+ *   imagen              stream:true   al entregar el resultado             503 + Retry-After
+ *   video (t2v)         stream:true   1er keep-alive (15 s; las cabeceras  503 + Retry-After
+ *                                     SSE se fijan antes pero no se envian)
  *
- * La fila que importa es la segunda: Claude Code habla /v1/messages con stream:true, y
- * las 149 negativas de cuota de los logs del usuario salen todas de ahi. Decir que este
- * cambio "mapea la cuota a 429 en los dos caminos" es falso justo para el modo que el
- * usuario ejecuta; lo que hace es que la negativa sea RECONOCIBLE en los dos caminos y
- * en las dos fases. anthropic.js:1203/1211 y chat.js:407 son las lineas que comprometen
- * la respuesta, y adelantarlas es deliberado: sin cabeceras enviadas no se pueden mandar
- * `ping` dentro del protocolo (anthropic.js:1156-1160), que es como se elimino el falso
- * "stream muerto" del puente. Por eso la espera viaja DENTRO del evento/frame: es el
- * unico canal que queda cuando la cabecera Retry-After ya no se puede poner.
+ * Solo el chat challenge y la cuota se quedan sin comprometer; cualquier otro fallo antes
+ * del primer frame compromete y sale como antes, dentro del stream (convertirlo en 5xx
+ * haria que los SDK lo reintenten contra upload/parse). Tras el compromiso —p. ej. cuota a
+ * mitad de respuesta, las 149 negativas de los logs del usuario— la espera viaja DENTRO del
+ * evento/frame (`retry_after`): es el unico canal que queda. El compromiso perezoso no
+ * reabre el falso "stream muerto" del puente: los `ping`/latidos lo comprometen como mucho
+ * un intervalo despues, y el silencio largo que resolvian era el del reintento de correccion,
+ * que ocurre ya comprometido.
  */
 
 /**
@@ -226,10 +231,18 @@ const rateLimitRetryAfterSeconds = (error) => {
  * repetir la deteccion; el `type` de cable lo pone cada uno con su constante de arriba.
  * @param {unknown} error - Error capturado
  * @param {number} [fallbackStatus] - Status cuando NO es cuota (500 Anthropic / 502 OpenAI)
- * @param {number} [overloadedStatus] - Status del adjunto de contexto caido (529 Anthropic / 503 OpenAI)
+ * @param {number} [overloadedStatus] - Status del adjunto de contexto caido o del chat challenge (529 Anthropic / 503 OpenAI)
  * @returns {{ rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null }}
  */
 const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus = 529) => {
+  if (isWafChallengeError(error)) {
+    return {
+      rateLimited: false,
+      overloaded: true,
+      status: overloadedStatus,
+      retryAfter: Number(error.retryAfter) || CHAT_CHALLENGE_RETRY_AFTER_SECONDS
+    };
+  }
   if (isContextAttachmentError(error)) {
     return {
       rateLimited: false,
@@ -254,7 +267,8 @@ const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus =
  * HTTP 4xx/5xx) no enfria a proposito, y ese es justo el hueco.
  *
  * El require es perezoso: account.js arranca temporizadores al cargarse y no debe
- * entrar en la cadena de carga de este modulo, que es puro.
+ * entrar en la cadena de carga de este modulo, que no arranca ninguno (el unico estado
+ * que guarda es el cortacircuitos del chat challenge, mas abajo).
  * @param {unknown} error - Error capturado en el controlador
  * @param {{email?: string}|null} [account] - Cuenta que sirvio la peticion
  * @returns {boolean} true si se marco la cuenta
@@ -273,12 +287,143 @@ const noteRateLimitedAccount = (error, account) => {
 };
 
 /**
+ * Chat challenge: Qwen se niega a GENERAR ("被挤爆啦") mientras crear el chat y subir el
+ * historial siguen pasando. Medido en prod 2026-09-23..26: 477 de 502 envios desafiados,
+ * todos entre 07:00Z y 22:00Z (el pico de Pekin); la misma cuenta pasa de noche y cae de
+ * dia, asi que no es la cuenta ni el tamano del contexto. Cada reintento inmediato del
+ * cliente agentico re-sube su historial y agota el limitador de parse en segundos.
+ *
+ * Cortacircuitos (gemelo en intencion del de parse en upload.js, pero con media apertura):
+ * - cerrado: cada desafio suma un strike; una respuesta con `choices` los borra.
+ * - abierto: tras CHAT_BREAKER_STRIKES seguidos, sendChatRequest contesta 529/503 sin
+ *   tocar Qwen durante `chatChallengeBreakerSeconds`. Una respuesta de un stream que ya
+ *   estaba en curso borra strikes pero NO cierra: no prueba que Qwen acepte peticiones nuevas.
+ * - media apertura: la primera peticion tras el enfriamiento sale como UNICA sonda y
+ *   rearma la ventana para las demas. Si Qwen le contesta, cierra; si la desafia, reabre.
+ */
+const CHAT_BUSY_MESSAGE = 'Qwen 上游繁忙，触发风控验证（被挤爆啦），请稍后重试 / Qwen chat challenge: upstream busy, retry later';
+const CHAT_CAPTCHA_MESSAGE = 'Qwen 上游要求人机验证（captcha），请稍后重试 / Qwen chat challenge: captcha required, retry later';
+const CHAT_BREAKER_MESSAGE = 'Qwen 上游连续触发风控验证，已暂停发送，请稍后重试 / Qwen chat challenge: repeated upstream challenges, requests paused, retry later';
+const CHAT_BUSY_SIGNAL_RE = /RGV587|被挤爆/;
+const CHAT_CHALLENGE_RETRY_AFTER_SECONDS = 30;
+const CHAT_BREAKER_STRIKES = 3;
+const chatBreakers = new Map();
+let chatResponseContexts = new WeakMap();
+let nextProbeId = 0;
+
+const breakerFor = (egress) => {
+  if (!chatBreakers.has(egress)) chatBreakers.set(egress, { strikes: 0, openUntil: 0, probeId: null });
+  return chatBreakers.get(egress);
+};
+
+const challengeContext = (source) => {
+  if (source && typeof source.egress === 'string') return source;
+  return source && typeof source === 'object'
+    ? (chatResponseContexts.get(source) || { egress: 'direct', probeId: null })
+    : { egress: 'direct', probeId: null };
+};
+
+const bindChatChallengeContext = (response, context) => {
+  if (response && typeof response === 'object') chatResponseContexts.set(response, context);
+  return response;
+};
+
+// Reloj inyectable, como parseClock en upload.js: los tests avanzan la ventana sin dormir.
+let chatClock = () => Date.now();
+const setChatChallengeClockForTests = (fn) => { chatClock = typeof fn === 'function' ? fn : () => Date.now(); };
+
+// Perezosos como el require de account.js: config valida el entorno al cargarse.
+const chatBreakerSeconds = () => Math.max(0, Number(require('../config/index.js').chatChallengeBreakerSeconds) || 0);
+const logger = () => require('./logger').logger;
+
+const resetChatChallengeBreaker = () => {
+  chatBreakers.clear();
+  chatResponseContexts = new WeakMap();
+  nextProbeId = 0;
+};
+
+/** @returns {number} Retry-After (s) para el desafio que acaba de llegar */
+const noteChatChallenge = (source) => {
+  const context = challengeContext(source);
+  const breaker = breakerFor(context.egress);
+  breaker.strikes += 1;
+  const seconds = chatBreakerSeconds();
+  const isProbe = context.probeId !== null && context.probeId === breaker.probeId;
+  if (seconds <= 0 || (breaker.probeId !== null && !isProbe) ||
+      (breaker.probeId === null && breaker.strikes < CHAT_BREAKER_STRIKES)) {
+    return CHAT_CHALLENGE_RETRY_AFTER_SECONDS;
+  }
+  breaker.openUntil = chatClock() + seconds * 1000;
+  breaker.probeId = null;
+  logger().warn('Qwen chat challenge 连续 ' + breaker.strikes + ' 次，' + seconds + 's 内不再发送聊天请求', 'UPSTREAM');
+  return seconds;
+};
+
+const noteChatAnswer = (source) => {
+  const context = challengeContext(source);
+  const breaker = breakerFor(context.egress);
+  breaker.strikes = 0;
+  if (breaker.probeId === null || context.probeId !== breaker.probeId) return;
+  breaker.openUntil = 0;
+  breaker.probeId = null;
+  logger().info('Qwen chat challenge 探测请求已正常返回，恢复发送聊天请求', 'UPSTREAM');
+};
+
+const noteChatChallengeAnswer = (source) => noteChatAnswer(source);
+
+// Los SDK de Anthropic y OpenAI solo respetan un Retry-After por debajo de 60 s; con 60 o mas
+// vuelven a su backoff corto. La ventana del breaker puede ser 60: el cliente vuelve 1 s antes
+// y, si aun esta abierto, recibe el segundo que falta.
+const CHAT_CHALLENGE_MAX_RETRY_AFTER_SECONDS = 59;
+
+const chatChallengeError = (message, retryAfter, details) => {
+  const error = new UpstreamResponseError(message, WAF_CHALLENGE_CODE, details);
+  error.retryAfter = Math.min(retryAfter, CHAT_CHALLENGE_MAX_RETRY_AFTER_SECONDS);
+  return error;
+};
+
+/**
+ * sendChatRequest y la ruta de imagen/video lo llaman antes de crear el chat o subir nada.
+ * Con el enfriamiento agotado deja pasar a quien llega primero como sonda.
+ */
+const assertChatChallengeBreakerClosed = (account) => {
+  const egress = require('./proxy-helper').describeEgress(account);
+  const breaker = breakerFor(egress);
+  const context = { egress, probeId: null };
+  if (!breaker.openUntil) return context;
+  const now = chatClock();
+  const remaining = Math.ceil((breaker.openUntil - now) / 1000);
+  if (remaining > 0) throw chatChallengeError(CHAT_BREAKER_MESSAGE, remaining, { breakerOpen: true });
+  context.probeId = ++nextProbeId;
+  breaker.openUntil = now + chatBreakerSeconds() * 1000;
+  breaker.probeId = context.probeId;
+  return context;
+};
+
+/**
+ * Si el frame es un chat challenge devuelve su error (y cuenta el strike); si no, null.
+ * "被挤爆啦" es saturacion; un captcha/punish sin ella es verificacion humana.
+ * @param {object} payload - Frame ya parseado
+ * @returns {UpstreamResponseError|null}
+ */
+const chatChallengeFrom = (payload, source) => {
+  const detected = detectWafChallenge(payload);
+  if (!detected) return null;
+  const ret = Array.isArray(payload?.ret) ? payload.ret.map(String) : [];
+  const busy = [...ret, ...findWafChallengeSignals(payload)].some(item => CHAT_BUSY_SIGNAL_RE.test(item));
+  return chatChallengeError(busy ? CHAT_BUSY_MESSAGE : CHAT_CAPTCHA_MESSAGE,
+    noteChatChallenge(source), detected.details);
+};
+
+/**
  * Qwen Web 有时以 HTTP 200 + 普通 JSON 返回 WAF/captcha 或业务失败。
  * 这些帧没有 choices，若直接跳过就会被误包装成空成功或正常 stop。
+ * Alimenta el cortacircuitos del chat challenge: cada desafio suma un strike y cada frame
+ * con `choices` cuenta como respuesta (ver noteChatAnswer).
  */
-const assertNoUpstreamFailure = (payload) => {
-  const wafChallenge = detectWafChallenge(payload);
-  if (wafChallenge) throw wafChallenge;
+const assertNoUpstreamFailure = (payload, source) => {
+  const challenge = chatChallengeFrom(payload, source);
+  if (challenge) throw challenge;
   if (!payload || typeof payload !== 'object') return;
 
   const explicitError = payload.error;
@@ -302,6 +447,8 @@ const assertNoUpstreamFailure = (payload) => {
       waitHours === undefined || waitHours === null ? null : { waitHours }
     );
   }
+
+  if (Array.isArray(payload.choices)) noteChatAnswer(source);
 };
 
 module.exports = {
@@ -312,6 +459,12 @@ module.exports = {
   isRateLimitError,
   isWafChallengeError,
   isTransportInterruption,
+  assertChatChallengeBreakerClosed,
+  bindChatChallengeContext,
+  chatChallengeFrom,
+  noteChatChallengeAnswer,
+  resetChatChallengeBreaker,
+  setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
   noteRateLimitedAccount,

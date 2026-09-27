@@ -762,10 +762,6 @@ class Account {
         this.accountRotator.recordQuotaExhausted(email, retryAfterSeconds)
     }
 
-    recordAccountChallenge(email) {
-        this.accountRotator.recordChallenge(email)
-    }
-
     /**
      * 累计 daily stats（per-account）
      * 调用方：chat.js / anthropic.js / cli.chat.js 在成功消费完上游 usage 后

@@ -331,7 +331,9 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     if (!frame.data || frame.data.trim() === '[DONE]') return
     const decoded = isJson(frame.data) ? JSON.parse(frame.data) : null
     if (decoded === null) return
-    assertNoUpstreamFailure(decoded)
+    assertNoUpstreamFailure(decoded, upstreamResponse)
+    // The frame passed: the controller may now commit its stream (see chat.js#commitStream).
+    if (typeof options.on_upstream_frame === 'function') options.on_upstream_frame()
 
     const created = normalizeCreatedMetadata(decoded)
     if (created) {
@@ -795,7 +797,7 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       const replayBody = (quotaFailure || challengeFailure) && !deliveredOutput
         ? createAccountReplayBody(options.requestBody)
         : null
-      if (!replayBody || !currentAccount?.email || !error.accountFailureRecorded ||
+      if (!replayBody || !currentAccount?.email || !(error.accountFailureRecorded || challengeFailure) ||
           attemptNumber >= maxAttempts || typeof requestSender !== 'function' ||
           options.isClientDisconnected?.() || (challengeFailure && challengeFailovers >= 1)) {
         throw error
@@ -807,9 +809,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       if (challengeFailure) challengeFailovers += 1
       logger.warn(`Agent attempt ${attemptNumber}/${maxAttempts}: ${error.code}; retrying with a different healthy account`, 'AGENT')
       currentAccount = replacementAccount
-      // Re-externalize the original complete prompt. Do not reuse another
-      // account's conversation IDs, shortened prompt, or cached context attachment.
-      currentUpstreamOptions = { ...currentUpstreamOptions, contextPrefixKey: null, allowContextCompaction: false }
+      // Re-externalize the original complete prompt; never reuse another account's
+      // conversation IDs or a shortened prompt. A quota switch also re-uploads the history.
+      // A chat challenge keeps the history prefix: Qwen refused before reading it, the
+      // prefix is not tied to an account (normal rotation reuses it across accounts too),
+      // and re-uploading it on every challenge is what exhausts the parse budget.
+      currentUpstreamOptions = {
+        ...currentUpstreamOptions,
+        contextPrefixKey: challengeFailure ? currentUpstreamOptions.contextPrefixKey : null,
+        allowContextCompaction: false
+      }
       const retryResponse = await sendBoundRequest(replayBody, {
         ...currentUpstreamOptions,
         chatId: null,
@@ -817,6 +826,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         agentRetry: true
       })
       if (!retryResponse?.status || !retryResponse.response) {
+        // A switch that could not even start keeps its cause: a challenge is still a
+        // retryable 503 and quota a 429, both with Retry-After — not an opaque 502.
+        if (challengeFailure || quotaFailure) throw error
         return {
           ok: false,
           error: { status: 502, message: retryResponse?.message || 'Account failover request failed', code: 'upstream_retry_failed' },
