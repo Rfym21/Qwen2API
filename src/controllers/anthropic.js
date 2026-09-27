@@ -1262,8 +1262,6 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let textBlockOpen = false;
   let thinkingBlockOpen = false;
   let thinkingSignature = null;
-  let promptTokens = 0;
-  let completionTokens = 0;
   let upstreamUsage = null; // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
   let upstreamFinishReason = null;
   let upstreamCompleted;
@@ -2001,8 +1999,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
 
   // 只对上游没报的字段补本地估算（早停的回合收不到尾部 usage 帧）
   const usage = reportUsage(upstreamUsage, () => createUsageObject(requestBody?.messages || '', completionContent), 'ANTHROPIC');
-  promptTokens = usage.prompt_tokens;
-  completionTokens = usage.completion_tokens;
+  const promptTokens = usage.prompt_tokens;
+  const completionTokens = usage.completion_tokens;
 
   // Daily stats 累计——一次性归属主账户（见模块顶部 attributeChatUsage 注释）
   attributeChatUsage(ctx.currentAccount, promptTokens, completionTokens);
@@ -2041,8 +2039,6 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   // 与流式分支同一条纪律，上一轮的泄漏已经重试过了。
   let attemptThinkingContent = '';
   let answerContent = '';
-  let promptTokens = 0;
-  let completionTokens = 0;
   let upstreamUsage = null; // 上游逐帧累计的 usage（DashScope 命名已归一化；null = 还没报）
   let webSearchInfo = null;
   let upstreamFinishReason = null;
@@ -2577,8 +2573,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     const nativeArgsText = nativeToolCalls.map(call => call.function.arguments || '').join('');
     return createUsageObject(requestBody?.messages || '', thinkingContent + answerContent + nativeArgsText);
   }, 'ANTHROPIC');
-  promptTokens = usage.prompt_tokens;
-  completionTokens = usage.completion_tokens;
+  const promptTokens = usage.prompt_tokens;
+  const completionTokens = usage.completion_tokens;
 
   const contentBlocks = [];
   if (thinkingContent && thinkingContent.trim()) {

@@ -816,7 +816,11 @@ test('lockstep: ningun sitio de prompt/hint re-ensena la forma nativa <tool_call
     const code = src
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .split('\n')
-      .map(line => line.replace(/\/\/.*$/, ''))
+      // Bounded by the newline, not by `$`: on a CRLF checkout `$` matches before
+      // the CR, so `.*` backtracked to the CR and left the comment body in `code`
+      // — the rationale comments that legitimately name `<tool_call>` then failed
+      // the scan below.
+      .map(line => line.replace(/\/\/[^\r\n]*/, ''))
       .join('\n')
     assert.doesNotMatch(code, /<[ \t]*\/?[ \t]*tool_call[ >]/i, `${rel}: cadena con la forma nativa <tool_call> legible por el modelo`)
   }
