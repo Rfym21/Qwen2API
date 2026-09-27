@@ -299,7 +299,11 @@ const noteRateLimitedAccount = (error, account) => {
  *   tocar Qwen durante `chatChallengeBreakerSeconds`. Una respuesta de un stream que ya
  *   estaba en curso borra strikes pero NO cierra: no prueba que Qwen acepte peticiones nuevas.
  * - media apertura: la primera peticion tras el enfriamiento sale como UNICA sonda y
- *   rearma la ventana para las demas. Si Qwen le contesta, cierra; si la desafia, reabre.
+ *   rearma la ventana para las demas. Si la desafia, reabre; la primera respuesta de Qwen
+ *   mientras la sonda esta en vuelo cierra, venga de la sonda o de un stream anterior.
+ *   ponytail: distinguir la sonda de un stream viejo exigiria etiquetar cada stream; el
+ *   peor caso es que la sonda desafiada no reabra y hagan falta 3 strikes nuevos.
+ * Imagen/video no pasan por assertNoUpstreamFailure: llaman a noteChatAnswer al terminar bien.
  */
 const CHAT_BUSY_MESSAGE = 'Qwen 上游繁忙，触发风控验证（被挤爆啦），请稍后重试 / Qwen chat challenge: upstream busy, retry later';
 const CHAT_CAPTCHA_MESSAGE = 'Qwen 上游要求人机验证（captcha），请稍后重试 / Qwen chat challenge: captcha required, retry later';
@@ -379,7 +383,8 @@ const assertChatChallengeBreakerClosed = () => {
 const chatChallengeFrom = (payload) => {
   const detected = detectWafChallenge(payload);
   if (!detected) return null;
-  const busy = findWafChallengeSignals(payload).some(item => CHAT_BUSY_SIGNAL_RE.test(item));
+  // Sobre todo el payload, no solo las senales del detector: "被挤爆" puede venir sin "RGV587".
+  const busy = CHAT_BUSY_SIGNAL_RE.test(JSON.stringify(payload));
   return chatChallengeError(busy ? CHAT_BUSY_MESSAGE : CHAT_CAPTCHA_MESSAGE, noteChatChallenge(), detected.details);
 };
 
@@ -429,6 +434,7 @@ module.exports = {
   isTransportInterruption,
   assertChatChallengeBreakerClosed,
   chatChallengeFrom,
+  noteChatAnswer,
   resetChatChallengeBreaker,
   setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,

@@ -10,7 +10,7 @@ const { getDefaultModelByChatType } = require('../models/models-map.js')
 const { getSsxmodForAccount } = require('../utils/ssxmod-manager')
 const { applyProxyToAxiosConfig, getChatBaseUrl } = require('../utils/proxy-helper');
 const { buildRequestHeaders } = require('../utils/header-profile')
-const { assertChatChallengeBreakerClosed, chatChallengeFrom } = require('../utils/upstream-error.js')
+const { assertChatChallengeBreakerClosed, chatChallengeFrom, noteChatAnswer } = require('../utils/upstream-error.js')
 
 const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i
 const HTTP_URL_REGEX = /^https?:\/\//i
@@ -187,6 +187,15 @@ const parseUpstreamErrorFromRawText = (text) => {
 
     return null
 }
+
+/**
+ * t2v pide responseType 'json': un cuerpo que no es JSON (la pagina de captcha, o un
+ * `data: {...}`) llega como string, y parseUpstreamImageError lo descartaba al fallar el
+ * JSON.parse; el "video" terminaba siendo la primera URL de la pagina de captcha.
+ */
+const parseUpstreamBody = (data) => (
+    typeof data === 'string' ? parseUpstreamErrorFromRawText(data) : parseUpstreamImageError(data)
+)
 
 /**
  * 收集对象中的所有值
@@ -876,7 +885,7 @@ const readVideoUpstreamResult = async (responseStream) => {
         const videoTaskCandidates = extractVideoTaskIdentifiersFromPayload(responseStream)
         const responseIDs = extractResponseIDsFromPayload(responseStream)
         return {
-            upstreamError: parseUpstreamImageError(responseStream),
+            upstreamError: parseUpstreamBody(responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             videoTaskID: videoTaskCandidates[0] || null,
             videoTaskCandidates,
@@ -975,7 +984,7 @@ const readVideoUpstreamResult = async (responseStream) => {
 const readImageUpstreamResult = async (responseStream) => {
     if (!responseStream || typeof responseStream.on !== 'function') {
         return {
-            upstreamError: parseUpstreamImageError(responseStream),
+            upstreamError: parseUpstreamBody(responseStream),
             contentUrl: extractResourceUrlFromPayload(responseStream),
             responseIDs: extractResponseIDsFromPayload(responseStream),
             rawPreview: typeof responseStream === 'string' ? responseStream.slice(0, 400) : ''
@@ -1295,6 +1304,15 @@ const generateImageVideoResult = async (payload) => {
             ]
         }
 
+        // Antes del breaker: una peticion invalida no debe quedarse con la unica sonda.
+        const userPrompt = messages?.[messages.length - 1]?.content
+        if (!userPrompt) {
+            throw {
+                status: 400,
+                error: '缺少有效的提示词'
+            }
+        }
+
         try {
             assertChatChallengeBreakerClosed()
         } catch (challenge) {
@@ -1308,14 +1326,6 @@ const generateImageVideoResult = async (payload) => {
         }
 
         reqBody.chat_id = chatID
-
-        const userPrompt = messages?.[messages.length - 1]?.content
-        if (!userPrompt) {
-            throw {
-                status: 400,
-                error: '缺少有效的提示词'
-            }
-        }
 
         const messagesHistory = messages.filter(item => item.role === 'user' || item.role === 'assistant')
         const selectedImageList = []
@@ -1439,7 +1449,7 @@ const generateImageVideoResult = async (payload) => {
             try {
                 responseData = await axios.post(`${chatBaseUrl}/api/v2/chat/completions?chat_id=${chatID}`, reqBody, requestConfig)
 
-                const inlineUpstreamError = parseUpstreamImageError(responseData.data)
+                const inlineUpstreamError = parseUpstreamBody(responseData.data)
                 // Ya contado como strike: no dejar que el resolver lo vuelva a parsear y contar.
                 if (inlineUpstreamError?.code === 'upstream_waf_challenge') throw inlineUpstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(inlineUpstreamError)) {
@@ -1451,7 +1461,9 @@ const generateImageVideoResult = async (payload) => {
                 break
             } catch (error) {
                 logger.error('图片/视频请求失败', 'CHAT', '', buildAxiosErrorLog(error))
-                const upstreamError = parseUpstreamImageError(error.response?.data)
+                const upstreamError = parseUpstreamBody(error.response?.data)
+                // Un desafio con status no-2xx ya sumo su strike aqui: el catch externo no lo re-parsea.
+                if (upstreamError?.code === 'upstream_waf_challenge') throw upstreamError
                 if (attempt < maxUpstreamAttempts && isRetryableUpstreamError(upstreamError)) {
                     logger.warn(`图片/视频请求上游返回瞬时内部错误，准备第 ${attempt + 1} 次重试`, 'CHAT')
                     await sleep(800)
@@ -1464,6 +1476,7 @@ const generateImageVideoResult = async (payload) => {
 
         if (newChatType === 't2i' || newChatType === 'image_edit') {
             const contentUrl = await resolveImageResultContentUrl(responseData.data, chatID, token)
+            noteChatAnswer()
             return {
                 model,
                 chatType: newChatType,
@@ -1474,6 +1487,7 @@ const generateImageVideoResult = async (payload) => {
 
         if (newChatType === 't2v') {
             const contentUrl = await resolveVideoResultContentUrl(responseData.data, token, chatID)
+            noteChatAnswer()
             return {
                 model,
                 chatType: newChatType,

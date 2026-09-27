@@ -40,14 +40,21 @@ const screenHtmlChallenge = async (response) => {
     if (!/text\/html/i.test(String(response.headers?.['content-type'] || ''))) return response.data
     const chunks = []
     let size = 0
-    for await (const chunk of response.data) {
-        chunks.push(Buffer.from(chunk))
-        size += chunk.length
-        if (size >= HTML_BODY_MAX_BYTES) break
+    let readError = null
+    try {
+        for await (const chunk of response.data) {
+            chunks.push(Buffer.from(chunk))
+            size += chunk.length
+            if (size >= HTML_BODY_MAX_BYTES) break
+        }
+    } catch (error) {
+        // Corte a media pagina: si las marcas del captcha ya llegaron, sigue siendo el desafio.
+        readError = error
     }
     const body = Buffer.concat(chunks).toString('utf8')
     const challenge = chatChallengeFrom(body)
     if (challenge) throw challenge
+    if (readError) throw readError
     return Readable.from([body])
 }
 
