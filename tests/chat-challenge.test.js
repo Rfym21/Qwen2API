@@ -166,6 +166,48 @@ test('sendChatRequest refuses while the breaker is open, before creating a chat 
   }
 })
 
+// The captcha page as text/html on /api/v2/chat/completions (upstream #179, 2026-09-19): no `data:` frame.
+const captchaPage = '<!doctype html><html><head><meta name="aliyun_waf_aa" content="1"><title>Verification</title></head>' +
+  '<body><div id="captcha-element"></div><script>var _waf_is_mobile = false;</script></body></html>'
+const postReturning = (contentType, body) => async () => ({
+  status: 200,
+  headers: { 'content-type': contentType },
+  data: Readable.from([Buffer.from(body)])
+})
+const sendToQwen = () => sendChatRequest(
+  { model: 'qwen3-max', messages: [{ role: 'user', content: '你好' }] },
+  { chatId: 'html-test-chat', currentAccount: { email: 'html@example.invalid', token: 'html-test-token' } }
+)
+
+test('a captcha page served as text/html is a chat challenge: one strike and a 529, not an empty answer', async () => {
+  const realPost = axios.post
+  axios.post = postReturning('text/html; charset=utf-8', captchaPage)
+  try {
+    await assert.rejects(sendToQwen(), error =>
+      isWafChallengeError(error) && describeUpstreamFailure(error, 500).status === 529 && error.retryAfter > 0)
+    strike(2)
+    assert.ok(breakerOpen(), 'the HTML challenge counted as one strike')
+  } finally {
+    axios.post = realPost
+  }
+})
+
+test('any other text/html body is handed on byte for byte, and counts no strike', async () => {
+  const realPost = axios.post
+  axios.post = postReturning('text/html', '<html><body>502 Bad Gateway</body></html>')
+  try {
+    const result = await sendToQwen()
+    assert.equal(result.status, true)
+    const chunks = []
+    for await (const chunk of result.response) chunks.push(Buffer.from(chunk))
+    assert.equal(Buffer.concat(chunks).toString(), '<html><body>502 Bad Gateway</body></html>')
+    strike(2)
+    assert.equal(breakerOpen(), false)
+  } finally {
+    axios.post = realPost
+  }
+})
+
 test('OpenAI non-stream answers a chat challenge with 503 upstream_unavailable and Retry-After', async () => {
   const res = mockResponse()
   await handleNonStreamResponse(res, Readable.from([frame(busy)]), false, false, 'qwen3-max', { messages: [] }, {})

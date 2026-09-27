@@ -1,4 +1,5 @@
 const axios = require('axios')
+const { Readable } = require('node:stream')
 const accountManager = require('./account.js')
 const config = require('../config/index.js')
 const { logger } = require('./logger')
@@ -7,7 +8,7 @@ const { applyProxyToAxiosConfig, getChatBaseUrl } = require('./proxy-helper');
 const { generateUUID, jitter } = require('./tools.js')
 const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js')
 const { buildRequestHeaders } = require('./header-profile')
-const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed } = require('./upstream-error.js')
+const { ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed, chatChallengeFrom, isWafChallengeError } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
     TOOL_CALL_OPEN, LEDGER_HEADER, LEDGER_CAPTION, truncateToolHistoryLedger, stripRetainedThinking
@@ -26,6 +27,29 @@ const isRetryableNetworkError = (error) => {
 }
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+// La pagina de captcha pesa ~16 KB; el tope solo evita cargar en memoria un cuerpo inesperado.
+const HTML_BODY_MAX_BYTES = 256 * 1024
+
+/**
+ * Qwen tambien manda el chat challenge como 200 text/html (la pagina de captcha del WAF):
+ * sin frames `data:` nadie lo veia y el cliente recibia "respuesta vacia" tras 2-3 reintentos.
+ * Lanza el chat challenge; cualquier otro HTML se devuelve intacto para no cambiar su camino.
+ */
+const screenHtmlChallenge = async (response) => {
+    if (!/text\/html/i.test(String(response.headers?.['content-type'] || ''))) return response.data
+    const chunks = []
+    let size = 0
+    for await (const chunk of response.data) {
+        chunks.push(Buffer.from(chunk))
+        size += chunk.length
+        if (size >= HTML_BODY_MAX_BYTES) break
+    }
+    const body = Buffer.concat(chunks).toString('utf8')
+    const challenge = chatChallengeFrom(body)
+    if (challenge) throw challenge
+    return Readable.from([body])
+}
 
 const HISTORY_MARKER = '# Conversation history (JSONL)'
 const CURRENT_MESSAGE_MARKER = '# Current message'
@@ -768,7 +792,7 @@ const sendChatRequest = async (body, options = {}) => {
                     contextPrefixReused: contextResult.reusedPrefix === true,
                     contextSerializedBytes: contextResult.serializedBytes,
                     status: true,
-                    response: response.data
+                    response: await screenHtmlChallenge(response)
                 }
             }
             // 非 200 但是没抛——退出循环, 走下面错误分类
@@ -776,6 +800,8 @@ const sendChatRequest = async (body, options = {}) => {
             lastError.response = { status: response.status }
             break
         } catch (error) {
+            // El cliente recibe 529/503 + Retry-After; el prefijo reutilizado no tuvo la culpa.
+            if (isWafChallengeError(error)) throw error
             lastError = error
             if (isRetryableNetworkError(error) && attempt < totalAttempts) {
                 logger.warn(
