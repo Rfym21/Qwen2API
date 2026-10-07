@@ -4,7 +4,7 @@
 
 # 🚀 Qwen-Proxy
 
-[![Version](https://img.shields.io/badge/version-26.09.11.16.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
+[![Version](https://img.shields.io/badge/version-26.10.07.10.00-blue.svg)](https://github.com/Rfym21/Qwen2API)
 [![Bun](https://img.shields.io/badge/Bun-1.3.14+-green.svg)](https://bun.sh/)
 [![Docker](https://img.shields.io/badge/Docker-supported-blue.svg)](https://hub.docker.com/r/rfym21/qwen2api)
 
