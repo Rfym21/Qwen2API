@@ -121,9 +121,10 @@
     "proxyInvalid": "Format error: must start with http://, https://, socks5:// or socks5h://",
     "proxyUpdateFailed": "Agent update failed:",
     "proxyUpdateSuccess": "Agent updated successfully",
-    "refreshAllComplete": "Batch refresh completed, {n} accounts were successfully refreshed",
-    "refreshAllConfirm": "Are you sure you want to refresh the tokens for all accounts? \nThis may take some time.",
+    "refreshAllComplete": "Batch refresh completed, {n} of {total} expiring accounts were successfully refreshed",
+    "refreshAllConfirm": "Refresh the tokens of accounts expiring within {hours} hours? \nAccounts that are not close to expiry are skipped; use \"Force refresh\" to refresh every account.",
     "refreshAllFailed": "Batch refresh failed:",
+    "refreshAllNone": "No tokens expire within {hours} hours, nothing to refresh. Use \"Force refresh\" to refresh every account.",
     "refreshFailed": "Failed to refresh account token:",
     "refreshSuccess": "Account {email} token refreshed successfully"
   },

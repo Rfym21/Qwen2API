@@ -48,7 +48,8 @@ class TokenManager {
             }, requestConfig)
 
             if (response.data && response.data.token) {
-                logger.success(`${email} 登录成功：${response.data.token}`, 'AUTH')
+                // 不记录令牌本身：日志可能落盘或被采集，令牌可直接冒充该账户
+                logger.success(`${email} 登录成功`, 'AUTH')
                 return response.data.token
             } else {
                 logger.error(`${email} 登录响应缺少令牌`, 'AUTH')

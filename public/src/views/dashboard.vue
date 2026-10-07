@@ -606,6 +606,8 @@ const selectAll = ref(false)
 const showDeleteAllConfirm = ref(false)
 
 // 刷新相关
+// 一键刷新只处理临期令牌；阈值同时用于请求和提示文案，避免两处不一致
+const REFRESH_THRESHOLD_HOURS = 24
 const isRefreshingAll = ref(false)
 const isForceRefreshingAll = ref(false)
 const refreshingTokens = ref([])
@@ -1153,19 +1155,28 @@ const refreshToken = async (email) => {
 const refreshAllAccounts = async () => {
   if (isRefreshingAll.value) return
 
-  if (!confirm(t('msg.refreshAllConfirm'))) return
+  if (!confirm(t('msg.refreshAllConfirm', { hours: REFRESH_THRESHOLD_HOURS }))) return
 
   isRefreshingAll.value = true
 
   try {
     const response = await axios.post('/api/refreshAllAccounts', {
-      thresholdHours: 24
+      thresholdHours: REFRESH_THRESHOLD_HOURS
     }, {
       headers: getAuthHeaders()
     })
 
     await getTokens()
-    showToast(t('msg.refreshAllComplete', { n: response.data.refreshedCount }))
+    const { refreshedCount, expiringCount } = response.data
+    // 令牌有效期远长于阈值，多数时候没有临期账户；直接报「刷新了 0 个」会被当成按钮失效（#113）
+    if (expiringCount === 0) {
+      showToast(t('msg.refreshAllNone', { hours: REFRESH_THRESHOLD_HOURS }), 'warning')
+    } else {
+      showToast(
+        t('msg.refreshAllComplete', { n: refreshedCount, total: expiringCount }),
+        refreshedCount < expiringCount ? 'warning' : 'success'
+      )
+    }
   } catch (error) {
     console.error('refreshAllAccounts error:', error)
     showToast(t('msg.refreshAllFailed') + error.message, 'error')

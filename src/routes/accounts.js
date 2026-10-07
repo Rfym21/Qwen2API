@@ -583,12 +583,16 @@ router.post('/refreshAllAccounts', adminKeyVerify, async (req, res) => {
   try {
     const { thresholdHours = 24 } = req.body
 
+    // 刷新前先统计临期账户：refreshedCount 为 0 时，面板据此区分「没有临期令牌」与「全部刷新失败」
+    const expiringCount = accountManager.getAccountsNeedingRefresh(thresholdHours).length
+
     // 执行批量刷新
     const refreshedCount = await accountManager.autoRefreshTokens(thresholdHours)
 
     res.json({
       message: '批量刷新完成',
       refreshedCount: refreshedCount,
+      expiringCount: expiringCount,
       thresholdHours: thresholdHours
     })
   } catch (error) {

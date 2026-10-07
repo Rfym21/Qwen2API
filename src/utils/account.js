@@ -465,6 +465,17 @@ class Account {
 
 
     /**
+     * 令牌将在阈值内过期（或已失效）的账户
+     * @param {number} thresholdHours - 过期阈值（小时）
+     * @returns {Array} 需要刷新的账户
+     */
+    getAccountsNeedingRefresh(thresholdHours = 24) {
+        return this.accountTokens.filter(account =>
+            this.tokenManager.isTokenExpiringSoon(account.token, thresholdHours)
+        )
+    }
+
+    /**
      * 自动刷新即将过期的令牌
      * @param {number} thresholdHours - 过期阈值（小时）
      * @returns {Promise<number>} 成功刷新的令牌数量
@@ -478,9 +489,7 @@ class Account {
         logger.info('开始自动刷新令牌...', 'TOKEN', '🔄')
 
         // 获取需要刷新的账户
-        const needsRefresh = this.accountTokens.filter(account =>
-            this.tokenManager.isTokenExpiringSoon(account.token, thresholdHours)
-        )
+        const needsRefresh = this.getAccountsNeedingRefresh(thresholdHours)
 
         if (needsRefresh.length === 0) {
             logger.info('没有需要刷新的令牌', 'TOKEN')
