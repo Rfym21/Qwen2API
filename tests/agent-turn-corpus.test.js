@@ -17,7 +17,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 
 const baseline = require('./fixtures/agent-turn-corpus.baseline.json')
-const { SCENARIOS, SURFACES, runScenario } = require('./agent-turn-corpus.scenarios.js')
+const { SCENARIOS, SURFACES, runScenario, corpusViolations } = require('./agent-turn-corpus.scenarios.js')
 
 // account.js arranca intervalos con ref al importarse (vía controllers).
 test.after(() => {
@@ -47,28 +47,10 @@ for (const scenario of SCENARIOS) {
       const where = `${scenario.id} en ${surface.id}`
       assert.deepStrictEqual(entry, baseline.scenarios[scenario.id][surface.id], where)
 
-      // Anti-baseline-hueco: una fila que dice cubrir una razón tiene que haber reintentado
-      // (si no, sus frames no llegan al camino que dice cubrir y el corpus miente), y una
-      // fila de aceptación no puede reintentar. Toda fila entrega algo al cliente.
-      assert.ok(entry.delivered.length > 0, `${where}: no entrega nada`)
-      if (entry.applicable) {
-        if (entry.targets.length > 0) {
-          assert.ok(entry.upstreamSends >= 2, `${where}: declara ${entry.targets.join('+')} y no reintentó`)
-        } else {
-          assert.equal(entry.upstreamSends, 1, `${where}: es celda de aceptación y reintentó`)
-        }
-      } else {
-        assert.deepEqual(entry.targets, [], `${where}: no aplicable con tokens declarados`)
-      }
-
-      // Corte del canal de texto: el handler deja de tirar del upstream en el frame que
-      // dispara la guarda (los frames siguientes no existen para el parser).
-      if (scenario.requiresCut) {
-        assert.ok(
-          entry.upstreamFrames.served < entry.upstreamFrames.total,
-          `${where}: la guarda de fuga no abortó el stream (${entry.upstreamFrames.served}/${entry.upstreamFrames.total})`
-        )
-      }
+      // Anti-baseline-hueco: los mismos invariantes que aplica el grabador antes de escribir,
+      // desde la misma implementación — si divergieran, el grabador podría congelar una fila
+      // que el test después acepta sin mirar.
+      assert.deepStrictEqual(corpusViolations(scenario, entry, where), [], where)
     }
   })
 }

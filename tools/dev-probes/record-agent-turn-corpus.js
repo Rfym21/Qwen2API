@@ -23,6 +23,7 @@ const {
   SCENARIOS,
   SURFACES,
   runCorpus,
+  corpusViolations,
   stableStringify
 } = require('../../tests/agent-turn-corpus.scenarios.js')
 
@@ -62,17 +63,15 @@ const main = async () => {
     }
   }
 
-  // Fila aplicable que no reintenta (o que no entrega nada) = baseline hueco: los frames no
-  // llegan al camino que la fila dice cubrir. Se arreglan los frames, no se graba encima.
+  // Fila hueca = los frames no llegan al camino que la fila dice cubrir. Se arreglan los
+  // frames, no se graba encima. Los invariantes son los mismos que aplica el test, desde la
+  // misma función: si fueran dos copias, el grabador podría congelar algo que el test
+  // después acepta sin mirar.
   const hollow = []
   for (const scenario of SCENARIOS) {
     for (const surface of SURFACES) {
       const entry = actual[scenario.id][surface.id]
-      if (!entry.applicable) continue
-      if (entry.targets.length > 0 && entry.upstreamSends < 2) hollow.push(`${scenario.id}/${surface.id}: declara ${entry.targets.join('+')} y no reintentó`)
-      if (entry.targets.length === 0 && entry.retried) hollow.push(`${scenario.id}/${surface.id}: celda de aceptación que reintentó`)
-      if (entry.delivered.length === 0) hollow.push(`${scenario.id}/${surface.id}: no entrega nada al cliente`)
-      if (scenario.requiresCut && entry.upstreamFrames.served >= entry.upstreamFrames.total) hollow.push(`${scenario.id}/${surface.id}: la guarda de fuga no abortó el stream`)
+      hollow.push(...corpusViolations(scenario, entry, `${scenario.id}/${surface.id}`))
     }
   }
   if (hollow.length > 0) {

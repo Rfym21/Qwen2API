@@ -409,8 +409,8 @@
           }
         ],
         "hints": [
-          "Your previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result.",
-          "Your previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result.",
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
         ],
         "retried": true,
         "status": 200,
@@ -467,13 +467,12 @@
           }
         ],
         "hints": [
-          "Your previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
         ],
         "retried": true,
         "status": 200,
         "targets": [
-          "missing_tool",
-          "empty"
+          "missing_tool"
         ],
         "upstreamFrames": {
           "served": 2,
@@ -587,7 +586,7 @@
           }
         ],
         "hints": [
-          "Your previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
         ],
         "retried": true,
         "status": 200,
@@ -646,7 +645,7 @@
           }
         ],
         "hints": [
-          "Your previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
         ],
         "retried": true,
         "status": 200,
@@ -911,7 +910,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -966,7 +965,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -1073,7 +1072,7 @@
           }
         ],
         "hints": [
-          "Your previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
         ],
         "retried": true,
         "status": 200,
@@ -1114,7 +1113,7 @@
           }
         ],
         "hints": [
-          "Your previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
         ],
         "retried": true,
         "status": 200,
@@ -1219,7 +1218,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -1274,7 +1273,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -1381,7 +1380,7 @@
           }
         ],
         "hints": [
-          "Your previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
         ],
         "retried": true,
         "status": 200,
@@ -1436,7 +1435,7 @@
           }
         ],
         "hints": [
-          "Your previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
         ],
         "retried": true,
         "status": 200,
@@ -1701,7 +1700,7 @@
           }
         ],
         "hints": [
-          "You did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
         ],
         "retried": true,
         "status": 200,
@@ -1760,7 +1759,7 @@
           }
         ],
         "hints": [
-          "You did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
         ],
         "retried": true,
         "status": 200,
@@ -2021,7 +2020,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -2092,7 +2091,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
         ],
         "retried": true,
         "status": 200,
@@ -2195,7 +2194,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+          "# Tool-call retry\n# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
         ],
         "retried": true,
         "status": 200,
@@ -2238,7 +2237,7 @@
           }
         ],
         "hints": [
-          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+          "# Tool-call retry\n# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
         ],
         "retried": true,
         "status": 200,
@@ -2345,7 +2344,7 @@
           }
         ],
         "hints": [
-          "You did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
         ],
         "retried": true,
         "status": 200,
@@ -2388,7 +2387,7 @@
           }
         ],
         "hints": [
-          "You did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
         ],
         "retried": true,
         "status": 200,
