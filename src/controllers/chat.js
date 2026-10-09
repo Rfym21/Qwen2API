@@ -23,8 +23,7 @@ const {
 } = require('../utils/upstream-error.js')
 const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
 
-const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
-    if (hasToolCalls) return 'tool_calls'
+const normalizeOpenAIFinishReason = (upstreamReason, upstreamCompleted) => {
     if (typeof upstreamReason === 'string' && upstreamReason.length > 0) {
         const aliases = {
             end_turn: 'stop',
@@ -125,7 +124,7 @@ const appendRetryHintToRequestBody = (requestBody, hint) => {
  * @param {boolean} enable_web_search - 是否启用网络搜索
  * @param {object} requestBody - 原始请求体，用于提取prompt信息
  * @param {object} [options] - 扩展选项
- * @param {boolean} [options.has_tools] - 是否启用工具调用解析
+ * @param {boolean} [options.has_tools] - 是否走 Agent 工具处理器（是则不进入本函数）
  * @param {string|Object} [options.tool_choice] - OpenAI tool_choice 控制项
  */
 /**
@@ -840,11 +839,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             return
         }
 
-        const finishReason = normalizeOpenAIFinishReason(
-            upstreamFinishReason,
-            false,
-            upstreamCompleted
-        )
+        const finishReason = normalizeOpenAIFinishReason(upstreamFinishReason, upstreamCompleted)
         if (!finishReason) {
             const detail = upstreamEventCount === 0 ? '上游未返回任何 SSE 事件' : '上游流在结束标记前断开'
             writeOpenAIStreamError(res, detail, 'upstream_incomplete')
@@ -927,7 +922,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
  * @param {string} model - 模型名称
  * @param {object} requestBody - 原始请求体，用于提取prompt信息
  * @param {object} [options] - 扩展选项
- * @param {boolean} [options.has_tools] - 是否启用工具调用解析
+ * @param {boolean} [options.has_tools] - 是否走 Agent 工具处理器（是则不进入本函数）
  */
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
     if (options.has_tools) {
@@ -1129,11 +1124,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             })
         }
 
-        const finishReason = normalizeOpenAIFinishReason(
-            upstreamFinishReason,
-            false,
-            upstreamCompleted
-        )
+        const finishReason = normalizeOpenAIFinishReason(upstreamFinishReason, upstreamCompleted)
         if (!finishReason) {
             return res.status(502).json({
                 error: {

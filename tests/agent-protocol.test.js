@@ -134,8 +134,8 @@ test('Defect A: thinking deltas pass through even with no role', () => {
 })
 
 test('finish reasons preserve truncation instead of reporting normal completion', () => {
-  assert.equal(normalizeOpenAIFinishReason('length', false, true), 'length')
-  assert.equal(normalizeOpenAIFinishReason(null, false, false), null)
+  assert.equal(normalizeOpenAIFinishReason('length', true), 'length')
+  assert.equal(normalizeOpenAIFinishReason(null, false), null)
   assert.equal(mapAnthropicStopReason('length', false, true), 'max_tokens')
   assert.equal(mapAnthropicStopReason(null, false, false), null)
   assert.equal(mapAnthropicStopReason('stop', true, true), 'tool_use')
