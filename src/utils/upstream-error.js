@@ -118,6 +118,10 @@ const RATE_LIMIT_MESSAGE_RE = /upper limit for today|reached the upper limit|已
 const isRateLimitError = (error) => {
   if (!error || typeof error !== 'object') return false;
   if (isWafChallengeError(error)) return false;
+  // Un 429 del upstream es la cuota dicha por el otro canal: la misma pared, sin cuerpo que
+  // leer. Clasificarla aqui hace que TODOS los consumidores de este predicado la vean igual
+  // (el failover dentro de la peticion, la marca de cuenta agotada, el registro de fallos).
+  if (Number(error.response?.status) === 429) return true;
   const code = String(error.code || '').toLowerCase();
   if (code === RATE_LIMIT_CODE.toLowerCase() || code === QUOTA_LIMIT_CODE) return true;
   return RATE_LIMIT_MESSAGE_RE.test(String(error.publicMessage || error.message || ''));
@@ -256,6 +260,20 @@ const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus =
   }
   return { rateLimited: true, overloaded: false, status: 429, retryAfter: rateLimitRetryAfterSeconds(error) };
 };
+
+/**
+ * El veredicto cuando no hay causa de upstream que leer: nadie clasifico, y el status lo
+ * elige quien conoce el caso (503 configuracion local, 502 upstream opaco). Existe para que
+ * la forma del veredicto se defina una sola vez, aqui, y no en cada sitio que la construye.
+ * @param {number} status - Status que corresponde al caso
+ * @returns {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: null}}
+ */
+const unclassifiedFailure = (status) => ({
+  rateLimited: false,
+  overloaded: false,
+  status,
+  retryAfter: null
+});
 
 /**
  * Denuncia la cuenta que se quedo sin cuota, para que la rotacion deje de elegirla.
@@ -482,6 +500,7 @@ module.exports = {
   setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
+  unclassifiedFailure,
   noteRateLimitedAccount,
   ContextExternalizationError,
   isContextAttachmentError,
