@@ -61,6 +61,7 @@ const {
   isTransportInterruption,
   isWafChallengeError,
   noteRateLimitedAccount,
+  unclassifiedFailure,
   RATE_LIMIT_ANTHROPIC_TYPE,
   UpstreamResponseError
 } = require('../utils/upstream-error.js');
@@ -122,6 +123,26 @@ const toAnthropicToolUseId = (id) => {
     if (shared) return `toolu_${shared[1]}`;
   }
   return newAnthropicToolUseId();
+};
+
+/**
+ * Un veredicto de upstream en la forma de error de cable Anthropic, mientras la respuesta
+ * sigue libre. Es la unica traduccion: la usan la via de excepcion y la via de retorno del
+ * modulo de request, que antes contestaba un 500 `api_error` para todo.
+ * @param {object} res - Respuesta HTTP
+ * @param {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null}} failure
+ * @param {string} message - Mensaje para el cliente
+ */
+const writeAnthropicHttpFailure = (res, failure, message) => {
+  const errorType = failure.rateLimited
+    ? RATE_LIMIT_ANTHROPIC_TYPE
+    : (failure.overloaded ? 'overloaded_error' : 'api_error');
+  // Retry-After solo con una espera que mando el upstream de verdad.
+  if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
+  return res.status(failure.status).json({
+    type: 'error',
+    error: { type: errorType, message }
+  });
 };
 
 const writeAnthropicError = (res, message, errorType = 'api_error', retryAfterSeconds = null) => {
@@ -2768,10 +2789,14 @@ const handleAnthropicMessages = async (req, res) => {
     upstreamResp = await sendChatRequest(body, upstreamOptions);
     currentAccount = upstreamResp.currentAccount || null;
     if (!upstreamResp.status || !upstreamResp.response) {
-      return res.status(500).json({
-        type: 'error',
-        error: { type: 'api_error', message: upstreamResp.message || 'Request failed' }
-      });
+      // El fallo dice por que fallo: cuota 429 `rate_limit_error`, sobrecarga 529
+      // `overloaded_error`, transporte 503, sin clasificar 502 `api_error`. Nunca un
+      // `api_error` 500 para todo: eso es indistinguible de "servidor roto".
+      return writeAnthropicHttpFailure(
+        res,
+        upstreamResp.failure || unclassifiedFailure(502),
+        upstreamResp.message || 'Upstream did not produce a usable response'
+      );
     }
 
     // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
@@ -2806,6 +2831,8 @@ const handleAnthropicMessages = async (req, res) => {
     // La cuota diaria agotada es 429 `rate_limit_error`, como la API nativa — no un 500
     // `api_error`. Gemelo: chat.js#writeOpenAIHttpError. La deteccion es unica
     // (utils/upstream-error.js#describeUpstreamFailure); aqui solo se traduce al cable.
+    // 500 por defecto: lo que llega aqui son excepciones nuestras o challenges ya
+    // clasificados, no un no-200 opaco del upstream (ese sale por la via de retorno).
     const failure = describeUpstreamFailure(error, 500);
     const errorType = failure.rateLimited
       ? RATE_LIMIT_ANTHROPIC_TYPE
@@ -2831,12 +2858,8 @@ const handleAnthropicMessages = async (req, res) => {
       invalidateContextPrefix(contextPrefixKey);
     }
     if (!res.headersSent) {
-      // Retry-After solo con una espera que mando el upstream de verdad.
-      if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
-      res.status(failure.status).json({
-        type: 'error',
-        error: { type: errorType, message: error.publicMessage || 'Service error' }
-      });
+      // Mismo escritor que la via de retorno: una sola traduccion al cable Anthropic.
+      writeAnthropicHttpFailure(res, failure, error.publicMessage || 'Service error');
     } else {
       // A media transmision el status ya no se puede cambiar: el `type` del evento es el
       // unico canal que le queda al cliente para distinguir cuota de averia.
