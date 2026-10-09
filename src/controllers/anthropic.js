@@ -2,7 +2,21 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject, mergeUpstreamUsage, reportUsage } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
-const { resolveAttemptBudget } = require('../utils/agent-turn-gate.js');
+const {
+  gate,
+  REASONS,
+  PROTOCOL_RECOVERY_REASONS,
+  resolveAttemptBudget,
+  retryHintFor: gateRetryHintFor,
+  appendRetryHint: gateAppendRetryHint,
+  // Los cuatro constructores de hint del controlador, mudados a la puerta: acá quedan sus
+  // nombres porque el loop no-stream todavía los llama (expand–contract en pequeño; el
+  // ticket 06 los borra con su último llamador). Una sola copia de cada texto.
+  buildRequiredToolRetryHint: buildRetryHint,
+  buildEmptyOutputRetryHint,
+  buildMissingToolRetryHint,
+  buildToolErrorRetryHint
+} = require('../utils/agent-turn-gate.js');
 const accountManager = require('../utils/account.js');
 const {
   isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
@@ -21,9 +35,7 @@ const {
   looksLikeUnexecutedToolAction,
   containsOrphanProtocolResidue,
   stripToolCallResidue,
-  ANSWER_PHASES,
-  TOOL_CALL_OPEN,
-  TOOL_CALL_CLOSE
+  ANSWER_PHASES
 } = require('../utils/tool-prompt.js');
 const {
   createAgentTagStripper,
@@ -982,33 +994,36 @@ const buildInternalRequest = async (anthropicReq) => {
   };
 };
 
+/** 这一层请求的重试提示词前面带的标题（两处调用点共用同一个字节）。 */
+const ANTHROPIC_RETRY_HINT_HEADER = '# Tool-call retry';
+
 /**
- * 在请求体中追加用于 required 重试的强制提示
+ * 在请求体中追加用于重试的强制提示。实现只有一份（utils/agent-turn-gate.js）；这个绑定
+ * 只负责带上本层的标题，让两个循环的调用点保持原样（ticket 06 随最后一个调用者一起删）。
  * @param {Object} body - 内部请求体
  * @param {string} hint - 重试提示词
  * @returns {Object} 新请求体
  */
-const appendRetryHint = (body, hint) => {
-  const messages = Array.isArray(body.messages)
-    ? body.messages.map(message => ({ ...message }))
-    : [];
-  if (messages.length === 0) {
-    messages.push({ role: 'user', content: hint });
-  } else {
-    const last = messages[messages.length - 1];
-    if (typeof last.content === 'string') {
-      last.content = `${last.content}\n\n# Tool-call retry\n${hint}`;
-    } else if (Array.isArray(last.content)) {
-      const textPart = last.content.find(part => part?.type === 'text');
-      if (textPart) {
-        textPart.text = `${textPart.text || ''}\n\n# Tool-call retry\n${hint}`;
-      } else {
-        last.content = [{ type: 'text', text: hint }, ...last.content];
-      }
-    }
-  }
-  return { ...body, messages };
-};
+const appendRetryHint = (body, hint) => gateAppendRetryHint(body, hint, { header: ANTHROPIC_RETRY_HINT_HEADER });
+
+/**
+ * La política de esta superficie para la puerta (campos con nombre; el loop pone los hechos,
+ * la puerta la regla). Los cuatro valores son los de hoy, byte a byte:
+ *   proseWithTools — la prosa junto a llamadas se acepta: los bloques tool_use ya salieron
+ *     discretos y el cliente puede actuar con lo que llegó.
+ *   acceptBareFinal — la prosa sin envoltorio de cierre es una respuesta final: acá los tags
+ *     se pelan sin interpretarse, no hay vocabulario de control que exigir.
+ *   toolErrorsBeforeRequired — `required` manda: si el tool_choice exigía una llamada, el
+ *     rechazo es required_tool (su hint nombra el tool_choice), no tool_error.
+ *   toolErrorsVetoWithCalls — un error de herramienta no veta una llamada que ya se emitió.
+ * Los dos loop Anthropic (stream y no-stream) comparten estos cuatro valores.
+ */
+const ANTHROPIC_GATE_POLICY = Object.freeze({
+  proseWithTools: true,
+  acceptBareFinal: true,
+  toolErrorsBeforeRequired: false,
+  toolErrorsVetoWithCalls: false
+});
 
 /**
  * 判断 tool_choice 是否需要强制调用
@@ -1021,29 +1036,11 @@ const requiresToolCall = (toolChoice) => {
   return false;
 };
 
-/**
- * 构建 required 重试提示
- * @param {string|Object} toolChoice - 内部 tool_choice
- * @returns {string} 提示文本
- */
-const buildRetryHint = (toolChoice) => {
-  if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) {
-    return `You did not call any tool. You MUST now call \`${toolChoice.function.name}\` using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format.`;
-  }
-  return `You did not call any tool. You MUST now call exactly one tool using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format.`;
-};
-
-const buildEmptyOutputRetryHint = () => [
-  'Your previous reply produced no visible final answer or executable tool call.',
-  `Continue the Agent task now. If any action remains, emit the required \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
-  'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
-].join(' ');
-
-const buildMissingToolRetryHint = () => [
-  'Your previous reply described an action but did not execute any tool call.',
-  `Perform that action now by emitting the real \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
-  'Do not describe the action again or claim completion without a tool result.'
-].join(' ');
+// Los constructores de hint de este controlador (`buildRetryHint`, `buildEmptyOutputRetryHint`,
+// `buildMissingToolRetryHint`, `buildToolErrorRetryHint`) ya no se definen acá: su texto vive
+// en utils/agent-turn-gate.js — importados arriba con el mismo nombre — porque el corpus
+// grabó esos textos byte a byte y dos copias derivan. El loop no-stream los sigue llamando
+// igual hasta el ticket 06.
 
 /**
  * 把解析器的错误列表压成一行可读的诊断串。
@@ -1067,35 +1064,6 @@ const describeToolErrors = (errors) => {
     if (count) parts.push(`${type} ×${count}`);
   }
   return parts.join('; ') || 'unspecified';
-};
-
-/**
- * 工具错误的重试提示。基础文本复用 agent-turn.js 的通用提示；当错误是编造的工具名时，
- * 补上真实的名字 —— 那是让这类错误可恢复的唯一信息。原生调用的参数不合法
- * （invalid_arguments / schema_mismatch）时，点名该工具：模型要重发的是参数，不是名字。
- * @param {Array<Object>} errors - 本轮的工具错误
- * @param {Array<string>} allowedToolNames - 本次请求真正提供的工具名
- * @returns {string} 提示文本
- */
-const buildToolErrorRetryHint = (errors, allowedToolNames) => {
-  const base = buildAgentRetryHint('invalid_tool_call');
-  const unknown = [...new Set(
-    errors.filter(e => e?.type === 'unknown_tool').map(e => e.name).filter(Boolean)
-  )];
-  const badArguments = [...new Set(
-    errors.filter(e => e?.type === 'invalid_arguments' || e?.type === 'schema_mismatch').map(e => e.name).filter(Boolean)
-  )];
-  const lines = [base];
-  if (unknown.length && allowedToolNames?.length) {
-    lines.push(
-      `The tool name(s) ${unknown.join(', ')} do not exist.`,
-      `Use ONLY these exact tool names: ${allowedToolNames.join(', ')}.`
-    );
-  }
-  if (badArguments.length) {
-    lines.push(`Your arguments for tool ${badArguments.join(', ')} were not a valid JSON object or missed required keys. Re-emit the call with a complete JSON object that matches the tool's input schema.`);
-  }
-  return lines.join('\n');
 };
 
 /**
@@ -1347,9 +1315,10 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   let upstreamEventCount;
   let visibleText = '';
   // 本轮 attempt 写到线上的正文。visibleText 是跨轮累计（它如实映照线上已发出的
-  // 一切，供 empty 判定和"已见正文只许一次补偿"守卫使用）；但 malformed_protocol /
-  // missing_tool 检查的是**这一轮**说了什么 —— 上一轮泄漏的残渣已经重试过了，
-  // 拿累计文本判会把成功的重试轮再判一次死。
+  // 一切，供"已见正文只许一次补偿"守卫使用）；但 malformed_protocol / missing_tool
+  // 检查的是**这一轮**说了什么 —— 上一轮泄漏的残渣已经重试过了，拿累计文本判会把
+  // 成功的重试轮再判一次死。`empty` 自 ticket 05 起 también es de intento: la puerta
+  // recibe este texto, no el acumulado (medido invisible contra el corpus, ticket 03).
   let attemptVisibleText = '';
   // 本轮 attempt 的**原始**思考文本（不含注入的 searchTable）。think 内容照旧
   // verbatim 流给客户端（遏制是另案，见 deferred-work），但回合定案时要拿它过一遍
@@ -1358,7 +1327,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   // 早有这道防御（openai-agent-runtime.js:232-246）；这里把 B 拉到同一水位。
   let attemptThinkText = '';
   // 思维阶段的排放证据：think 文本过共享解析器后出现调用或解析错误，却没资格
-  // 晋升（守卫见回合定案处）。decideRetryReason 据此点起一次性 thought_tool_call。
+  // 晋升（守卫见回合定案处）。la puerta la lee como `thinkEvidence` y enciende el
+  // thought_tool_call de un solo uso.
   let attemptThinkEvidence = false;
 
   // 每个 attempt 都必须拿到全新的解析器。旧代码只建一次，于是补偿重试会继承上一轮的
@@ -1713,68 +1683,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
 
-  /**
-   * 判断本轮是否需要重试；返回 null 表示接受本轮。
-   * 只在 flush 之后调用：flush 会结算挂起的工具调用，此后 hasPendingCall() 恒为假。
-   */
-  const decideRetryReason = (emittedCalls) => {
-    if (emittedCalls) return null;
-    if (parser && requiresToolCall(toolChoice)) return 'required';
-    // 以前任何一个工具错误都会让全部补偿失效并直接 502。可是被编造的工具名恰恰是
-    // 最容易纠正的错误：把允许的名字摆在模型面前即可。终止性 finish 下**原生来源**
-    // 的错误不点火：被 length 截断的快照是 truncated_native_call，不发射也不重试
-    // （文本来源保持今天的行为）。
-    const retryableToolErrors = terminalFinish() ? (parser?.getErrors() || []) : currentToolErrors();
-    if (retryableToolErrors.length > 0) return 'tool_error';
-    // 平台把模型的原生工具调用吃掉时，我们收到的只剩 role:function 丢弃帧和一段
-    // 叙述失败的散文。丢弃帧就是拦截的现场证据：有丢弃、零工具调用、且本请求
-    // 确实带工具 → 值得用规范标记提示模型重发一次。终止性 finish（length/
-    // content_filter/refusal）与 missing_tool/empty 同一纪律：不重试。
-    if (hasTools && normalizeDelta.interceptedToolNames.length > 0 && !terminalFinish()) {
-      return 'intercepted';
-    }
-    // 同族防御：模型把方括号协议写坏，解析器的抢救闸门也没收下（未知名字 / 缺
-    // 闭标记 / 非法 JSON），残渣按正文泄漏。只是重试信号。intercepted 在前——
-    // 丢弃帧是更强的证据。判**本轮**文本，不判累计：上一轮的残渣已经重试过了。
-    if (hasTools && containsOrphanProtocolResidue(attemptVisibleText) && !terminalFinish()) {
-      return 'malformed_protocol';
-    }
-    // 同族第三形态：调用（或其残骸）泄漏在 think phase 里，晋升守卫没放行。
-    // 排在 missing_tool 之前 —— think 里的排放证据比正文措辞的启发式更硬。
-    // 泄漏的调用永远不从这里执行，这只是重试信号。
-    if (hasTools && attemptThinkEvidence && !terminalFinish()) {
-      return 'thought_tool_call';
-    }
-    if (hasTools && looksLikeUnexecutedToolAction(attemptVisibleText) && !terminalFinish()) {
-      return 'missing_tool';
-    }
-    if (!visibleText.trim() && !terminalFinish()) return 'empty';
-    return null;
-  };
-
-  const retryHintFor = (reason) => {
-    let hint;
-    if (reason === 'required') hint = buildRetryHint(toolChoice);
-    else if (reason === 'missing_tool') hint = buildMissingToolRetryHint();
-    else if (reason === 'empty') hint = buildEmptyOutputRetryHint();
-    else if (reason === 'intercepted') hint = buildAgentRetryHint('intercepted');
-    else if (reason === 'malformed_protocol') hint = buildAgentRetryHint('malformed_protocol');
-    else if (reason === 'thought_tool_call') hint = buildAgentRetryHint('thought_tool_call');
-    else hint = buildToolErrorRetryHint(currentToolErrors(), allowedToolNames);
-    // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
-    // 不动优先级、不动上限——只让提示词把关键事实带上：调用没到客户端。
-    if ((reason === 'required' || reason === 'missing_tool') &&
-        normalizeDelta.interceptedToolNames.length > 0) {
-      hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
-    }
-    // 同一个模式的 think 版本：required / tool_error 盖住 thought_tool_call 时，
-    // 提示词仍要带上关键事实 —— 调用写在了模型自己够不到的隐藏推理里。
-    // （missing_tool / empty 排在 thought_tool_call 之后，证据在时轮不到它们。）
-    if ((reason === 'required' || reason === 'tool_error') && attemptThinkEvidence) {
-      hint = `${hint}\n${buildAgentRetryHint('thought_tool_call')}`;
-    }
-    return hint;
-  };
+  // El juicio del turno y el armado del hint ya no viven acá: la decisión es
+  // `gate(snapshot, ANTHROPIC_GATE_POLICY)` y el texto es `gateRetryHintFor(reason, snapshot,
+  // ...)`, ambos en utils/agent-turn-gate.js (ticket 05). El loop conserva lo suyo: el
+  // presupuesto de intentos, la bandera mutable del cupo de recuperación de protocolo y la
+  // maquinaria de entrega. El snapshot se arma en el punto de liquidación, después del flush
+  // — flush 会结算挂起的工具调用，此后 hasPendingCall() 恒为假.
 
   const config = require('../config/index.js');
   const maxAttempts = resolveAttemptBudget(null, config.agentTurnMaxAttempts);
@@ -1888,7 +1802,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     //   1) 必须有非空白名单（无白名单时共享解析器的名字闸门放行一切 —— fail closed，
     //      不晋升）；
     //   2) 正文侧零工具错误（A 靠 evaluate 先按 toolErrors 拒绝整轮达到同一效果，
-    //      B 的晋升发生在 decideRetryReason 之前，必须自己带上这条）。
+    //      B 的晋升发生在 la puerta decide 之前，必须自己带上这条）。
     // 终止性 finish（length/content_filter/refusal）既不晋升也不重试 —— 与
     // intercepted/missing_tool/empty 同一纪律。这不是新的安全边界：A 自兼容工作以来
     // 一直在做同一个晋升。守卫不满足但 think 里确实出现了调用（或其解析残骸）时，
@@ -1912,8 +1826,30 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       }
     }
 
-    const retryReason = decideRetryReason(hasEmittedToolCalls);
-    if (!retryReason) break;
+    // Punto de liquidación del turno: un snapshot por intento, una llamada a la puerta.
+    // `visibleText` es el de **este** intento (el scope de `empty` es attempt-scoped desde
+    // el ticket 05; medido invisible contra el corpus, ver el ticket 03). `toolCalls` va
+    // vacío: en esta superficie las llamadas se emiten en el acto y el caso "ya salió un
+    // bloque tool_use" es `callsDelivered` — un snapshot no puede retractar lo entregado.
+    const gateSnapshot = {
+      finishReason: upstreamFinishReason,
+      visibleText: attemptVisibleText,
+      controlKind: null,
+      toolCalls: [],
+      toolErrors: currentToolErrors(),
+      textToolErrors: parser ? parser.getErrors() : [],
+      nativeToolCalls: [],
+      interceptedToolNames: normalizeDelta.interceptedToolNames,
+      thinkEvidence: attemptThinkEvidence,
+      callsDelivered: hasEmittedToolCalls,
+      textChannelCut: !!textRunaway?.cutRule(),
+      orphanResidue: containsOrphanProtocolResidue(attemptVisibleText),
+      hasTools,
+      requiresToolCall: requiresToolCall(toolChoice)
+    };
+    const verdict = gate(gateSnapshot, ANTHROPIC_GATE_POLICY);
+    if (verdict.verdict === 'accept') break;
+    const retryReason = verdict.reason;
     if (attemptsMade >= maxAttempts) {
       // 以前这里静默 break：生产环境分不清"回合被接受"和"次数用尽"。措辞保持中立：
       // 接下来可能按原样交付，也可能收敛成 invalid_tool_call_error / api_error（
@@ -1931,9 +1867,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     // 注意这个上限独立于下面的已见正文守卫 —— 无叙述的拦截（零可见正文）也必须
     // 停在一次。放弃时必须留日志：生产环境要能区分"提示被采纳、回合恢复"和
     // "第二次、原样交付"。
-    const isProtocolRecovery = retryReason === 'intercepted' ||
-      retryReason === 'malformed_protocol' ||
-      retryReason === 'thought_tool_call';
+    const isProtocolRecovery = PROTOCOL_RECOVERY_REASONS.has(retryReason);
     if (isProtocolRecovery && protocolRecoveryRetried) {
       const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
         ? ` (dropped: ${normalizeDelta.interceptedToolNames.join(', ')})`
@@ -1961,7 +1895,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       // thought_tool_call 消费的同样是这一次"已见正文后的补偿"名额：叙述已经流出
       // 去了，但迟到的 tool_use 仍然胜过一个死掉的会话（与 intercepted 同一条道理）。
       if (retriedAfterVisibleText) {
-        if (retryReason === 'tool_error') {
+        if (retryReason === REASONS.TOOL_ERROR) {
           // 以前这里静默 break：生产环境看不见"本轮是垃圾、按原样交付"的定案。
           logger.warn(
             `Anthropic Agent 已见正文后再次 tool_error，补偿名额已用，按原样交付 (${describeToolErrors(currentToolErrors())})`,
@@ -1976,7 +1910,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       // 拦在 emit 层，检测记账照旧），失败就按今天交付。绝不新增名额；模型复述
       // 协议的老毛病（回显字面标签必然解析失败）因此不会把第二轮垃圾拼上线 ——
       // 垃圾轮的文本根本不上线。
-      if (retryReason === 'tool_error') {
+      if (retryReason === REASONS.TOOL_ERROR) {
         suppressAttemptOutput = true;
         // attempt 侧的 recovered 文本进银行（剥掉登记残渣后），交付段仍会交付它。
         bankedRecoveredText += stripRecoveredResidue(recoveredBuffer, parser ? parser.getResidueSpans() : []);
@@ -2002,7 +1936,12 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
     let retryResp = null;
     try {
       await withPing(async () => {
-        retryResp = await sendRequest(appendRetryHint(requestBody, retryHintFor(retryReason)), upstreamOptions);
+        // El hint sale del snapshot ya armado: los errores y la evidencia son los del
+        // intento que la puerta acaba de rechazar, no los de un instante posterior.
+        retryResp = await sendRequest(
+          appendRetryHint(requestBody, gateRetryHintFor(retryReason, gateSnapshot, { toolChoice, allowedToolNames })),
+          upstreamOptions
+        );
       });
     } catch (e) {
       logger.error('Anthropic 流式重试失败', 'ANTHROPIC', '', e);
