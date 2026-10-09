@@ -7,15 +7,8 @@ const {
   REASONS,
   PROTOCOL_RECOVERY_REASONS,
   resolveAttemptBudget,
-  retryHintFor: gateRetryHintFor,
-  appendRetryHint: gateAppendRetryHint,
-  // Los cuatro constructores de hint del controlador, mudados a la puerta: acá quedan sus
-  // nombres porque el loop no-stream todavía los llama (expand–contract en pequeño; el
-  // ticket 06 los borra con su último llamador). Una sola copia de cada texto.
-  buildRequiredToolRetryHint: buildRetryHint,
-  buildEmptyOutputRetryHint,
-  buildMissingToolRetryHint,
-  buildToolErrorRetryHint
+  retryHintFor,
+  appendRetryHint
 } = require('../utils/agent-turn-gate.js');
 const accountManager = require('../utils/account.js');
 const {
@@ -32,7 +25,6 @@ const {
   parseToolCallsFromText,
   createToolCallStreamParser,
   createNativeToolCallAccumulator,
-  looksLikeUnexecutedToolAction,
   containsOrphanProtocolResidue,
   stripToolCallResidue,
   ANSWER_PHASES
@@ -40,7 +32,6 @@ const {
 const {
   createAgentTagStripper,
   stripAgentTags,
-  buildAgentRetryHint,
   buildAgentTurnDirective,
   buildToolHistoryLedger,
   extractHistoryToolCalls,
@@ -998,15 +989,6 @@ const buildInternalRequest = async (anthropicReq) => {
 const ANTHROPIC_RETRY_HINT_HEADER = '# Tool-call retry';
 
 /**
- * 在请求体中追加用于重试的强制提示。实现只有一份（utils/agent-turn-gate.js）；这个绑定
- * 只负责带上本层的标题，让两个循环的调用点保持原样（ticket 06 随最后一个调用者一起删）。
- * @param {Object} body - 内部请求体
- * @param {string} hint - 重试提示词
- * @returns {Object} 新请求体
- */
-const appendRetryHint = (body, hint) => gateAppendRetryHint(body, hint, { header: ANTHROPIC_RETRY_HINT_HEADER });
-
-/**
  * La política de esta superficie para la puerta (campos con nombre; el loop pone los hechos,
  * la puerta la regla). Los cuatro valores son los de hoy, byte a byte:
  *   proseWithTools — la prosa junto a llamadas se acepta: los bloques tool_use ya salieron
@@ -1016,8 +998,8 @@ const appendRetryHint = (body, hint) => gateAppendRetryHint(body, hint, { header
  *   toolErrorsBeforeRequired — `required` manda: si el tool_choice exigía una llamada, el
  *     rechazo es required_tool (su hint nombra el tool_choice), no tool_error.
  *   toolErrorsVetoWithCalls — un error de herramienta no veta una llamada que ya se emitió.
- * Los dos loops Anthropic comparten estos valores por comportamiento, pero hoy la constante
- * la lee sólo el streaming (ticket 05); el no-stream la adopta en el ticket 06.
+ * Desde el ticket 06 los dos loops Anthropic leen esta misma constante: no comparten sólo el
+ * comportamiento, comparten la política.
  */
 const ANTHROPIC_GATE_POLICY = Object.freeze({
   proseWithTools: true,
@@ -1027,7 +1009,10 @@ const ANTHROPIC_GATE_POLICY = Object.freeze({
 });
 
 /**
- * 判断 tool_choice 是否需要强制调用
+ * 判断 tool_choice 是否需要强制调用。
+ * No se borra con el `decideRetryReason` del loop no-stream (ticket 06): le quedan llamadores
+ * fuera de la decisión de turno — el snapshot del loop streaming, y la capa de entrega de las
+ * dos superficies (`hasToolProtocolError` / el 502 de protocolo).
  * @param {string|Object} toolChoice - 内部 tool_choice
  * @returns {boolean} 是否要求至少一次工具调用
  */
@@ -1037,11 +1022,9 @@ const requiresToolCall = (toolChoice) => {
   return false;
 };
 
-// Los constructores de hint de este controlador (`buildRetryHint`, `buildEmptyOutputRetryHint`,
-// `buildMissingToolRetryHint`, `buildToolErrorRetryHint`) ya no se definen acá: su texto vive
-// en utils/agent-turn-gate.js — importados arriba con el mismo nombre — porque el corpus
-// grabó esos textos byte a byte y dos copias derivan. El loop no-stream los sigue llamando
-// igual hasta el ticket 06.
+// Los constructores de hint y el append viven sólo en utils/agent-turn-gate.js: el corpus
+// grabó esos textos byte a byte y dos copias derivan. Los dos loops de esta superficie piden
+// su hint con `retryHintFor(reason, snapshot, context)` — ya no hay copia local que mantener.
 
 /**
  * 把解析器的错误列表压成一行可读的诊断串。
@@ -1939,8 +1922,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       await withPing(async () => {
         // El hint sale del snapshot ya armado: los errores y la evidencia son los del
         // intento que la puerta acaba de rechazar, no los de un instante posterior.
+        const hint = retryHintFor(retryReason, gateSnapshot, { toolChoice, allowedToolNames });
         retryResp = await sendRequest(
-          appendRetryHint(requestBody, gateRetryHintFor(retryReason, gateSnapshot, { toolChoice, allowedToolNames })),
+          appendRetryHint(requestBody, hint, { header: ANTHROPIC_RETRY_HINT_HEADER }),
           upstreamOptions
         );
       });
@@ -2333,7 +2317,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     ...(nativeToolAccumulator?.getErrors() || [])
   ];
   // 本轮 parser 的**原始** cleanedText 与登记 span（位置坐标系 = 原始文本）。
-  // 检测（decideRetryReason / settleThinkPhase）继续吃 tag-stripped 的
+  // 检测（la puerta, vía el snapshot / settleThinkPhase）继续吃 tag-stripped 的
   // cleanedText，逐字节不变；剥残渣只在交付点、在原始文本上按位置进行，然后
   // 才剥 agent tag（与 B 同序 —— review loop 1，条目 6）。
   let roundRawCleanedText = parsedTools.cleanedText;
@@ -2379,35 +2363,44 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   };
   settleThinkPhase();
 
-  const decideRetryReason = () => {
-    if (toolCalls.length > 0) return null;
-    if (hasTools && requiresToolCall(toolChoice)) return 'required';
-    // 以前任何一个工具错误都会让全部补偿失效并直接 502。被编造的工具名恰恰是最容易
-    // 纠正的错误：把允许的名字摆在模型面前即可。终止性 finish 下原生来源的错误不点火
-    // （截断的快照 = truncated_native_call，不发射也不重试；文本来源保持今天的行为）。
-    if ((terminalFinish() ? textToolErrors : toolErrors).length > 0) return 'tool_error';
-    // 与流式分支同一条防御：role:function 丢弃帧 + 零工具调用 + 本请求带工具，
-    // 说明平台吃掉了模型的原生调用，用规范标记提示重发一次。终止性 finish 不重试
-    // —— 与 missing_tool/empty 同一纪律。
-    if (hasTools && normalizeDelta.interceptedToolNames.length > 0 && !terminalFinish()) {
-      return 'intercepted';
-    }
-    // 同族防御：方括号协议写坏（孤儿闭标记 / 开头裸负载）整段泄漏为可见正文。
-    // 只是重试信号，泄漏的 JSON 永远不执行。intercepted 在前——丢弃帧是更强的证据。
-    if (hasTools && containsOrphanProtocolResidue(cleanedText) && !terminalFinish()) {
-      return 'malformed_protocol';
-    }
-    // 同族第三形态：调用（或其残骸）泄漏在 think phase 里，晋升守卫没放行。
-    // 排在 missing_tool 之前；泄漏的调用永远不从这里执行，这只是重试信号。
-    if (hasTools && attemptThinkEvidence && !terminalFinish()) {
-      return 'thought_tool_call';
-    }
-    if (hasTools && looksLikeUnexecutedToolAction(cleanedText) && !terminalFinish()) {
-      return 'missing_tool';
-    }
-    if (!cleanedText.trim() && !terminalFinish()) return 'empty';
-    return null;
+  // Punto de liquidación del turno: un snapshot por intento, una llamada a la puerta — la
+  // misma decisión que toma el loop streaming (ticket 06). Acá ya no vive ninguna regla: el
+  // vocabulario de razones, la precedencia y el texto del hint son de
+  // utils/agent-turn-gate.js, y ANTHROPIC_GATE_POLICY es la política de las dos superficies.
+  //
+  // `callsDelivered` es false: nada salió al cliente todavía y todo intento es retractable —
+  // ese campo es exactamente lo que hace que este loop y el streaming sean la misma decisión.
+  // `visibleText` es el de **este** intento (cleanedText se resuelve por ronda, tag-stripped);
+  // de ahí salen también las dos detecciones que el loop hacía a mano — residuo huérfano de
+  // protocolo y prosa que narra una acción sin ejecutarla.
+  //
+  // Los dos canales de error viajan separados: `textToolErrors` es el subconjunto del parser
+  // de texto (con finish terminal la puerta decide sólo con él, como decidía este loop — el
+  // snapshot truncado del acumulador nativo no veta) y `toolErrors` es la unión con los del
+  // acumulador nativo. Un error de herramienta sigue siendo corregible en vez de 502: el hint
+  // `tool_error` pone los nombres permitidos delante del modelo.
+  let gateSnapshot = null;
+  let decision = null;
+  const settleTurn = () => {
+    gateSnapshot = {
+      finishReason: upstreamFinishReason,
+      visibleText: cleanedText,
+      controlKind: null,
+      toolCalls,
+      toolErrors,
+      textToolErrors,
+      nativeToolCalls,
+      interceptedToolNames: normalizeDelta.interceptedToolNames,
+      thinkEvidence: attemptThinkEvidence,
+      callsDelivered: false,
+      textChannelCut: !!textRunaway?.cutRule(),
+      orphanResidue: containsOrphanProtocolResidue(cleanedText),
+      hasTools,
+      requiresToolCall: requiresToolCall(toolChoice)
+    };
+    decision = gate(gateSnapshot, ANTHROPIC_GATE_POLICY);
   };
+  settleTurn();
 
   const config = require('../config/index.js');
   const maxAttempts = resolveAttemptBudget(null, config.agentTurnMaxAttempts);
@@ -2419,17 +2412,15 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   // "迟到的叙述胜过死掉的会话"的精神）。留底形态：{ stripped, raw, spans }。
   let narrationFallback = null;
 
-  while (attemptsMade < maxAttempts) {
-    const retryReason = decideRetryReason();
-    if (!retryReason) break;
+  while (attemptsMade < maxAttempts && decision.verdict === 'retry') {
+    const retryReason = decision.reason;
 
     // 与流式分支同一条纪律：协议恢复重试（intercepted / malformed_protocol /
     // thought_tool_call 共享同一个名额）整个请求只允许一次。第二次说明提示没被
     // 采纳，把叙述散文按正常回答交付，别再烧尝试次数。放弃时留日志：生产环境
-    // 要能区分"提示被采纳、回合恢复"和"第二次、原样交付"。
-    const isProtocolRecovery = retryReason === 'intercepted' ||
-      retryReason === 'malformed_protocol' ||
-      retryReason === 'thought_tool_call';
+    // 要能区分"提示被采纳、回合恢复"和"第二次、原样交付"。La regla vive en la
+    // puerta y es la misma constante en los dos loops (ticket 06).
+    const isProtocolRecovery = PROTOCOL_RECOVERY_REASONS.has(retryReason);
     if (isProtocolRecovery) {
       if (protocolRecoveryRetried) {
         const giveUpDrops = normalizeDelta.interceptedToolNames.length > 0
@@ -2454,26 +2445,12 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
       'ANTHROPIC'
     );
 
-    let hint = retryReason === 'required'
-      ? buildRetryHint(toolChoice)
-      : (retryReason === 'missing_tool'
-        ? buildMissingToolRetryHint()
-        : (retryReason === 'empty'
-          ? buildEmptyOutputRetryHint()
-          : (retryReason === 'intercepted' || retryReason === 'malformed_protocol' || retryReason === 'thought_tool_call'
-            ? buildAgentRetryHint(retryReason)
-            : buildToolErrorRetryHint(toolErrors, allowedToolNames))));
-    // required / missing_tool 优先级高于 intercepted，会把拦截藏在自己后面。
-    // 不动优先级、不动上限——只让提示词把关键事实带上：调用没到客户端。
-    if ((retryReason === 'required' || retryReason === 'missing_tool') &&
-        normalizeDelta.interceptedToolNames.length > 0) {
-      hint = `${hint}\n${buildAgentRetryHint('intercepted')}`;
-    }
-    // 同一个模式的 think 版本：required / tool_error 盖住 thought_tool_call 时，
-    // 提示词仍要带上关键事实 —— 调用写在了模型自己够不到的隐藏推理里。
-    if ((retryReason === 'required' || retryReason === 'tool_error') && attemptThinkEvidence) {
-      hint = `${hint}\n${buildAgentRetryHint('thought_tool_call')}`;
-    }
+    // El hint sale del snapshot ya armado — el mismo que la puerta acaba de juzgar, no un
+    // estado posterior. `retryHintFor` es también quien agrega los dos apéndices que antes se
+    // pegaban a mano acá: required/missing_tool no esconden la interceptación (el hint lleva
+    // el hecho "la llamada no llegó"), y required/tool_error no esconden la evidencia de think
+    // (el hint lleva el hecho "quedó escrita en la razón oculta").
+    const hint = retryHintFor(retryReason, gateSnapshot, { toolChoice, allowedToolNames });
 
     // finding 2 的教义对 thought_tool_call 同样成立：14:08 形态（think 泄漏 + 成功
     // 叙述）的重试若空手而归，绝不能拿 502 换掉已经拿到的叙述。malformed_protocol
@@ -2487,7 +2464,10 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
 
     let retryResp;
     try {
-      retryResp = await sendRequest(appendRetryHint(requestBody, hint), upstreamOptions);
+      retryResp = await sendRequest(
+        appendRetryHint(requestBody, hint, { header: ANTHROPIC_RETRY_HINT_HEADER }),
+        upstreamOptions
+      );
     } catch (e) {
       logger.error('Anthropic 非流式重试失败', 'ANTHROPIC', '', e);
       if (e.publicMessage) throw e;
@@ -2509,7 +2489,8 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 每轮新建；统一两个循环的计划在 lohari 仓库
     // _bmad-output/implementation-artifacts/spec-qwen2api-unify-agent-loop.md）。
     // 在那之前：拦截计数必须按轮**就地**归零（length = 0，不能重新赋值 ——
-    // decideRetryReason 闭包持有的是同一个数组引用），否则上一轮的丢弃会把
+    // el normalizador empuja sobre ESE array y el snapshot lo lee de la misma
+    // propiedad; reasignarla los desincroniza），否则上一轮的丢弃会把
     // 成功的重试再判成拦截，协议恢复名额被烧光后以 502 收场。
     normalizeDelta.interceptedToolNames.length = 0;
     // 判定输入按轮清零（thinkingContent 本身继续累计 —— 响应交付语义不动）。
@@ -2536,21 +2517,23 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
     // 本轮文本，残渣原样上线 —— 有测试钉住）。
     roundRawCleanedText = parsedRetry.cleanedText;
     roundResidueSpans = parsedRetry.residueSpans || [];
-    // 重试轮的 think phase 同样要定案：晋升或留证据，下一次 decideRetryReason 才看得见。
+    // 重试轮的 think phase 同样要定案：晋升或留证据，下一轮定案才看得见。
     settleThinkPhase();
+    // La ronda del reintento también es un intento: se arma su snapshot y la puerta vuelve
+    // a decidir (el `decision` que lee la condición del loop es este).
+    settleTurn();
   }
 
   // 与流式分支对称的收尾观测：次数用尽而最后一轮仍被拒绝时留痕（协议恢复的
   // give-up 在循环内已有自己的日志，且只在 attemptsMade < maxAttempts 时触发，
   // 不会与这行重复）。措辞中立：接下来可能按原样交付、502 或兜底叙述，不预判。
-  if (!streamBrokeOnRetry && attemptsMade >= maxAttempts) {
-    const finalRejection = decideRetryReason();
-    if (finalRejection) {
-      logger.warn(
-        `Anthropic 非流式 Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${finalRejection})`,
-        'ANTHROPIC'
-      );
-    }
+  // La razón es la de la última liquidación — el mismo veredicto que dejó al loop sin
+  // presupuesto, no uno recalculado sobre un estado que ya no cambió.
+  if (!streamBrokeOnRetry && attemptsMade >= maxAttempts && decision.verdict === 'retry') {
+    logger.warn(
+      `Anthropic 非流式 Agent 尝试次数用尽（${attemptsMade}/${maxAttempts}），最后一轮仍被拒绝 (${decision.reason})`,
+      'ANTHROPIC'
+    );
   }
 
   if (streamBrokeOnRetry) {
@@ -2572,7 +2555,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   // salvage-3 layer 3：交付轮登记过残渣才动交付文本（review loop 1，条目 9：
   // 门挂在 residueSpans 上，不挂 toolErrors —— narrationFallback 轮零错误也可能
   // 携带残渣）。位置驱动：在**原始**文本上按登记落点剥，再剥 agent tag（与 B
-  // 同序）。检测与重试判定（decideRetryReason / containsOrphanProtocolResidue）
+  // 同序）。检测与重试判定（la puerta / containsOrphanProtocolResidue）
   // 早已在未剥离文本上跑完 —— 剥离只发生在交付点。剥离必须在下面的空判据
   // **之前**（review loop 2）：一整轮只有 debris 残渣（无信封负载配不平 ——
   // 有登记、零 toolErrors）时，剥后为空要走「无正文」的 502，绝不能交付
@@ -2828,6 +2811,5 @@ module.exports = {
   runWithAnthropicPing,
   handleAnthropicStream,
   handleAnthropicNonStream,
-  describeToolErrors,
-  buildToolErrorRetryHint
+  describeToolErrors
 };
