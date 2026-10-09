@@ -397,8 +397,8 @@ describe('OpenAI text-channel runaway cut-off (runOpenAIAgentTurn)', () => {
   });
 
   // P1 (review): una ronda cortada NO puede arrastrar errores del parser de pushes
-  // ANTERIORES. evaluateOpenAIAgentAttempt mira `toolErrors.length > 0` antes que
-  // `toolCalls.length > 0`, asi que un error superviviente reintentaba la ronda y relanzaba
+  // ANTERIORES. La puerta mira `toolErrors` antes que `toolCalls`, asi que un error
+  // superviviente reintentaba la ronda y relanzaba
   // la fuga que el corte acababa de detener, hasta 502. Paridad con anthropic.js:1080/:1749.
   it('an earlier parse error does NOT re-arm the retry loop on a cut round', async () => {
     const sender = scriptedSender();

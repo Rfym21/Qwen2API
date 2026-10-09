@@ -9,7 +9,10 @@ const {
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
 const { mergeUpstreamUsage } = require('./precise-tokenizer.js')
 const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
-const { assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError } = require('./upstream-error.js')
+const {
+  assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError,
+  openAIErrorShape, unclassifiedFailure
+} = require('./upstream-error.js')
 const { recordFailedAccount, createAccountReplayBody } = require('./agent-account-failover.js')
 const {
   parseAgentControlText,
@@ -23,14 +26,17 @@ const {
   createTextChannelRunawayGuard
 } = require('./agent-turn.js')
 const config = require('../config/index.js')
+const {
+  gate,
+  REASONS,
+  TERMINAL_FINISH_REASONS,
+  PROTOCOL_RECOVERY_REASONS,
+  EXHAUSTED_TURN_MESSAGES,
+  retryHintFor,
+  appendRetryHint,
+  resolveAttemptBudget
+} = require('./agent-turn-gate.js')
 const { logger } = require('./logger.js')
-
-const NON_RETRYABLE_FINISH_REASONS = new Set([
-  'length',
-  'max_tokens',
-  'content_filter',
-  'refusal'
-])
 
 /**
  * Rebasa los spans de residuo de coordenadas de `cleanedText` a las de `visibleText`.
@@ -255,8 +261,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
     cleanedText: streamedRawText,
     toolCalls: streamedCalls,
     // Una ronda cortada NO superficializa errores del parser — ni los del push disparador ni
-    // los de pushes anteriores. evaluateOpenAIAgentAttempt mira `toolErrors.length > 0` ANTES
-    // que `toolCalls.length > 0`: cualquier error superviviente reintentaria la ronda y
+    // los de pushes anteriores. La puerta mira `toolErrors` ANTES que `toolCalls`: cualquier
+    // error superviviente reintentaria la ronda y
     // volveria a lanzar la fuga que el corte acaba de detener, hasta agotar intentos y morir
     // en 502. Es la paridad con anthropic.js, donde decideRetryReason corta en seco con
     // `if (emittedCalls) return null` (:1080) / `if (toolCalls.length > 0) return null`
@@ -459,7 +465,8 @@ const collectOpenAIAgentAttempt = async (upstreamResponse, options = {}) => {
   const textChannelCut = !!textRunaway?.cutRule()
   // Tras un corte no se hace flush de ningun parser de texto: lo que queda en el buffer es
   // el resto del push descontrolado (medio trigger / medio payload) y el flush lo condenaria
-  // como truncated_tool_call -> toolErrors>0 -> reintento (evaluate :461), anulando el corte.
+  // como truncated_tool_call -> toolErrors>0 -> reintento (la puerta veta antes de la rama de
+  // llamadas), anulando el corte.
   if (reasoningStreamParser && !textChannelCut) {
     const streamed = reasoningStreamParser.flush()
     await emitReasoningDelta(streamed.textDelta)
@@ -601,121 +608,120 @@ const requiresToolCall = (toolChoice) => {
   return !!(toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function' && toolChoice.function?.name)
 }
 
-const evaluateOpenAIAgentAttempt = (attempt, options = {}) => {
-  const finishReason = attempt.upstreamFinishReason
-  if (NON_RETRYABLE_FINISH_REASONS.has(finishReason)) {
-    const normalized = finishReason === 'max_tokens' ? 'length' : finishReason
-    return { accepted: true, finishReason: normalized, retryReason: null }
-  }
-  // 过闸的原生调用是结构化帧，比文本启发式更强的证据：有一个就接纳本轮 —— 排在
-  // toolErrors 否决与"正文不得与工具并存"之前，不翻 agentTurnAllowProseWithTools。
-  // 调用前的干净正文随 visibleText 交付；调用后的叙述在采集时就已丢弃。但被跳过的两道
-  // 否决恰恰说明 visibleText 里可能混着写坏的文本 [TOOL CALL]（文本来源的解析错误 /
-  // 孤儿协议残渣）：这种正文不交付 —— suppressVisibleText 让交付层把 content 置空，
-  // tool_calls 照常。
-  if ((attempt.nativeToolCalls?.length || 0) > 0) {
-    const suppressVisibleText = (attempt.textToolErrors?.length || 0) > 0 ||
-      containsOrphanProtocolResidue(attempt.visibleText)
-    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
-  }
-  // Ronda cortada por la guarda de fuga con llamadas admitidas: SIEMPRE se entrega (paridad
-  // con anthropic.js decideRetryReason :1080/:1749 y la promesa de settledTextRound). Va ANTES
-  // del veto por toolErrors y de "prosa no coexiste con tools": rechazarla reintenta la fuga
-  // recién detenida y, peor, el reintento cae en el mismo chat_id cuya generación abortada
-  // sigue viva en Qwen → CHAT_IN_PROGRESS → 502 (incidente qwen-next 2026-09-06 20:29, gate
-  // estricto: narración previa a la llamada + corte por duplicado). La prosa previa al corte
-  // viaja sólo si la config la permite; con gate estricto se suprime en vez de rechazar.
-  if (attempt.textChannelCut === true && attempt.toolCalls.length > 0) {
-    const suppressVisibleText = (attempt.toolErrors?.length || 0) > 0 ||
-      containsOrphanProtocolResidue(attempt.visibleText) ||
-      (!config.agentTurnAllowProseWithTools && !!attempt.visibleText.trim())
-    return { accepted: true, finishReason: 'tool_calls', retryReason: null, suppressVisibleText }
-  }
-  if (attempt.toolErrors.length > 0) {
-    return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'tool_errors' }
-  }
-  if (attempt.toolCalls.length > 0) {
-    if (!config.agentTurnAllowProseWithTools &&
-        (attempt.controlKind !== 'empty' || attempt.visibleText.trim())) {
-      return { accepted: false, finishReason: null, retryReason: 'invalid_tool_call', detail: 'prose_with_tools' }
-    }
-    return { accepted: true, finishReason: 'tool_calls', retryReason: null }
-  }
-  if (requiresToolCall(options.tool_choice)) {
-    return { accepted: false, finishReason: null, retryReason: 'required_tool' }
-  }
-  // 协议恢复防御（与 Anthropic 两个循环同族）。必须排在 final/blocked 接纳之前：
-  // 事故正是以 <agent_final> 包着的失败叙述被当成合法完结交付出去的。
-  // - intercepted：role:function 丢弃帧 = 平台吃掉了模型的原生调用，只剩叙述。
-  // - malformed_protocol：方括号协议写坏（孤儿闭标记 / 开头裸负载）整段泄漏为
-  //   可见正文。只是重试信号，泄漏的 JSON 永远不执行。
-  // intercepted 在前——丢弃帧是更强的证据。protocol_recovery_used 表示共享的
-  // 一次性恢复名额已用：跳过两个检查，让回合按原有规则交付（原样交付胜过死循环）。
-  if (options.has_tools !== false && !options.protocol_recovery_used) {
-    if ((attempt.interceptedToolNames?.length || 0) > 0) {
-      return { accepted: false, finishReason: null, retryReason: 'intercepted' }
-    }
-    if (containsOrphanProtocolResidue(attempt.visibleText)) {
-      return { accepted: false, finishReason: null, retryReason: 'malformed_protocol' }
-    }
-  }
-  if (attempt.controlKind === 'final' || attempt.controlKind === 'blocked') {
-    if (attempt.visibleText.trim()) {
-      return { accepted: true, finishReason: 'stop', retryReason: null }
-    }
-    return { accepted: false, finishReason: null, retryReason: 'empty' }
-  }
-  if (attempt.controlKind === 'empty') {
-    return { accepted: false, finishReason: null, retryReason: 'empty' }
-  }
-  if (attempt.controlKind === 'invalid_control') {
-    return { accepted: false, finishReason: null, retryReason: 'invalid_control' }
-  }
-  if (config.agentTurnAcceptBareFinal && attempt.visibleText.trim()) {
-    return { accepted: true, finishReason: 'stop', retryReason: null }
-  }
-  return { accepted: false, finishReason: null, retryReason: 'bare' }
+/**
+ * La política de esta superficie, en los cuatro campos nombrados que la puerta entiende.
+ * Hasta el ticket 07 estas cuatro reglas vivían como ramas propias dentro de una evaluación
+ * local; los valores son los de siempre — este cableado no cambia ninguno.
+ */
+const openAIAgentGatePolicy = () => ({
+  // 正文不得与工具并存: con agentTurnAllowProseWithTools=false la prosa junto a llamadas se
+  // rechaza (asimetría deliberada con las superficies Anthropic, que sí la aceptan).
+  proseWithTools: config.agentTurnAllowProseWithTools === true,
+  // 裸正文不是完成: con agentTurnAcceptBareFinal=false la prosa sin envoltorio se reintenta.
+  acceptBareFinal: config.agentTurnAcceptBareFinal === true,
+  // El veto por error de herramienta manda sobre `required_tool`: el veto miraba ANTES de
+  // `requiresToolCall` (una llamada inventada no satisface el tool_choice).
+  toolErrorsBeforeRequired: true,
+  // Y veta aunque haya una llamada parseada: una llamada parcial es una acción
+  // silenciosamente equivocada (paridad con anthropic.js, donde decideRetryReason entrega
+  // la llamada buena — allá el cliente recibe bloques discretos y puede actuar con lo que llegó).
+  toolErrorsVetoWithCalls: true
+})
+
+/**
+ * El snapshot de un intento tal como lo ve la puerta: solo hechos de ESTE intento.
+ *
+ * `protocolRecoverySpent` no es un hecho del intento sino del loop (la puerta no tiene cupo):
+ * cuando el cupo compartido ya se gastó, el snapshot se presenta SIN la evidencia que ese
+ * cupo existe para gastar —intercepted / malformed_protocol— y el intento se juzga por las
+ * reglas normales. Es la semántica de siempre: 第二次拦截/残缺按原样交付, 原样交付胜过死循环.
+ *
+ * `hasTools` va explícito: la puerta asume `true` cuando falta (correcto para las superficies
+ * Anthropic, una herencia silenciosa aquí). Los dos hechos de petición son los únicos que no
+ * salen del intento.
+ */
+const buildOpenAIAgentGateSnapshot = (attempt, options = {}, protocolRecoverySpent = false) => ({
+  finishReason: attempt.upstreamFinishReason,
+  visibleText: attempt.visibleText,
+  controlKind: attempt.controlKind,
+  toolCalls: attempt.toolCalls,
+  toolErrors: attempt.toolErrors,
+  textToolErrors: attempt.textToolErrors,
+  nativeToolCalls: attempt.nativeToolCalls,
+  interceptedToolNames: protocolRecoverySpent ? [] : attempt.interceptedToolNames,
+  // Esta superficie no detecta el think leak ni la narración sin ejecución: son vocabulario
+  // de las superficies sin envoltorio de control (parseAgentControlText nunca devuelve null).
+  thinkEvidence: false,
+  // Las llamadas de esta superficie solo viajan al aceptar el intento: nunca hay un bloque
+  // ya entregado al cliente cuando la puerta juzga.
+  callsDelivered: false,
+  textChannelCut: attempt.textChannelCut === true,
+  // El residuo se mide SIEMPRE y en crudo: la supresión de la entrega no depende del cupo de
+  // recuperación — el código viejo llamaba containsOrphanProtocolResidue sin condición para
+  // decidir si el texto viajaba. Lo que el cupo gatea es el REINTENTO por malformed_protocol,
+  // y eso viaja como campo aparte para que la puerta no tenga que adivinar cuál de los dos
+  // usos está mirando.
+  orphanResidue: containsOrphanProtocolResidue(attempt.visibleText),
+  protocolRecoverySpent,
+  hasTools: options.has_tools !== false,
+  requiresToolCall: requiresToolCall(options.tool_choice)
+})
+
+/**
+ * Las redacciones propias de esta superficie, para los tokens donde el texto del mapa de la
+ * puerta dice otra cosa: su envoltorio de control tiene su propio hint (`empty`,
+ * `required_tool`) y `prose_with_tools` conserva el cuerpo `invalid_tool_call` de
+ * agent-turn.js, que es el texto que la puerta da a ese token. El resto (bare, invalid_control,
+ * intercepted, malformed_protocol) sale del mapa compartido, byte a byte como siempre.
+ */
+// Sólo las dos razones cuyo TEXTO difiere del que sirve la puerta: `empty` y `required_tool`
+// tienen redacción propia en esta superficie. `prose_with_tools` no está acá porque el
+// constructor de la puerta ya devuelve exactamente este texto — tenerlo en los dos lados era
+// un segundo hogar que podía derivar sin que nada lo notara.
+const OPENAI_LOCAL_HINTS = Object.freeze({
+  [REASONS.EMPTY]: () => buildAgentRetryHint('empty'),
+  [REASONS.REQUIRED_TOOL]: () => buildAgentRetryHint('required_tool')
+})
+
+/**
+ * El hint de una razón. `tool_error` entra por el constructor compartido y ESO es el cambio
+ * declarado del ticket 07: con el vocabulario fusionado el texto gana el apéndice que nombra
+ * los nombres inventados y los argumentos inválidos — el único texto que hace recuperable un
+ * nombre desconocido. `allowedToolNames` viaja siempre: omitirlo descarta el apéndice en
+ * silencio (la trampa anotada por la revisión del ticket 05).
+ */
+const openAIRetryHint = (reason, snapshot, options = {}) => {
+  const local = OPENAI_LOCAL_HINTS[reason]
+  if (local) return local()
+  return retryHintFor(reason, snapshot, {
+    toolChoice: options.tool_choice,
+    allowedToolNames: options.allowed_tool_names
+  })
 }
 
-const appendRetryHint = (requestBody, hint) => {
-  const clone = requestBody && typeof requestBody === 'object'
-    ? JSON.parse(JSON.stringify(requestBody))
-    : {}
-  const messages = Array.isArray(clone.messages) ? clone.messages : []
-  if (messages.length === 0) {
-    messages.push({ role: 'user', content: hint })
-  } else {
-    const last = messages[messages.length - 1]
-    if (typeof last.content === 'string') {
-      last.content = `${last.content}\n\n${hint}`
-    } else if (Array.isArray(last.content)) {
-      const textPart = last.content.find(part => part?.type === 'text')
-      if (textPart) textPart.text = `${textPart.text || ''}\n\n${hint}`
-      else last.content.unshift({ type: 'text', text: hint })
-    } else {
-      last.content = hint
-    }
-  }
-  clone.messages = messages
-  return clone
-}
+/** La razón de cierre que viaja al cliente. La puerta acepta con `stop`/`tool_calls`: conoce
+ * los tokens de truncamiento (los importa para decidir) pero no los emite, así que una ronda
+ * aceptada por finish terminal conserva el suyo (max_tokens se normaliza a length, como
+ * siempre). */
+const wireFinishReason = (attempt, evaluation) =>
+  TERMINAL_FINISH_REASONS.has(attempt.upstreamFinishReason)
+    ? (attempt.upstreamFinishReason === 'max_tokens' ? 'length' : attempt.upstreamFinishReason)
+    : evaluation.finishReason
 
+/**
+ * El error de agotamiento. El texto por razón lo sirve el mapa de la puerta
+ * (`EXHAUSTED_TURN_MESSAGES`); el status y el código de cable son vocabulario de ESTA
+ * superficie y se quedan aquí. El código de cable no cambió con el renombre del vocabulario:
+ * las dos mitades del viejo `invalid_tool_call` (tool_error / prose_with_tools) siguen
+ * saliendo como `invalid_tool_call`.
+ */
 const exhaustedError = (attempt, retryReason) => {
-  if (retryReason === 'empty' && !String(attempt?.reasoning || '').trim()) {
+  if (retryReason === REASONS.EMPTY && !String(attempt?.reasoning || '').trim()) {
     return {
       status: 503,
       message: '上游连续返回空 Agent 回合，任务状态未被标记为完成',
       code: 'upstream_unavailable'
     }
-  }
-  const messages = {
-    empty: '上游连续只返回思考内容，没有给出可执行工具调用或最终答复',
-    bare: '上游连续返回未声明完成状态的文本，已阻止 Agent 将未完成任务误判为结束',
-    invalid_control: '上游连续返回无效的 Agent 完成标记',
-    invalid_tool_call: '上游连续返回残缺、非法或不存在的工具调用',
-    required_tool: '上游连续违反 tool_choice，未返回要求的工具调用',
-    intercepted: '上游的工具调用被平台拦截，重试后仍未恢复',
-    malformed_protocol: '上游持续返回残缺的工具调用协议，未能恢复为可执行调用'
   }
   return {
     // 502, no 429. Nada de esto fue un límite de tasa: es un desacuerdo de protocolo con el
@@ -724,8 +730,10 @@ const exhaustedError = (attempt, retryReason) => {
     // entero" — multiplicando el gasto de cuota de la cuenta contra la que ya se falló.
     // El 429 real (Qwen RateLimited) sigue saliendo por chat.image.video.js.
     status: 502,
-    message: messages[retryReason] || '上游未能生成有效的 Agent 回合',
-    code: retryReason === 'invalid_tool_call' ? 'invalid_tool_call' : 'upstream_agent_turn_incomplete'
+    message: EXHAUSTED_TURN_MESSAGES[retryReason] || '上游未能生成有效的 Agent 回合',
+    code: retryReason === REASONS.TOOL_ERROR || retryReason === REASONS.PROSE_WITH_TOOLS
+      ? 'invalid_tool_call'
+      : 'upstream_agent_turn_incomplete'
   }
 }
 
@@ -735,10 +743,7 @@ const exhaustedError = (attempt, retryReason) => {
  */
 const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   const requestSender = options.sendChatRequest
-  const maxAttempts = Math.min(
-    6,
-    Math.max(2, Number(options.agent_turn_max_attempts) || config.agentTurnMaxAttempts)
-  )
+  const maxAttempts = resolveAttemptBudget(options.agent_turn_max_attempts, config.agentTurnMaxAttempts)
   let currentResponse = initialResponse
   let lastAttempt = null
   let lastEvaluation = null
@@ -768,8 +773,9 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     }
   }
   let attemptsMade = 0
-  // 协议恢复重试（intercepted / malformed_protocol 共享）整个请求只允许一次。
-  // 用过之后 evaluate 会跳过这两个检查，让第二次拦截/残缺按原有规则原样交付。
+  // 协议恢复重试（intercepted / malformed_protocol 共享）整个请求只允许一次。用过之后 el
+  // snapshot se presenta sin esa evidencia, y el segundo interceptado/残缺 se juzga por las
+  // reglas normales (原样交付胜过死循环).
   let protocolRecoveryRetried = false
 
   const mergePresent = (base, extra) => {
@@ -844,15 +850,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       upstreamContext = { chatId: retryResponse.chatId || null, parentId: null, responseId: null }
       continue
     }
-    const evaluation = evaluateOpenAIAgentAttempt(attempt, {
-      ...options,
-      protocol_recovery_used: protocolRecoveryRetried
-    })
+    // La decisión es de la puerta: un snapshot de este intento más la política de esta
+    // superficie. El cupo de recuperación de protocolo es del loop, y viaja como ausencia de
+    // evidencia en el snapshot (ver buildOpenAIAgentGateSnapshot).
+    const snapshot = buildOpenAIAgentGateSnapshot(attempt, options, protocolRecoveryRetried)
+    const evaluation = gate(snapshot, openAIAgentGatePolicy())
     lastAttempt = attempt
     lastEvaluation = evaluation
     upstreamContext = mergePresent(upstreamContext, attempt.metadata)
 
-    if (evaluation.accepted) {
+    if (evaluation.verdict === 'accept') {
       // 恢复名额已用而本轮仍带拦截/残渣证据 = 第二次事故按原样交付。留一行日志，
       // 生产环境要能区分"提示被采纳、回合恢复"和"第二次、原样交付"。
       if (protocolRecoveryRetried && attempt.toolCalls.length === 0 &&
@@ -884,23 +891,23 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
         ok: true,
         currentAccount,
         attempt,
-        finishReason: evaluation.finishReason,
+        finishReason: wireFinishReason(attempt, evaluation),
         attempts: attemptNumber,
         // 原生接纳但正文被文本 [TOOL CALL] 残渣污染：交付层不转发 visibleText。
         suppressVisibleText: evaluation.suppressVisibleText === true
       }
     }
 
-    // 有丢弃帧时任何拒绝理由都带上名字：invalid_tool_call/required_tool 优先级更高
+    // 有丢弃帧时任何拒绝理由都带上名字：tool_error/required_tool 优先级更高
     // 时拦截会被盖住，这行日志是生产环境验证拦截确实发生的抓手。
     const dropSuffix = (attempt.interceptedToolNames?.length || 0) > 0
       ? `; dropped: ${attempt.interceptedToolNames.join(', ')}`
       : ''
-    // `detail` distingue en producción los dos invalid_tool_call (toolErrors vs prosa+tools):
-    // sin él, el incidente 2026-09-06 fue indistinguible por logs.
-    const detailSuffix = evaluation.detail ? `:${evaluation.detail}` : ''
+    // La razón ES el detalle desde el ticket 07: el viejo `invalid_tool_call` se partió en
+    // `tool_error` (errores de herramienta) y `prose_with_tools` (prosa junto a llamadas) —
+    // los dos distinguibles por logs, como desde el incidente 2026-09-06.
     logger.warn(
-      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.retryReason}${detailSuffix}${dropSuffix})`,
+      `Agent attempt ${attemptNumber}/${maxAttempts} 被回合门禁拒绝 (${evaluation.reason}${dropSuffix})`,
       'AGENT'
     )
     if (attempt.streamedVisibleText) {
@@ -917,13 +924,15 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
     }
     if (attemptNumber >= maxAttempts || typeof requestSender !== 'function' || options.isClientDisconnected?.()) break
 
-    if (evaluation.retryReason === 'intercepted' || evaluation.retryReason === 'malformed_protocol') {
+    if (PROTOCOL_RECOVERY_REASONS.has(evaluation.reason)) {
       protocolRecoveryRetried = true
     }
-    let retryHint = buildAgentRetryHint(evaluation.retryReason)
-    // 别的理由（invalid_tool_call/required_tool）盖住拦截时，提示词仍要把关键
-    // 事实带上：调用没到客户端。不动优先级、不动名额。
-    if (evaluation.retryReason !== 'intercepted' &&
+    let retryHint = openAIRetryHint(evaluation.reason, snapshot, options)
+    // 别的理由（tool_error/required_tool）盖住拦截时，提示词仍要把关键
+    // 事实带上：调用没到客户端。不动优先级、不动名额。No se duplica: el hint local de
+    // `required_tool` no trae el hecho (el mapa de la puerta sí lo agrega para ese token, y
+    // por eso ese token no entra por el mapa).
+    if (evaluation.reason !== REASONS.INTERCEPTED &&
         attempt.toolCalls.length === 0 &&
         (attempt.interceptedToolNames?.length || 0) > 0) {
       retryHint = `${retryHint}\n${buildAgentRetryHint('intercepted')}`
@@ -943,13 +952,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       agentRetry: true
     })
     if (!retryResponse?.status || !retryResponse.response) {
+      // El reenvio de correccion tampoco arranco: su fallo dice por que (cuota 429, transporte
+      // 503, opaco 502) en vez de aplanarse en un 502 mudo. Sin veredicto se conserva el 502
+      // y el code de siempre.
       return {
         ok: false,
-        error: {
-          status: 502,
-          message: retryResponse?.message || 'Agent 回合纠正请求失败',
-          code: 'upstream_retry_failed'
-        },
+        error: openAIErrorShape(
+          retryResponse?.failure || unclassifiedFailure(502),
+          retryResponse?.message || 'Agent 回合纠正请求失败',
+          'upstream_retry_failed'
+        ),
         attempt,
         attempts: attemptNumber
       }
@@ -985,18 +997,17 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   return {
     ok: false,
     currentAccount,
-    error: exhaustedError(lastAttempt, lastEvaluation?.retryReason),
+    error: exhaustedError(lastAttempt, lastEvaluation?.reason),
     attempt: lastAttempt,
     attempts: attemptsMade
   }
 }
 
 module.exports = {
-  NON_RETRYABLE_FINISH_REASONS,
   normalizeCreatedMetadata,
+  buildOpenAIAgentGateSnapshot,
+  openAIAgentGatePolicy,
   collectOpenAIAgentAttempt,
-  evaluateOpenAIAgentAttempt,
-  appendRetryHint,
   runOpenAIAgentTurn,
   // chat.js 旧路径共用的原生帧喂入
   feedNativeFrame

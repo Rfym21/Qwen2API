@@ -1,7 +1,12 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { describeToolErrors, buildToolErrorRetryHint } = require('../src/controllers/anthropic.js')
+// `describeToolErrors` es del controlador; `buildToolErrorRetryHint` vive en la puerta desde
+// el ticket 05 (el re-export del controlador murió con su último llamador local, ticket 06).
+// Se importa de donde honestamente vive: un alias en el controlador volvería a poner dos
+// nombres para una sola función.
+const { describeToolErrors } = require('../src/controllers/anthropic.js')
+const { buildToolErrorRetryHint } = require('../src/utils/agent-turn-gate.js')
 
 // Los tipos que produce createNativeToolCallAccumulator en modo snapshot. Antes de D1 el
 // resumen los ignoraba y el log decia "unspecified" para una ronda entera de errores nativos.

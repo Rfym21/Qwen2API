@@ -118,6 +118,10 @@ const RATE_LIMIT_MESSAGE_RE = /upper limit for today|reached the upper limit|已
 const isRateLimitError = (error) => {
   if (!error || typeof error !== 'object') return false;
   if (isWafChallengeError(error)) return false;
+  // Un 429 del upstream es la cuota dicha por el otro canal: la misma pared, sin cuerpo que
+  // leer. Clasificarla aqui hace que TODOS los consumidores de este predicado la vean igual
+  // (el failover dentro de la peticion, la marca de cuenta agotada, el registro de fallos).
+  if (Number(error.response?.status) === 429) return true;
   const code = String(error.code || '').toLowerCase();
   if (code === RATE_LIMIT_CODE.toLowerCase() || code === QUOTA_LIMIT_CODE) return true;
   return RATE_LIMIT_MESSAGE_RE.test(String(error.publicMessage || error.message || ''));
@@ -192,8 +196,11 @@ const isContextAttachmentError = (error) => String(error?.code || '') === CONTEX
  */
 const rateLimitRetryAfterSeconds = (error) => {
   const hours = Number(error?.details?.waitHours);
-  if (!Number.isFinite(hours) || hours <= 0) return null;
-  return Math.ceil(hours * 3600);
+  if (Number.isFinite(hours) && hours > 0) return Math.ceil(hours * 3600);
+  // Canal HTTP: un 429 puede traer la espera como cabecera. Solo segundos — una fecha HTTP
+  // no se interpreta, porque no hay caso medido que la produzca.
+  const header = Number(error?.response?.headers?.['retry-after']);
+  return Number.isFinite(header) && header > 0 ? Math.ceil(header) : null;
 };
 
 /**
@@ -255,6 +262,44 @@ const describeUpstreamFailure = (error, fallbackStatus = 502, overloadedStatus =
     return { rateLimited: false, overloaded: false, status: fallbackStatus, retryAfter: null };
   }
   return { rateLimited: true, overloaded: false, status: 429, retryAfter: rateLimitRetryAfterSeconds(error) };
+};
+
+/**
+ * El veredicto cuando no hay causa de upstream que leer: nadie clasifico, y el status lo
+ * elige quien conoce el caso (503 configuracion local, 502 upstream opaco). Existe para que
+ * la forma del veredicto se defina una sola vez, aqui, y no en cada sitio que la construye.
+ * @param {number} status - Status que corresponde al caso
+ * @returns {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: null}}
+ */
+const unclassifiedFailure = (status) => ({
+  rateLimited: false,
+  overloaded: false,
+  status,
+  retryAfter: null
+});
+
+/**
+ * Un veredicto de upstream en la forma de error de cable OpenAI. Vive aqui, junto a los
+ * constantes de los dos vocabularios, porque la usan tres sitios que no pueden depender
+ * unos de otros: el controlador de chat (via de excepcion y via de retorno) y el runtime
+ * de agente, que ya devolvia un error con status y code de este cable.
+ * @param {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null}} failure
+ * @param {string} message - Mensaje para el cliente
+ * @param {string} [fallbackCode] - `code` cuando el veredicto no trae uno propio
+ * @returns {{status: number, message: string, code: string, type?: string, retry_after?: number}}
+ */
+const openAIErrorShape = (failure, message, fallbackCode = 'upstream_error') => {
+  const shape = {
+    status: failure.status,
+    message,
+    code: failure.rateLimited
+      ? RATE_LIMIT_OPENAI_TYPE
+      : (failure.overloaded ? 'upstream_unavailable' : fallbackCode)
+  };
+  if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE;
+  else if (failure.overloaded) shape.type = 'server_error';
+  if (failure.retryAfter !== null) shape.retry_after = failure.retryAfter;
+  return shape;
 };
 
 /**
@@ -482,6 +527,8 @@ module.exports = {
   setChatChallengeClockForTests,
   rateLimitRetryAfterSeconds,
   describeUpstreamFailure,
+  unclassifiedFailure,
+  openAIErrorShape,
   noteRateLimitedAccount,
   ContextExternalizationError,
   isContextAttachmentError,

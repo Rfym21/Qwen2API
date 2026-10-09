@@ -134,8 +134,8 @@ test('Defect A: thinking deltas pass through even with no role', () => {
 })
 
 test('finish reasons preserve truncation instead of reporting normal completion', () => {
-  assert.equal(normalizeOpenAIFinishReason('length', false, true), 'length')
-  assert.equal(normalizeOpenAIFinishReason(null, false, false), null)
+  assert.equal(normalizeOpenAIFinishReason('length', true), 'length')
+  assert.equal(normalizeOpenAIFinishReason(null, false), null)
   assert.equal(mapAnthropicStopReason('length', false, true), 'max_tokens')
   assert.equal(mapAnthropicStopReason(null, false, false), null)
   assert.equal(mapAnthropicStopReason('stop', true, true), 'tool_use')
@@ -639,6 +639,45 @@ test('strict non-stream Agent gate returns an HTTP error instead of a fake compl
   assert.equal(res.statusCode, 502)
   const payload = JSON.parse(res.output)
   assert.equal(payload.error.code, 'upstream_agent_turn_incomplete')
+  // El texto del agotamiento lo sirve el mapa de la puerta (EXHAUSTED_TURN_MESSAGES): no se
+  // movió con la consolidación del ticket 07.
+  assert.equal(payload.error.message, '上游连续返回未声明完成状态的文本，已阻止 Agent 将未完成任务误判为结束')
+  assert.equal(Object.hasOwn(payload, 'choices'), false)
+})
+
+test('strict non-stream Agent gate: el agotamiento por error de herramienta conserva mensaje y código de cable', async () => {
+  const toolErrorRound = `data: ${JSON.stringify({
+    choices: [{ delta: { phase: 'answer', content: '[TOOL CALL]{"name":"nope","arguments":{}}[END TOOL CALL]' }, finish_reason: 'stop' }]
+  })}\n\n`
+  let retries = 0
+  const res = createMockResponse()
+  await handleNonStreamResponse(
+    res,
+    Readable.from([toolErrorRound]),
+    false,
+    false,
+    'qwen-test',
+    { messages: [{ role: 'user', content: 'finish and verify everything' }] },
+    {
+      has_tools: true,
+      tool_choice: 'auto',
+      allowed_tool_names: ['run_tests'],
+      agent_turn_max_attempts: 2,
+      sendChatRequest: async () => {
+        retries += 1
+        return { status: true, response: Readable.from([toolErrorRound]) }
+      }
+    }
+  )
+
+  assert.equal(retries, 1)
+  assert.equal(res.statusCode, 502)
+  const payload = JSON.parse(res.output)
+  // La mitad "errores de herramienta" del viejo invalid_tool_call (hoy `tool_error`): el
+  // mensaje es el de siempre —ahora servido por el mapa de la puerta— y el código de cable
+  // no cambió con el renombre del vocabulario.
+  assert.equal(payload.error.message, '上游连续返回残缺、非法或不存在的工具调用')
+  assert.equal(payload.error.code, 'invalid_tool_call')
   assert.equal(Object.hasOwn(payload, 'choices'), false)
 })
 
@@ -1225,8 +1264,17 @@ test('interleaved multi-response frames are not merged into a duplicated answer'
 // ---------------------------------------------------------------------------
 // 回合门禁放宽开关（默认关闭，严格行为不变）
 // ---------------------------------------------------------------------------
+// Desde el ticket 07 el veredicto de esta superficie lo decide la puerta compartida: estos
+// tests afirman contra la puerta VIVA, con el mismo snapshot y la misma política que arma el
+// runtime (buildOpenAIAgentGateSnapshot + openAIAgentGatePolicy), no contra copias de sus
+// reglas. El viejo `invalid_tool_call` con `detail` se partió en dos tokens: `tool_error`
+// (errores de herramienta) y `prose_with_tools` (prosa junto a llamadas).
 const agentTurnConfig = require('../src/config/index.js')
-const { evaluateOpenAIAgentAttempt: evaluateAgentTurn } = require('../src/utils/openai-agent-runtime.js')
+const {
+  buildOpenAIAgentGateSnapshot,
+  openAIAgentGatePolicy
+} = require('../src/utils/openai-agent-runtime.js')
+const { gate, REASONS } = require('../src/utils/agent-turn-gate.js')
 
 const buildAttempt = (overrides = {}) => ({
   upstreamFinishReason: null,
@@ -1236,6 +1284,20 @@ const buildAttempt = (overrides = {}) => ({
   visibleText: '',
   ...overrides
 })
+
+/**
+ * El veredicto vivo de una ronda: snapshot + política, como en el loop. `protocolRecoverySpent`
+ * reemplaza al viejo `protocol_recovery_used` — el cupo es del loop y el snapshot es donde se
+ * expresa (la puerta no tiene cupo).
+ */
+const evaluateAgentTurn = (attempt, { protocolRecoverySpent = false, ...overrides } = {}) => gate(
+  buildOpenAIAgentGateSnapshot(
+    attempt,
+    { has_tools: true, tool_choice: 'auto', ...overrides },
+    protocolRecoverySpent
+  ),
+  openAIAgentGatePolicy()
+)
 
 const withAgentTurnFlags = (flags, fn) => {
   const saved = {
@@ -1250,7 +1312,7 @@ const withAgentTurnFlags = (flags, fn) => {
   }
 }
 
-test('默认严格模式：工具调用附带可见正文仍判为 invalid_tool_call', () => {
+test('默认严格模式：工具调用附带可见正文仍判为 prose_with_tools', () => {
   const attempt = buildAttempt({
     toolCalls: [{ id: 'call_1', function: { name: 'read', arguments: '{}' } }],
     controlKind: 'bare',
@@ -1258,12 +1320,12 @@ test('默认严格模式：工具调用附带可见正文仍判为 invalid_tool_
   })
   withAgentTurnFlags({ agentTurnAllowProseWithTools: false }, () => {
     assert.deepEqual(evaluateAgentTurn(attempt), {
-      accepted: false,
+      verdict: 'retry',
       finishReason: null,
-      retryReason: 'invalid_tool_call',
-      // Ronda NO cortada (sin textChannelCut): el rechazo estricto se mantiene; `detail`
-      // sólo etiqueta cuál de los dos invalid_tool_call fue, para los logs de producción.
-      detail: 'prose_with_tools'
+      // La partición del vocabulario: esta razón es la mitad "prosa + tools" del viejo
+      // invalid_tool_call, la que el incidente 2026-09-06 no podía distinguir por logs.
+      reason: 'prose_with_tools',
+      suppressVisibleText: false
     })
   })
 })
@@ -1276,9 +1338,10 @@ test('AGENT_TURN_ALLOW_PROSE_WITH_TOOLS 打开后接受正文与工具调用共�
   })
   withAgentTurnFlags({ agentTurnAllowProseWithTools: true }, () => {
     assert.deepEqual(evaluateAgentTurn(attempt), {
-      accepted: true,
+      verdict: 'accept',
       finishReason: 'tool_calls',
-      retryReason: null
+      reason: null,
+      suppressVisibleText: false
     })
   })
 })
@@ -1289,27 +1352,30 @@ test('打开放宽开关也不会接受非法工具调用', () => {
     visibleText: '正文'
   })
   withAgentTurnFlags({ agentTurnAllowProseWithTools: true, agentTurnAcceptBareFinal: true }, () => {
-    assert.equal(evaluateAgentTurn(attempt).accepted, false)
-    assert.equal(evaluateAgentTurn(attempt).retryReason, 'invalid_tool_call')
+    assert.equal(evaluateAgentTurn(attempt).verdict, 'retry')
+    // La otra mitad del viejo invalid_tool_call: el veto por error de herramienta.
+    assert.equal(evaluateAgentTurn(attempt).reason, REASONS.TOOL_ERROR)
   })
 })
 
 test('默认严格模式：缺少 <agent_final> 包装的正文判为 bare', () => {
   const attempt = buildAttempt({ controlKind: 'bare', visibleText: '已经改完了。' })
   withAgentTurnFlags({ agentTurnAcceptBareFinal: false }, () => {
-    assert.equal(evaluateAgentTurn(attempt).retryReason, 'bare')
+    assert.equal(evaluateAgentTurn(attempt).reason, REASONS.BARE)
   })
 })
 
-test('AGENT_TURN_ACCEPT_BARE_FINAL 打开后按 stop 接受，空正文仍判为 bare', () => {
+test('AGENT_TURN_ACCEPT_BARE_FINAL 打开后按 stop 接受，空正文仍被拒绝', () => {
   withAgentTurnFlags({ agentTurnAcceptBareFinal: true }, () => {
     assert.deepEqual(
       evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '已经改完了。' })),
-      { accepted: true, finishReason: 'stop', retryReason: null }
+      { verdict: 'accept', finishReason: 'stop', reason: null, suppressVisibleText: false }
     )
+    // Texto en blanco: parseAgentControlText nunca lo llama `bare` (lo devuelve como
+    // `empty`), y la regla que sí lo alcanza lo sigue rechazando.
     assert.equal(
-      evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '   ' })).retryReason,
-      'bare'
+      evaluateAgentTurn(buildAttempt({ controlKind: 'empty', visibleText: '   ' })).reason,
+      REASONS.EMPTY
     )
   })
 })
@@ -1319,8 +1385,8 @@ test('AGENT_TURN_ACCEPT_BARE_FINAL 打开后按 stop 接受，空正文仍判为
 // literal en el canal de razonamiento de un turno que el gate acepta, ese texto debe
 // llegar entero: antes el parser se lo tragaba y la frase salía cortada en el tag.
 //
-// El mismo eco en el canal de respuesta NO llega: el gate estricto lo marca
-// invalid_tool_call y, como ya salió texto, cierra con 422
+// El mismo eco en el canal de respuesta NO llega: el gate estricto lo marca tool_error y,
+// como ya salió texto, cierra con 422
 // upstream_agent_stream_invalidated. Eso es comportamiento deliberado del gate
 // (tests "默认严格模式" + los switches AGENT_TURN_*), no algo que este cambio toque.
 // Anotado en deferred-work.md.
@@ -1382,7 +1448,7 @@ const AGENT_LEAK = [
 ].join('\n')
 // El mismo payload SIN closer: residuo (forma de leak) pero no protocolo demostrable →
 // sigue disparando malformed_protocol. Desde el spec narrated-toolcall (2026-09-02) la
-// forma CON closer y nombre no declarado es un error duro (unknown_tool → invalid_tool_call).
+// forma CON closer y nombre no declarado es un error duro (unknown_tool → tool_error).
 const AGENT_LEAK_NO_CLOSER = AGENT_LEAK.split('\n')[0]
 
 const runAgentTurn = (initialFrames, sendChatRequest, overrides = {}) => runOpenAIAgentTurn(
@@ -1405,14 +1471,15 @@ test('OpenAI gate: la narracion envuelta tras drops se rechaza como intercepted,
     interceptedToolNames: ['Bash']
   })
   assert.deepEqual(evaluateAgentTurn(attempt), {
-    accepted: false,
+    verdict: 'retry',
     finishReason: null,
-    retryReason: 'intercepted'
+    reason: REASONS.INTERCEPTED,
+    suppressVisibleText: false
   })
   // Nombre agotado el tope compartido: se entrega por las reglas de siempre.
-  assert.equal(evaluateAgentTurn(attempt, { protocol_recovery_used: true }).accepted, true)
+  assert.equal(evaluateAgentTurn(attempt, { protocolRecoverySpent: true }).verdict, 'accept')
   // Sin herramientas en juego, los drops no significan nada.
-  assert.equal(evaluateAgentTurn(attempt, { has_tools: false }).accepted, true)
+  assert.equal(evaluateAgentTurn(attempt, { has_tools: false }).verdict, 'accept')
 })
 
 test('OpenAI gate: drops junto a una llamada aceptada no reintenta (drop especulativo benigno)', () => {
@@ -1421,21 +1488,22 @@ test('OpenAI gate: drops junto a una llamada aceptada no reintenta (drop especul
     interceptedToolNames: ['Bash']
   })
   assert.deepEqual(evaluateAgentTurn(attempt), {
-    accepted: true,
+    verdict: 'accept',
     finishReason: 'tool_calls',
-    retryReason: null
+    reason: null,
+    suppressVisibleText: false
   })
 })
 
 test('OpenAI gate: el leak de protocolo malformado se rechaza; JSON ordinario no', () => {
   assert.equal(
-    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: AGENT_LEAK })).retryReason,
-    'malformed_protocol'
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: AGENT_LEAK })).reason,
+    REASONS.MALFORMED_PROTOCOL
   )
   // JSON sin clave "arguments" al inicio: respuesta normal, cae en bare.
   assert.equal(
-    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '{"name": "results", "count": 3}' })).retryReason,
-    'bare'
+    evaluateAgentTurn(buildAttempt({ controlKind: 'bare', visibleText: '{"name": "results", "count": 3}' })).reason,
+    REASONS.BARE
   )
 })
 
@@ -1494,7 +1562,7 @@ test('OpenAI loop: el leak malformado (sin closer) reintenta con su hint y recup
   assert.match(JSON.stringify(sent[0]), /was NOT executed/)
 })
 
-test('OpenAI loop: el leak CON closer y nombre no declarado es error duro (spec narrated-toolcall) → invalid_tool_call, reintenta y recupera', async () => {
+test('OpenAI loop: el leak CON closer y nombre no declarado es error duro (spec narrated-toolcall) → tool_error, reintenta y recupera', async () => {
   const sent = []
   const result = await runAgentTurn(
     [agentAnswerFrame(AGENT_LEAK)],
@@ -1508,7 +1576,10 @@ test('OpenAI loop: el leak CON closer y nombre no declarado es error duro (spec 
   assert.equal(result.finishReason, 'tool_calls')
   assert.equal(sent.length, 1)
   const hint = JSON.stringify(sent[0])
-  assert.match(hint, /invalid, truncated, or unknown tool call/, 'la razon es invalid_tool_call (unknown_tool), no malformed_protocol')
+  assert.match(hint, /invalid, truncated, or unknown tool call/, 'la razon es tool_error (unknown_tool), no malformed_protocol')
+  // Y con el constructor compartido el hint nombra el nombre inventado: el único texto que
+  // hace recuperable un nombre desconocido (cambio declarado del ticket 07).
+  assert.match(hint, /The tool name\(s\) AskUserQuestion do not exist/)
   assert.doesNotMatch(hint, /was NOT executed/)
 })
 
@@ -1626,8 +1697,6 @@ test('P10: los drops internos no queman el slot que malformed_protocol necesita'
 // `role:function "Tool X does not exists."` y el modelo narra que no tiene herramientas.
 // Antes cada frame se hacia push() en index 0 con `+=` → JSON invalido → invalid_tool_call
 // → retry quemado. Fixtures byte-fieles a scratchpad/capture-foreign.txt (2026-09-01).
-
-const { createNativeToolCallAccumulator: createNativeAccumulatorForIndexPin } = require('../src/utils/tool-prompt.js')
 
 const agentNativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
   choices: [{
@@ -1931,7 +2000,7 @@ test('OpenAI loop: sin result frames la prosa cierra la llamada nativa; no hay c
   assert.equal(result.attempt.visibleText.trim(), '')
 })
 
-test('OpenAI loop: la ronda de code_interpreter (plataforma) sigue siendo invalid_tool_call con retry, sin corte temprano', async () => {
+test('OpenAI loop: la ronda de code_interpreter (plataforma) sigue siendo tool_error con retry, sin corte temprano', async () => {
   const sent = []
   const frames = [
     ...CODE_INTERPRETER_SNAPSHOTS.map(snapshot => agentPlatformCallFrame('code_interpreter', snapshot, CODE_INTERPRETER_ID)),
@@ -2100,80 +2169,34 @@ test('OpenAI non-stream e2e (F2): texto contaminado → content null; prosa limp
   assert.equal(clean.message.content, 'Let me check.', 'la prosa limpia previa a la llamada sigue saliendo')
 })
 
-// ── chat.js legacy (strict_agent_turn: false): feed nativo, index unico, retry limpio ──
 
-const legacyToolCallHeaders = (output) => output
-  .split('\n\n')
-  .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
-  .map(line => JSON.parse(line.slice(6)))
-  .flatMap(chunk => (chunk.choices?.[0]?.delta?.tool_calls || []))
-
-const legacyArgsOf = (deltas, index) => deltas
-  .filter(call => call.index === index && !call.id)
-  .map(call => call.function.arguments)
-  .join('')
-
-const runLegacyStream = async (frames, options = {}) => {
+// Ticket 01 de `.scratch/agent-turn-gate/`: al borrar el camino de herramientas
+// inalcanzable quedó a la vista un comportamiento que NO estaba gateado por
+// `hasTools`. El reintento por respuesta vacía del loop no-stream reconstruía el
+// acumulador nativo y volvía a parsear el texto del reintento — sin condición de
+// herramientas —, así que una petición SIN herramientas cuyo primer intento salía
+// vacío y cuyo reintento devolvía un bloque `[TOOL CALL]` terminaba entregando
+// `tool_calls` (y `finish_reason: "tool_calls"`) a un cliente que nunca declaró
+// herramienta alguna. El propio hint del reintento pide ese bloque, así que el
+// lazo se cerraba solo.
+//
+// Este test fija la conducta nueva: una petición sin herramientas nunca recibe
+// `tool_calls`. El residuo de protocolo viaja verbatim como contenido, que es lo
+// que ya hacían el primer intento de esta misma ruta y el gemelo streaming.
+test('OpenAI non-stream sin herramientas: el reintento nunca produce tool_calls fantasma', async () => {
+  let retries = 0
   const res = createMockResponse()
-  await handleStreamResponse(
+  await handleNonStreamResponse(
     res,
-    Readable.from(frames),
+    Readable.from(['data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n']),
     false,
     false,
-    { messages: [{ role: 'user', content: 'do the task' }] },
-    { has_tools: true, strict_agent_turn: false, tool_choice: 'auto', allowed_tool_names: NATIVE_TOOLS, ...options }
-  )
-  return res
-}
-
-test('chat.js legacy stream: una llamada nativa produce exactamente un header tool_calls[0] con los arguments exactos', async () => {
-  const res = await runLegacyStream([
-    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
-    agentNotExistsFrame('Bash'),
-    AGENT_FINISHED_FRAME,
-    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-  ])
-  assert.doesNotMatch(res.output, /invalid_tool_call/)
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.equal(headers.length, 1, 'un snapshot repetido no puede abrir una segunda llamada')
-  assert.equal(headers[0].index, 0)
-  assert.equal(headers[0].function.name, 'Bash')
-  assert.equal(legacyArgsOf(deltas, 0), NATIVE_BASH_ARGS)
-  assert.match(res.output, /"finish_reason":"tool_calls"/)
-})
-
-test('chat.js legacy stream: la llamada textual y la nativa no pueden ser ambas tool_calls[0]', async () => {
-  const res = await runLegacyStream([
-    agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
-    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
-    agentNotExistsFrame('Bash'),
-    AGENT_FINISHED_FRAME,
-    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-  ])
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.deepEqual(headers.map(call => call.function.name), ['Bash', 'Bash'])
-  assert.deepEqual(headers.map(call => call.index), [0, 1], 'el caller es dueno del unico index monotono')
-  assert.equal(legacyArgsOf(deltas, 0), '{"command":"ls"}')
-  assert.equal(legacyArgsOf(deltas, 1), NATIVE_BASH_ARGS)
-  // El accumulator por si solo sigue numerando desde 0: la unificacion vive en el caller.
-  const twin = createNativeAccumulatorForIndexPin({ allowedToolNames: NATIVE_TOOLS })
-  twin.pushNativeSnapshot({ name: 'Bash', arguments: NATIVE_BASH_ARGS, phase: 'answer' })
-  assert.equal(twin.finalize()[0].index, 0)
-})
-
-test('chat.js legacy stream: el retry de compensacion recrea parser y accumulator — el fragmento de la ronda 1 no reaparece', async () => {
-  let sent = 0
-  const res = await runLegacyStream(
-    [
-      agentAnswerFrame('[TOOL CALL]{"name":"Bash","arg'),
-      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-    ],
+    'qwen-test',
+    { messages: [{ role: 'user', content: 'hola' }] },
     {
-      tool_choice: 'required',
+      has_tools: false,
       sendChatRequest: async () => {
-        sent += 1
+        retries += 1
         return {
           status: true,
           response: Readable.from([
@@ -2184,12 +2207,10 @@ test('chat.js legacy stream: el retry de compensacion recrea parser y accumulato
       }
     }
   )
-  assert.equal(sent, 1, 'tool_choice=required sin llamada dispara la compensacion')
-  assert.doesNotMatch(res.output, /invalid_tool_call/, 'el fragmento de la ronda 1 contamino el parser de la ronda 2')
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.equal(headers.length, 1)
-  assert.equal(headers[0].function.name, 'Bash')
-  assert.equal(legacyArgsOf(deltas, headers[0].index), '{"command":"ls"}')
-  assert.match(res.output, /"finish_reason":"tool_calls"/)
+
+  assert.equal(retries, 1, 'la respuesta vacia dispara el reintento de compensacion')
+  const body = JSON.parse(res.output)
+  assert.equal(body.choices[0].message.tool_calls, undefined,
+    'un cliente que no declaro herramientas no puede recibir tool_calls')
+  assert.notEqual(body.choices[0].finish_reason, 'tool_calls')
 })
