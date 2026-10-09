@@ -1627,8 +1627,6 @@ test('P10: los drops internos no queman el slot que malformed_protocol necesita'
 // Antes cada frame se hacia push() en index 0 con `+=` → JSON invalido → invalid_tool_call
 // → retry quemado. Fixtures byte-fieles a scratchpad/capture-foreign.txt (2026-09-01).
 
-const { createNativeToolCallAccumulator: createNativeAccumulatorForIndexPin } = require('../src/utils/tool-prompt.js')
-
 const agentNativeCallFrame = (name, snapshot) => `data: ${JSON.stringify({
   choices: [{
     delta: {
@@ -2100,96 +2098,3 @@ test('OpenAI non-stream e2e (F2): texto contaminado → content null; prosa limp
   assert.equal(clean.message.content, 'Let me check.', 'la prosa limpia previa a la llamada sigue saliendo')
 })
 
-// ── chat.js legacy (strict_agent_turn: false): feed nativo, index unico, retry limpio ──
-
-const legacyToolCallHeaders = (output) => output
-  .split('\n\n')
-  .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
-  .map(line => JSON.parse(line.slice(6)))
-  .flatMap(chunk => (chunk.choices?.[0]?.delta?.tool_calls || []))
-
-const legacyArgsOf = (deltas, index) => deltas
-  .filter(call => call.index === index && !call.id)
-  .map(call => call.function.arguments)
-  .join('')
-
-const runLegacyStream = async (frames, options = {}) => {
-  const res = createMockResponse()
-  await handleStreamResponse(
-    res,
-    Readable.from(frames),
-    false,
-    false,
-    { messages: [{ role: 'user', content: 'do the task' }] },
-    { has_tools: true, strict_agent_turn: false, tool_choice: 'auto', allowed_tool_names: NATIVE_TOOLS, ...options }
-  )
-  return res
-}
-
-test('chat.js legacy stream: una llamada nativa produce exactamente un header tool_calls[0] con los arguments exactos', async () => {
-  const res = await runLegacyStream([
-    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
-    agentNotExistsFrame('Bash'),
-    AGENT_FINISHED_FRAME,
-    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-  ])
-  assert.doesNotMatch(res.output, /invalid_tool_call/)
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.equal(headers.length, 1, 'un snapshot repetido no puede abrir una segunda llamada')
-  assert.equal(headers[0].index, 0)
-  assert.equal(headers[0].function.name, 'Bash')
-  assert.equal(legacyArgsOf(deltas, 0), NATIVE_BASH_ARGS)
-  assert.match(res.output, /"finish_reason":"tool_calls"/)
-})
-
-test('chat.js legacy stream: la llamada textual y la nativa no pueden ser ambas tool_calls[0]', async () => {
-  const res = await runLegacyStream([
-    agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
-    ...nativeAgentTurn('Bash', NATIVE_BASH_SNAPSHOTS),
-    agentNotExistsFrame('Bash'),
-    AGENT_FINISHED_FRAME,
-    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-  ])
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.deepEqual(headers.map(call => call.function.name), ['Bash', 'Bash'])
-  assert.deepEqual(headers.map(call => call.index), [0, 1], 'el caller es dueno del unico index monotono')
-  assert.equal(legacyArgsOf(deltas, 0), '{"command":"ls"}')
-  assert.equal(legacyArgsOf(deltas, 1), NATIVE_BASH_ARGS)
-  // El accumulator por si solo sigue numerando desde 0: la unificacion vive en el caller.
-  const twin = createNativeAccumulatorForIndexPin({ allowedToolNames: NATIVE_TOOLS })
-  twin.pushNativeSnapshot({ name: 'Bash', arguments: NATIVE_BASH_ARGS, phase: 'answer' })
-  assert.equal(twin.finalize()[0].index, 0)
-})
-
-test('chat.js legacy stream: el retry de compensacion recrea parser y accumulator — el fragmento de la ronda 1 no reaparece', async () => {
-  let sent = 0
-  const res = await runLegacyStream(
-    [
-      agentAnswerFrame('[TOOL CALL]{"name":"Bash","arg'),
-      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-    ],
-    {
-      tool_choice: 'required',
-      sendChatRequest: async () => {
-        sent += 1
-        return {
-          status: true,
-          response: Readable.from([
-            agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
-            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-          ])
-        }
-      }
-    }
-  )
-  assert.equal(sent, 1, 'tool_choice=required sin llamada dispara la compensacion')
-  assert.doesNotMatch(res.output, /invalid_tool_call/, 'el fragmento de la ronda 1 contamino el parser de la ronda 2')
-  const deltas = legacyToolCallHeaders(res.output)
-  const headers = deltas.filter(call => call.id)
-  assert.equal(headers.length, 1)
-  assert.equal(headers[0].function.name, 'Bash')
-  assert.equal(legacyArgsOf(deltas, headers[0].index), '{"command":"ls"}')
-  assert.match(res.output, /"finish_reason":"tool_calls"/)
-})

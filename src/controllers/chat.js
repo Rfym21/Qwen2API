@@ -3,20 +3,15 @@ const { createUsageObject, mergeUpstreamUsage, reportUsage } = require('../utils
 const { sendChatRequest } = require('../utils/request.js')
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js')
 const {
-    createToolCallStreamParser,
-    parseToolCallsFromText,
-    createNativeToolCallAccumulator,
-    looksLikeUnexecutedToolAction,
     stripToolCallResidue,
-    TOOL_CALL_OPEN,
-    TOOL_CALL_CLOSE
+    TOOL_CALL_OPEN
 } = require('../utils/tool-prompt.js')
 const { stripAgentTags } = require('../utils/agent-turn.js')
 const { consumeSSEStream, createUpstreamResponseFilter } = require('../utils/sse.js')
 const accountManager = require('../utils/account.js')
 const config = require('../config/index.js')
 const { logger } = require('../utils/logger')
-const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('../utils/chat-helpers.js')
+const { createUpstreamDeltaNormalizer } = require('../utils/chat-helpers.js')
 const {
     assertNoUpstreamFailure,
     describeUpstreamFailure,
@@ -26,7 +21,7 @@ const {
     unclassifiedFailure,
     openAIErrorShape
 } = require('../utils/upstream-error.js')
-const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
+const { runOpenAIAgentTurn } = require('../utils/openai-agent-runtime.js')
 
 const normalizeOpenAIFinishReason = (upstreamReason, hasToolCalls, upstreamCompleted) => {
     if (hasToolCalls) return 'tool_calls'
@@ -94,41 +89,10 @@ const getImageMarkdownListFromDelta = (delta) => {
     return imageList
 }
 
-/**
- * 判断 tool_choice 是否要求强制调用工具
- * @param {string|Object} toolChoice - OpenAI tool_choice
- * @returns {boolean} 是否需要至少一次工具调用
- */
-const requiresToolCall = (toolChoice) => {
-    if (toolChoice === 'required') return true
-    if (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function' && toolChoice.function?.name) {
-        return true
-    }
-    return false
-}
-
-/**
- * 构建 tool_choice=required 重试时追加的强约束提示
- * @param {string|Object} toolChoice - OpenAI tool_choice
- * @returns {string} 重试提示词
- */
-const buildRequiredRetryHint = (toolChoice) => {
-    if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) {
-        return `You did not call any tool in your previous reply. You MUST now call the tool \`${toolChoice.function.name}\` using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format and nothing else.`
-    }
-    return `You did not call any tool in your previous reply. You MUST now call exactly one tool using the ${TOOL_CALL_OPEN}...${TOOL_CALL_CLOSE} format and nothing else.`
-}
-
 const buildEmptyOutputRetryHint = () => [
     'Your previous reply produced no visible final answer or executable tool call.',
     `Continue the Agent task now. If any action remains, emit the required \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
     'Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning.'
-].join(' ')
-
-const buildMissingToolRetryHint = () => [
-    'Your previous reply described an action but did not execute any tool call.',
-    `Perform that action now by emitting the real \`${TOOL_CALL_OPEN}\` block immediately with no preamble.`,
-    'Do not describe the action again or claim completion without a tool result.'
 ].join(' ')
 
 const appendRetryHintToRequestBody = (requestBody, hint) => {
@@ -626,7 +590,7 @@ const handleOpenAIAgentNonStream = async (
 }
 
 const handleStreamResponse = async (res, response, enable_thinking, enable_web_search, requestBody = null, options = {}) => {
-    if (options.has_tools && options.strict_agent_turn !== false) {
+    if (options.has_tools) {
         return handleOpenAIAgentStream(
             res,
             response,
@@ -646,18 +610,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         let emittedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
-        const hasTools = !!options.has_tools
         const requestSender = options.sendChatRequest || sendChatRequest
-        const toolChoice = options.tool_choice
-        const allowedToolNames = options.allowed_tool_names || []
-        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
-        let toolParser = hasTools ? createToolCallStreamParser({ allowedToolNames }) : null
-        let nativeToolAccumulator = hasTools
-            ? createNativeToolCallAccumulator({ allowedToolNames })
-            : null
-        // 调用方持有唯一的单调 index：文本解析器与原生累积器各自从 0 计数，直接透传会让
-        // 两路都写 tool_calls[0]。
-        let nextToolCallIndex = 0
         let upstreamFinishReason = null
         let upstreamCompleted = false
         let upstreamEventCount = 0
@@ -727,86 +680,6 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
         }
 
         /**
-         * 发送回复正文增量：有工具解析器则先过解析，否则直接写 content
-         * @param {string} text - 回复正文文本
-         */
-        const emitAnswerContent = (text) => {
-            if (!text) return
-            if (toolParser) {
-                const parsed = toolParser.push(text)
-                if (parsed.textDelta) writeContentDelta(parsed.textDelta)
-                if (parsed.completedCalls.length > 0) writeToolCallsDelta(parsed.completedCalls)
-            } else {
-                writeContentDelta(text)
-            }
-        }
-
-        /**
-         * 写一个工具调用增量，按 OpenAI 规范分片：
-         *   1) 头块：包含 index/id/type 与 function.name + 空 arguments
-         *   2) 多个参数块：function.arguments 切片
-         * @param {Array<Object>} calls - 已完成的工具调用列表
-         */
-        const writeToolCallsDelta = (calls) => {
-            if (!calls || calls.length === 0) return
-            const ARG_CHUNK_SIZE = 32
-
-            for (const call of calls) {
-                const index = nextToolCallIndex++
-                const headerDelta = {
-                    "id": `chatcmpl-${message_id}`,
-                    "object": "chat.completion.chunk",
-                    "created": Math.round(new Date().getTime() / 1000),
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "id": call.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": call.function.name,
-                                            "arguments": ""
-                                        }
-                                    }
-                                ]
-                            },
-                            "finish_reason": null
-                        }
-                    ]
-                }
-                res.write(`data: ${JSON.stringify(headerDelta)}\n\n`)
-
-                const argsString = call.function.arguments || ''
-                for (let offset = 0; offset < argsString.length; offset += ARG_CHUNK_SIZE) {
-                    const piece = argsString.slice(offset, offset + ARG_CHUNK_SIZE)
-                    const argDelta = {
-                        "id": `chatcmpl-${message_id}`,
-                        "object": "chat.completion.chunk",
-                        "created": Math.round(new Date().getTime() / 1000),
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": index,
-                                            "function": { "arguments": piece }
-                                        }
-                                    ]
-                                },
-                                "finish_reason": null
-                            }
-                        ]
-                    }
-                    res.write(`data: ${JSON.stringify(argDelta)}\n\n`)
-                }
-            }
-        }
-
-        /**
          * 处理一个 SSE data 段（已剥离 'data: ' 前缀）
          * @param {string} dataContent - 原始 data 段
          */
@@ -829,11 +702,6 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             }
 
             const delta = choice.delta || {}
-            if (nativeToolAccumulator) {
-                // 关闭即判定；发射仍在回合尾部 finalize()（旧路径没有中途排放，drain 为空操作）。
-                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
-            }
-
             if (delta && delta.name === 'web_search') {
                 web_search_info = delta.extra.web_search_info
             }
@@ -889,13 +757,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     }
                 }
 
-                if (toolParser && delta.phase === 'answer') {
-                    const parsed = toolParser.push(content)
-                    if (parsed.textDelta) writeContentDelta(parsed.textDelta)
-                    if (parsed.completedCalls.length > 0) writeToolCallsDelta(parsed.completedCalls)
-                } else {
-                    writeContentDelta(content)
-                }
+                writeContentDelta(content)
                 return
             }
 
@@ -923,7 +785,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
                     content = `${pendingImageContent}${content}`
                 }
             }
-            emitAnswerContent(content)
+            writeContentDelta(content)
         }
 
         /**
@@ -947,52 +809,22 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 
         await pipeUpstream(response)
 
-        // Agent 空回合补偿：只有思考、没有正文/工具调用时自动重试一次。
-        // required 仍使用更强的指定工具提示；两个条件共用一次重试，避免重复请求。
-        const needsRequiredRetry = !!(
-            hasTools && toolParser &&
-            !toolParser.hasEmittedAnyCall() &&
-            !nativeToolAccumulator?.hasAny() &&
-            requiresToolCall(toolChoice)
-        )
+        // 空回合补偿：只有思考、没有正文时自动重试一次。
+        // Con herramientas la peticion no llega aqui — entra por el handler de agente en el
+        // despacho de arriba — asi que este camino ya no tiene parser ni acumulador que
+        // reconstruir por intento.
         const needsEmptyOutputRetry = !!(
             !visibleContent.trim() &&
-            !toolParser?.hasEmittedAnyCall() &&
-            !toolParser?.hasPendingCall() &&
-            !toolParser?.hasParseError() &&
-            !nativeToolAccumulator?.hasAny() &&
             !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
         )
-        const needsMissingToolRetry = !!(
-            hasTools && looksLikeUnexecutedToolAction(visibleContent) &&
-            !toolParser?.hasEmittedAnyCall() && !toolParser?.hasPendingCall() &&
-            !toolParser?.hasParseError() && !nativeToolAccumulator?.hasAny() &&
-            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
-        )
-        if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
-            const retryHint = needsRequiredRetry
-                ? buildRequiredRetryHint(toolChoice)
-                : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
-            const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warn(
-                needsRequiredRetry
-                    ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
-                    : (needsMissingToolRetry
-                        ? 'Agent 首次响应只描述了动作但未调用工具，进行一次补偿重试'
-                        : 'Agent 首次响应没有正文或工具调用，进行一次补偿重试'),
-                'CHAT'
-            )
+        if (needsEmptyOutputRetry) {
+            const retryBody = appendRetryHintToRequestBody(requestBody, buildEmptyOutputRetryHint())
+            logger.warn('Agent 首次响应没有正文或工具调用，进行一次补偿重试', 'CHAT')
             try {
                 // Mismas opciones que la peticion original: sin ellas el reenvio no puede
                 // compactar ni reutilizar el prefijo de historial y quema un parse mas.
                 const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
-                    // 与非流式分支同一条：重试是新的回合，解析器与累积器都重建，第一轮的残片
-                    // 不能漂进第二轮（其余消费者本来就按 attempt 重建）。
-                    if (hasTools) {
-                        toolParser = createToolCallStreamParser({ allowedToolNames })
-                        nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
-                    }
                     upstreamFinishReason = null
                     await pipeUpstream(retryResp.response)
                 }
@@ -1002,34 +834,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
             }
         }
 
-        // flush 工具调用解析器中的残留内容
-        if (toolParser) {
-            const tail = toolParser.flush()
-            if (tail.textDelta) writeContentDelta(tail.textDelta)
-            if (tail.completedCalls.length > 0) writeToolCallsDelta(tail.completedCalls)
-        }
-
-        const nativeToolCalls = nativeToolAccumulator?.hasAny()
-            ? nativeToolAccumulator.finalize()
-            : []
-        if (nativeToolCalls.length > 0) writeToolCallsDelta(nativeToolCalls)
-
-        const hasEmittedToolCalls = !!(
-            nativeToolCalls.length > 0 ||
-            (toolParser && toolParser.hasEmittedAnyCall())
-        )
-        const hasToolProtocolError = !!(
-            !hasEmittedToolCalls &&
-            (requiresToolCall(toolChoice) ||
-                (toolParser && toolParser.hasParseError()) ||
-                (nativeToolAccumulator && nativeToolAccumulator.hasParseError()))
-        )
-        if (hasToolProtocolError) {
-            writeOpenAIStreamError(res, '上游返回了残缺、非法或不存在的工具调用', 'invalid_tool_call')
-            return
-        }
-
-        if (!visibleContent.trim() && !hasEmittedToolCalls &&
+        if (!visibleContent.trim() &&
             !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
             writeOpenAIStreamError(res, '上游重试后仍未返回正文或工具调用', 'upstream_empty_output')
             return
@@ -1037,7 +842,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
 
         const finishReason = normalizeOpenAIFinishReason(
             upstreamFinishReason,
-            hasEmittedToolCalls,
+            false,
             upstreamCompleted
         )
         if (!finishReason) {
@@ -1125,7 +930,7 @@ const handleStreamResponse = async (res, response, enable_thinking, enable_web_s
  * @param {boolean} [options.has_tools] - 是否启用工具调用解析
  */
 const handleNonStreamResponse = async (res, response, enable_thinking, enable_web_search, model, requestBody = null, options = {}) => {
-    if (options.has_tools && options.strict_agent_turn !== false) {
+    if (options.has_tools) {
         return handleOpenAIAgentNonStream(
             res,
             response,
@@ -1147,14 +952,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         let appendedImageMarkdownSet = new Set()
         let pendingImageMarkdownList = []
 
-        const hasTools = !!options.has_tools
         const requestSender = options.sendChatRequest || sendChatRequest
-        const toolChoice = options.tool_choice
-        const allowedToolNames = options.allowed_tool_names || []
-        const isClientToolName = createClientToolNamePredicate(allowedToolNames)
-        let nativeToolAccumulator = hasTools
-            ? createNativeToolCallAccumulator({ allowedToolNames })
-            : null
         let upstreamFinishReason = null
         let upstreamCompleted = false
         let upstreamEventCount = 0
@@ -1202,11 +1000,6 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                 upstreamFinishReason = reportedFinishReason
             }
             const delta = choice.delta || {}
-            if (nativeToolAccumulator) {
-                // 关闭即判定；结算在回合尾部 finalize()（drain 为空操作）。
-                feedNativeFrame(nativeToolAccumulator, delta, reportedFinishReason, { isClientToolName, drain: () => {} })
-            }
-
             if (delta.name === 'web_search') {
                 web_search_info = delta.extra?.web_search_info
             }
@@ -1288,49 +1081,27 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             })
         }
 
-        // 同时支持提示词/XML 工具调用与上游原生 delta.tool_calls。
+        // Sin herramientas no hay protocolo que parsear: lo acumulado es la respuesta tal
+        // cual. Las peticiones con tools entran por el handler de agente, en el despacho de
+        // arriba, y nunca llegan a esta funcion.
         let assistantContent = fullContent
-        let toolCalls = []
-        let toolErrors = []
-        if (hasTools) {
-            const parsed = parseToolCallsFromText(fullContent, { allowedToolNames })
-            const nativeCalls = nativeToolAccumulator?.hasAny() ? nativeToolAccumulator.finalize() : []
-            assistantContent = parsed.cleanedText
-            toolCalls = [...nativeCalls, ...parsed.toolCalls].map((call, index) => ({ ...call, index }))
-            toolErrors = [
-                ...parsed.errors,
-                ...(nativeToolAccumulator?.getErrors() || [])
-            ]
-        }
 
-        // required 未调用，或只有思考没有可见输出时，共用一次补偿重试。
-        const needsRequiredRetry = hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)
-        const needsEmptyOutputRetry = toolCalls.length === 0 && toolErrors.length === 0 && !assistantContent.trim() &&
+        // 空回合补偿：只有思考、没有正文时重试一次。
+        const needsEmptyOutputRetry = !assistantContent.trim() &&
             !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
-        const needsMissingToolRetry = hasTools && toolCalls.length === 0 && toolErrors.length === 0 &&
-            looksLikeUnexecutedToolAction(assistantContent) &&
-            !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)
-        if (needsRequiredRetry || needsEmptyOutputRetry || needsMissingToolRetry) {
-            const retryHint = needsRequiredRetry
-                ? buildRequiredRetryHint(toolChoice)
-                : (needsMissingToolRetry ? buildMissingToolRetryHint() : buildEmptyOutputRetryHint())
-            const retryBody = appendRetryHintToRequestBody(requestBody, retryHint)
-            logger.warn(
-                needsRequiredRetry
-                    ? 'tool_choice=required 首次未触发工具调用，进行一次重试'
-                    : (needsMissingToolRetry
-                        ? 'Agent 首次响应只描述了动作但未调用工具，进行一次补偿重试'
-                        : 'Agent 首次响应没有正文或工具调用，进行一次补偿重试'),
-                'CHAT'
-            )
+        if (needsEmptyOutputRetry) {
+            const retryBody = appendRetryHintToRequestBody(requestBody, buildEmptyOutputRetryHint())
+            logger.warn('Agent 首次响应没有正文或工具调用，进行一次补偿重试', 'CHAT')
             try {
                 const retryResp = await requestSender(retryBody, options.upstreamOptions || {})
                 if (retryResp.status && retryResp.response) {
                     const before = fullContent
-                    nativeToolAccumulator = createNativeToolCallAccumulator({ allowedToolNames })
                     upstreamFinishReason = null
                     await accumulateUpstream(retryResp.response)
                     if (!upstreamCompleted && !upstreamFinishReason) {
+                        // 消息维持原样: 这条 rama solo se alcanza desde el reintento por
+                        // respuesta vacia, pero el texto es el que ya viajaba al cliente y
+                        // este cambio no altera lo observable.
                         return res.status(502).json({
                             error: {
                                 message: '工具调用重试流在结束标记前断开',
@@ -1339,18 +1110,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
                             }
                         })
                     }
-                    const retriedText = fullContent.slice(before.length)
-                    const parsedRetry = parseToolCallsFromText(retriedText, { allowedToolNames })
-                    const nativeRetryCalls = nativeToolAccumulator.hasAny()
-                        ? nativeToolAccumulator.finalize()
-                        : []
-                    toolCalls = [...nativeRetryCalls, ...parsedRetry.toolCalls]
-                        .map((call, index) => ({ ...call, index }))
-                    assistantContent = parsedRetry.cleanedText
-                    toolErrors = [
-                        ...parsedRetry.errors,
-                        ...nativeToolAccumulator.getErrors()
-                    ]
+                    assistantContent = fullContent.slice(before.length)
                 }
             } catch (e) {
                 logger.error('Agent 补偿重试失败', 'CHAT', '', e)
@@ -1358,18 +1118,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
             }
         }
 
-        if (hasTools && toolCalls.length === 0 && (toolErrors.length > 0 || requiresToolCall(toolChoice))) {
-            return res.status(502).json({
-                error: {
-                    message: '上游返回了残缺、非法或不存在的工具调用',
-                    type: 'invalid_tool_call',
-                    code: 'invalid_tool_call',
-                    details: toolErrors
-                }
-            })
-        }
-
-        if (toolCalls.length === 0 && !assistantContent.trim() &&
+        if (!assistantContent.trim() &&
             !['length', 'max_tokens', 'content_filter', 'refusal'].includes(upstreamFinishReason)) {
             return res.status(502).json({
                 error: {
@@ -1382,7 +1131,7 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
 
         const finishReason = normalizeOpenAIFinishReason(
             upstreamFinishReason,
-            toolCalls.length > 0,
+            false,
             upstreamCompleted
         )
         if (!finishReason) {
@@ -1414,9 +1163,6 @@ const handleNonStreamResponse = async (res, response, enable_thinking, enable_we
         const assistantMessage = { role: 'assistant', content: assistantContent || null }
         if (fullReasoning) {
             assistantMessage.reasoning_content = fullReasoning
-        }
-        if (toolCalls.length > 0) {
-            assistantMessage.tool_calls = toolCalls
         }
 
         const bodyTemplate = {
