@@ -407,7 +407,11 @@ const gate = (snapshot, policy) => {
   if (hasTools && !terminal) {
     // intercepted primero: el frame descartado es la evidencia más fuerte.
     if (intercepted.length > 0) return retry(REASONS.INTERCEPTED)
-    if (s.orphanResidue === true) return retry(REASONS.MALFORMED_PROTOCOL)
+    // El cupo de recuperación de protocolo ya gastado no reintenta por residuo — pero el
+    // residuo sigue contando para la supresión de la entrega (ver `suppressForNativeAccept`).
+    // Sólo la superficie que lleva ese cupo lo declara; donde el campo no llega, la regla es
+    // la de siempre.
+    if (s.orphanResidue === true && s.protocolRecoverySpent !== true) return retry(REASONS.MALFORMED_PROTOCOL)
     if (s.thinkEvidence === true) return retry(REASONS.THOUGHT_TOOL_CALL)
     // Solo en una superficie sin vocabulario de control: donde hay envoltorio, la prosa la
     // deciden las reglas del envoltorio (la superficie OpenAI no detecta `missing_tool`).

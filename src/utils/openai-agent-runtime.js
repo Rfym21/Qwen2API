@@ -656,7 +656,13 @@ const buildOpenAIAgentGateSnapshot = (attempt, options = {}, protocolRecoverySpe
   // ya entregado al cliente cuando la puerta juzga.
   callsDelivered: false,
   textChannelCut: attempt.textChannelCut === true,
-  orphanResidue: !protocolRecoverySpent && containsOrphanProtocolResidue(attempt.visibleText),
+  // El residuo se mide SIEMPRE y en crudo: la supresión de la entrega no depende del cupo de
+  // recuperación — el código viejo llamaba containsOrphanProtocolResidue sin condición para
+  // decidir si el texto viajaba. Lo que el cupo gatea es el REINTENTO por malformed_protocol,
+  // y eso viaja como campo aparte para que la puerta no tenga que adivinar cuál de los dos
+  // usos está mirando.
+  orphanResidue: containsOrphanProtocolResidue(attempt.visibleText),
+  protocolRecoverySpent,
   hasTools: options.has_tools !== false,
   requiresToolCall: requiresToolCall(options.tool_choice)
 })

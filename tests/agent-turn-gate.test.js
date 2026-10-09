@@ -159,6 +159,21 @@ const TABLE = [
     { verdict: 'accept', finishReason: FINISH_STOP }],
   ['controlKind final sin texto: empty', { controlKind: 'final', visibleText: '' }, OPENAI,
     { verdict: 'retry', reason: REASONS.EMPTY }],
+  // El cupo de recuperación gastado apaga el REINTENTO por residuo, no la supresión de la
+  // entrega: el código viejo medía el residuo sin condición para decidir si el texto viajaba
+  // y gateaba sólo el reintento. Sin estas dos filas, apagar el campo entero —que es lo que
+  // la revisión de spec encontró— volvía a colar bytes de protocolo al cliente.
+  // Lo que se afirma acá es la RAZÓN, no el veredicto: con el cupo gastado la ronda cae a
+  // `bare` (sin envoltorio) en vez de reintentarse por `malformed_protocol`, que es lo que
+  // hacía el código viejo al saltarse el chequeo.
+  ['residuo con el cupo gastado: no reintenta por malformed_protocol',
+    { orphanResidue: true, protocolRecoverySpent: true }, OPENAI,
+    { verdict: 'retry', reason: REASONS.BARE }],
+  ['residuo con el cupo gastado sobre una aceptación nativa: el texto igual se suprime',
+    { orphanResidue: true, protocolRecoverySpent: true, nativeToolCalls: [call] }, OPENAI,
+    { verdict: 'accept', finishReason: FINISH_TOOL_CALLS, suppressVisibleText: true }],
+  ['residuo sin cupo gastado: sí reintenta', { orphanResidue: true }, OPENAI,
+    { verdict: 'retry', reason: REASONS.MALFORMED_PROTOCOL }],
   ['controlKind blocked con texto: también es una respuesta final',
     { controlKind: 'blocked' }, OPENAI, { verdict: 'accept', finishReason: FINISH_STOP }],
   ['controlKind blocked sin texto: empty, igual que final',
