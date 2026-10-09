@@ -213,6 +213,31 @@ const retryHintFor = (reason, snapshot, context = {}) => {
   return hint
 }
 
+// ---------------------------------------------------------------------------
+// Mensajes de agotamiento: el segundo mapa indexado por el mismo vocabulario
+// ---------------------------------------------------------------------------
+
+/**
+ * Qué se le dice al cliente cuando el presupuesto de intentos se agota y el último intento
+ * seguía rechazado. Vivía en `openai-agent-runtime.js` con la clave `invalid_tool_call` —la
+ * misma condición que este vocabulario parte en `tool_error` (errores de herramienta) y
+ * `prose_with_tools` (prosa junto a llamadas)—, y las dos mitades conservan el texto de la
+ * clave vieja: el renombre es del vocabulario, no del mensaje que ya viajaba al cliente.
+ *
+ * El mapa NO lleva el status ni el código de cable: estos son vocabulario de cada superficie
+ * (ADR 0001) y los pone el runtime que consume el mapa.
+ */
+const EXHAUSTED_TURN_MESSAGES = Object.freeze({
+  [REASONS.EMPTY]: '上游连续只返回思考内容，没有给出可执行工具调用或最终答复',
+  [REASONS.BARE]: '上游连续返回未声明完成状态的文本，已阻止 Agent 将未完成任务误判为结束',
+  [REASONS.INVALID_CONTROL]: '上游连续返回无效的 Agent 完成标记',
+  [REASONS.TOOL_ERROR]: '上游连续返回残缺、非法或不存在的工具调用',
+  [REASONS.PROSE_WITH_TOOLS]: '上游连续返回残缺、非法或不存在的工具调用',
+  [REASONS.REQUIRED_TOOL]: '上游连续违反 tool_choice，未返回要求的工具调用',
+  [REASONS.INTERCEPTED]: '上游的工具调用被平台拦截，重试后仍未恢复',
+  [REASONS.MALFORMED_PROTOCOL]: '上游持续返回残缺的工具调用协议，未能恢复为可执行调用'
+})
+
 /**
  * Añade un hint de reintento al último mensaje del cuerpo interno. Una sola implementación
  * para las tres superficies: `header` es lo único que cambia entre ellas (el Anthropic manda
@@ -362,6 +387,12 @@ const gate = (snapshot, policy) => {
 
   if (toolErrorVeto) return retry(REASONS.TOOL_ERROR)
 
+  // Terminaciones que el upstream ya explicó: la ronda se entrega como está, reintentar no
+  // las arregla. Va después de los vetos —con finish terminal el error del canal de texto
+  // todavía veta, y `required_tool` también— y antes de la rama de llamadas, para que una
+  // ronda truncada con llamadas se entregue en vez de reintentarse por su prosa.
+  if (terminal) return accept(FINISH_STOP)
+
   // Llamadas admisibles: la superficie OpenAI veta la prosa que las acompaña; las Anthropic
   // aceptan — el cliente recibe bloques tool_use discretos y puede actuar con lo que llegó.
   if (calls.length > 0) {
@@ -411,6 +442,7 @@ module.exports = {
   FINISH_TOOL_CALLS,
   resolveAttemptBudget,
   RETRY_HINT_BUILDERS,
+  EXHAUSTED_TURN_MESSAGES,
   retryHintFor,
   appendRetryHint,
   buildRequiredToolRetryHint,

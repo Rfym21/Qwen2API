@@ -469,7 +469,7 @@ const SCENARIOS = [
     id: 'required_tool',
     group: 'retry',
     title: 'tool_choice requires a call, the round has none',
-    targets: { 'openai.stream': ['required_tool'], 'openai.nonstream': ['required_tool'], 'anthropic.stream': ['required'], 'anthropic.nonstream': ['required'] },
+    targets: { 'openai.stream': ['required_tool'], 'openai.nonstream': ['required_tool'], 'anthropic.stream': ['required_tool'], 'anthropic.nonstream': ['required_tool'] },
     applicable: { openai: true, anthropic: true },
     toolChoice: 'required',
     // Ronda sin texto visible a propósito: con una respuesta final envuelta, el texto ya
@@ -483,7 +483,7 @@ const SCENARIOS = [
     id: 'tool_error',
     group: 'retry',
     title: 'a malformed tool call',
-    targets: { 'openai.stream': ['invalid_tool_call'], 'openai.nonstream': ['invalid_tool_call'], 'anthropic.stream': ['tool_error'], 'anthropic.nonstream': ['tool_error'] },
+    targets: { 'openai.stream': ['tool_error'], 'openai.nonstream': ['tool_error'], 'anthropic.stream': ['tool_error'], 'anthropic.nonstream': ['tool_error'] },
     applicable: { openai: true, anthropic: true },
     // Tercera herramienta declarada, nombre inexistente: error DURO del parser (unknown_tool),
     // el mismo que distingue "el modelo inventó un nombre" de "el protocolo se rompió".
@@ -495,7 +495,7 @@ const SCENARIOS = [
     title: 'prose alongside a parsed tool call',
     // Celda de asimetría deliberada (policy `proseWithTools`): OpenAI reintenta, Anthropic
     // acepta. En Anthropic la fila SÍ aplica — su expectativa es "aceptar y entregar".
-    targets: { 'openai.stream': ['invalid_tool_call:prose_with_tools'], 'openai.nonstream': ['invalid_tool_call:prose_with_tools'], 'anthropic.stream': [], 'anthropic.nonstream': [] },
+    targets: { 'openai.stream': ['prose_with_tools'], 'openai.nonstream': ['prose_with_tools'], 'anthropic.stream': [], 'anthropic.nonstream': [] },
     applicable: { openai: true, anthropic: true },
     rounds: [[answer(`Sure, let me look at that file.\n\n${READ_CALL}`), STOP], RECOVERY_ROUND, RECOVERY_ROUND]
   },
@@ -567,7 +567,7 @@ const SCENARIOS = [
     // Asimetría deliberada (policy `toolErrorsVetoWithCalls`): OpenAI reintenta el conjunto
     // (una llamada parcial es una acción silenciosamente equivocada), Anthropic entrega la
     // llamada buena (bloques discretos: el cliente puede actuar con lo que llegó).
-    targets: { 'openai.stream': ['invalid_tool_call:tool_errors'], 'openai.nonstream': ['invalid_tool_call:tool_errors'], 'anthropic.stream': [], 'anthropic.nonstream': [] },
+    targets: { 'openai.stream': ['tool_error'], 'openai.nonstream': ['tool_error'], 'anthropic.stream': [], 'anthropic.nonstream': [] },
     applicable: { openai: true, anthropic: true },
     rounds: [[answer(`${READ_CALL}\n\n${BROKEN_SIBLING}`), STOP], RECOVERY_ROUND, RECOVERY_ROUND]
   },
@@ -577,7 +577,7 @@ const SCENARIOS = [
     title: 'a tool error together with an unsatisfied required',
     // Asimetría deliberada (policy `toolErrorsBeforeRequired`): OpenAI veta por error de
     // herramienta antes de mirar `required`; Anthropic mira `required` primero.
-    targets: { 'openai.stream': ['invalid_tool_call'], 'openai.nonstream': ['invalid_tool_call'], 'anthropic.stream': ['required'], 'anthropic.nonstream': ['required'] },
+    targets: { 'openai.stream': ['tool_error'], 'openai.nonstream': ['tool_error'], 'anthropic.stream': ['required_tool'], 'anthropic.nonstream': ['required_tool'] },
     applicable: { openai: true, anthropic: true },
     toolChoice: 'required',
     rounds: [[answer(BROKEN_SIBLING), STOP], RECOVERY_ROUND, RECOVERY_ROUND]
