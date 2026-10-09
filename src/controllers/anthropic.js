@@ -2,6 +2,7 @@ const { isJson, generateUUID } = require('../utils/tools.js');
 const { createUsageObject, mergeUpstreamUsage, reportUsage } = require('../utils/precise-tokenizer.js');
 const { sendChatRequest, invalidateContextPrefix } = require('../utils/request.js');
 const { buildContextPrefixKey } = require('../utils/context-prefix-cache.js');
+const { resolveAttemptBudget } = require('../utils/agent-turn-gate.js');
 const accountManager = require('../utils/account.js');
 const {
   isChatType, isThinkingEnabled, parserModel, parserMessages, isThinkPhase, extractMediaToFiles,
@@ -1776,7 +1777,7 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   };
 
   const config = require('../config/index.js');
-  const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
+  const maxAttempts = resolveAttemptBudget(null, config.agentTurnMaxAttempts);
 
   let currentUpstream = upstream;
   // Vueltas en las que el modelo llego a responder. Un failover no cuenta: el modelo aun no
@@ -2469,7 +2470,7 @@ const handleAnthropicNonStream = async (res, ctx, upstream) => {
   };
 
   const config = require('../config/index.js');
-  const maxAttempts = Math.max(1, Number(config.agentTurnMaxAttempts) || 1);
+  const maxAttempts = resolveAttemptBudget(null, config.agentTurnMaxAttempts);
   let attemptsMade = 1;
   let streamBrokeOnRetry = false;
   let protocolRecoveryRetried = false;

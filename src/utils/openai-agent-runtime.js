@@ -26,6 +26,7 @@ const {
   createTextChannelRunawayGuard
 } = require('./agent-turn.js')
 const config = require('../config/index.js')
+const { resolveAttemptBudget } = require('./agent-turn-gate.js')
 const { logger } = require('./logger.js')
 
 const NON_RETRYABLE_FINISH_REASONS = new Set([
@@ -738,10 +739,7 @@ const exhaustedError = (attempt, retryReason) => {
  */
 const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
   const requestSender = options.sendChatRequest
-  const maxAttempts = Math.min(
-    6,
-    Math.max(2, Number(options.agent_turn_max_attempts) || config.agentTurnMaxAttempts)
-  )
+  const maxAttempts = resolveAttemptBudget(options.agent_turn_max_attempts, config.agentTurnMaxAttempts)
   let currentResponse = initialResponse
   let lastAttempt = null
   let lastEvaluation = null
