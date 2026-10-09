@@ -77,7 +77,7 @@ const runOpenAI = async (budget) => {
   return sender.sends + 1 // la primera generación no pasa por el sender
 }
 
-const runAnthropic = async () => {
+const runAnthropic = async (overrides = {}) => {
   const sender = countingSender()
   await handleAnthropicNonStream(
     createStreamResponse(),
@@ -90,7 +90,8 @@ const runAnthropic = async () => {
       requestBody: { messages: [{ role: 'user', content: 'do the task' }] },
       sendRequest: sender,
       historyToolCalls: [],
-      upstreamOptions: {}
+      upstreamOptions: {},
+      ...overrides
     },
     proseRound()
   )
@@ -109,4 +110,12 @@ test('presupuesto 2 significa dos intentos: un reintento y se acabó', async () 
 test('la superficie Anthropic honra el mismo presupuesto de configuración', async () => {
   assert.equal(await runAnthropic(), 2,
     'config en 2 = dos generaciones, la misma cuenta que en la superficie OpenAI')
+})
+
+test('la superficie Anthropic no tiene override por petición', async () => {
+  // No existe ese canal: el ctx no lo lee y el presupuesto sale de config. Se pasa uno
+  // igual para fijar que NO se empieza a honrar algo que nadie definió — el día que exista
+  // un override de Anthropic, este test es el que obliga a decidirlo en vez de heredarlo.
+  assert.equal(await runAnthropic({ agent_turn_max_attempts: 1 }), 2,
+    'un override colado en el ctx se ignora: sigue mandando config')
 })
