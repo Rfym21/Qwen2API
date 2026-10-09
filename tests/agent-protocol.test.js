@@ -2098,3 +2098,48 @@ test('OpenAI non-stream e2e (F2): texto contaminado → content null; prosa limp
   assert.equal(clean.message.content, 'Let me check.', 'la prosa limpia previa a la llamada sigue saliendo')
 })
 
+
+// Ticket 01 de `.scratch/agent-turn-gate/`: al borrar el camino de herramientas
+// inalcanzable quedó a la vista un comportamiento que NO estaba gateado por
+// `hasTools`. El reintento por respuesta vacía del loop no-stream reconstruía el
+// acumulador nativo y volvía a parsear el texto del reintento — sin condición de
+// herramientas —, así que una petición SIN herramientas cuyo primer intento salía
+// vacío y cuyo reintento devolvía un bloque `[TOOL CALL]` terminaba entregando
+// `tool_calls` (y `finish_reason: "tool_calls"`) a un cliente que nunca declaró
+// herramienta alguna. El propio hint del reintento pide ese bloque, así que el
+// lazo se cerraba solo.
+//
+// Este test fija la conducta nueva: una petición sin herramientas nunca recibe
+// `tool_calls`. El residuo de protocolo viaja verbatim como contenido, que es lo
+// que ya hacían el primer intento de esta misma ruta y el gemelo streaming.
+test('OpenAI non-stream sin herramientas: el reintento nunca produce tool_calls fantasma', async () => {
+  let retries = 0
+  const res = createMockResponse()
+  await handleNonStreamResponse(
+    res,
+    Readable.from(['data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n']),
+    false,
+    false,
+    'qwen-test',
+    { messages: [{ role: 'user', content: 'hola' }] },
+    {
+      has_tools: false,
+      sendChatRequest: async () => {
+        retries += 1
+        return {
+          status: true,
+          response: Readable.from([
+            agentAnswerFrame('[TOOL CALL]{"name":"Bash","arguments":{"command":"ls"}}[END TOOL CALL]'),
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+          ])
+        }
+      }
+    }
+  )
+
+  assert.equal(retries, 1, 'la respuesta vacia dispara el reintento de compensacion')
+  const body = JSON.parse(res.output)
+  assert.equal(body.choices[0].message.tool_calls, undefined,
+    'un cliente que no declaro herramientas no puede recibir tool_calls')
+  assert.notEqual(body.choices[0].finish_reason, 'tool_calls')
+})
