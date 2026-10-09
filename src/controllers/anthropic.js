@@ -1668,8 +1668,8 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
   ];
 
   // El juicio del turno y el armado del hint ya no viven acá: la decisión es
-  // `gate(snapshot, ANTHROPIC_GATE_POLICY)` y el texto es `gateRetryHintFor(reason, snapshot,
-  // ...)`, ambos en utils/agent-turn-gate.js (ticket 05). El loop conserva lo suyo: el
+  // `gate(snapshot, ANTHROPIC_GATE_POLICY)` y el texto es `retryHintFor(reason, snapshot,
+  // ...)`, ambos en utils/agent-turn-gate.js (tickets 05 y 06). El loop conserva lo suyo: el
   // presupuesto de intentos, la bandera mutable del cupo de recuperación de protocolo y la
   // maquinaria de entrega. El snapshot se arma en el punto de liquidación, después del flush
   // — flush 会结算挂起的工具调用，此后 hasPendingCall() 恒为假.

@@ -668,10 +668,13 @@ const buildOpenAIAgentGateSnapshot = (attempt, options = {}, protocolRecoverySpe
  * agent-turn.js, que es el texto que la puerta da a ese token. El resto (bare, invalid_control,
  * intercepted, malformed_protocol) sale del mapa compartido, byte a byte como siempre.
  */
+// Sólo las dos razones cuyo TEXTO difiere del que sirve la puerta: `empty` y `required_tool`
+// tienen redacción propia en esta superficie. `prose_with_tools` no está acá porque el
+// constructor de la puerta ya devuelve exactamente este texto — tenerlo en los dos lados era
+// un segundo hogar que podía derivar sin que nada lo notara.
 const OPENAI_LOCAL_HINTS = Object.freeze({
   [REASONS.EMPTY]: () => buildAgentRetryHint('empty'),
-  [REASONS.REQUIRED_TOOL]: () => buildAgentRetryHint('required_tool'),
-  [REASONS.PROSE_WITH_TOOLS]: () => buildAgentRetryHint('invalid_tool_call')
+  [REASONS.REQUIRED_TOOL]: () => buildAgentRetryHint('required_tool')
 })
 
 /**
@@ -690,9 +693,10 @@ const openAIRetryHint = (reason, snapshot, options = {}) => {
   })
 }
 
-/** La razón de cierre que viaja al cliente. La puerta acepta con `stop`/`tool_calls` y no
- * conoce los tokens de truncamiento: una ronda aceptada por finish terminal conserva el suyo
- * (max_tokens se normaliza a length, como siempre). */
+/** La razón de cierre que viaja al cliente. La puerta acepta con `stop`/`tool_calls`: conoce
+ * los tokens de truncamiento (los importa para decidir) pero no los emite, así que una ronda
+ * aceptada por finish terminal conserva el suyo (max_tokens se normaliza a length, como
+ * siempre). */
 const wireFinishReason = (attempt, evaluation) =>
   TERMINAL_FINISH_REASONS.has(attempt.upstreamFinishReason)
     ? (attempt.upstreamFinishReason === 'max_tokens' ? 'length' : attempt.upstreamFinishReason)
