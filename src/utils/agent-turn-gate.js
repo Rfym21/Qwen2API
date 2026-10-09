@@ -11,8 +11,10 @@
  * "intentos agotados" es propiedad del loop, y los códigos terminales son vocabulario de
  * cada superficie (ADR 0001).
  *
- * Es una hoja: no lee configuración, no toca red, no loguea efectos. Por eso es una función
- * pura y por eso la tabla de verdad del seam es barata.
+ * No lee configuración, no toca red y no loguea: `gate` es una función pura de sus dos
+ * argumentos, y por eso la tabla de verdad del seam es barata. Hoja en dependencias tampoco
+ * lo es del todo — importa `tool-prompt.js`, que arrastra el logger, que lee entorno al
+ * importarse; la pureza que importa es la de `gate`, no la del grafo de imports.
  */
 
 const {

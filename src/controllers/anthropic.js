@@ -1016,7 +1016,8 @@ const appendRetryHint = (body, hint) => gateAppendRetryHint(body, hint, { header
  *   toolErrorsBeforeRequired — `required` manda: si el tool_choice exigía una llamada, el
  *     rechazo es required_tool (su hint nombra el tool_choice), no tool_error.
  *   toolErrorsVetoWithCalls — un error de herramienta no veta una llamada que ya se emitió.
- * Los dos loop Anthropic (stream y no-stream) comparten estos cuatro valores.
+ * Los dos loops Anthropic comparten estos valores por comportamiento, pero hoy la constante
+ * la lee sólo el streaming (ticket 05); el no-stream la adopta en el ticket 06.
  */
 const ANTHROPIC_GATE_POLICY = Object.freeze({
   proseWithTools: true,
@@ -1847,9 +1848,9 @@ const handleAnthropicStream = async (res, ctx, upstream) => {
       hasTools,
       requiresToolCall: requiresToolCall(toolChoice)
     };
-    const verdict = gate(gateSnapshot, ANTHROPIC_GATE_POLICY);
-    if (verdict.verdict === 'accept') break;
-    const retryReason = verdict.reason;
+    const decision = gate(gateSnapshot, ANTHROPIC_GATE_POLICY);
+    if (decision.verdict === 'accept') break;
+    const retryReason = decision.reason;
     if (attemptsMade >= maxAttempts) {
       // 以前这里静默 break：生产环境分不清"回合被接受"和"次数用尽"。措辞保持中立：
       // 接下来可能按原样交付，也可能收敛成 invalid_tool_call_error / api_error（
