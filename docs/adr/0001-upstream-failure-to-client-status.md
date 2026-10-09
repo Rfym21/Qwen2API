@@ -39,8 +39,24 @@ on the OpenAI one, transport interruption → `503`, unclassified → `502`.
 - `Retry-After` is never invented. A client that respects an invented wait
   waits for a wall that is not there.
 
+## Where the verdict travels
+
+Two failure channels carry it. The **throw** path already had it (chat
+challenge, context attachment, quota-in-a-payload). The **return** path —
+`{status: false, response: null}` — now carries it too, on every exit, and the
+three callers translate it. A second return-path exit exists deeper in the agent
+runtime: when a rejected turn's correction resend cannot even start, its failure
+verdict is propagated rather than flattened into an opaque 502. The runtime's
+*account failover* exit was listed in the review as a third such site; it is
+unreachable (the switch is only entered for quota or chat challenge, both of
+which rethrow the original error there), so it was left alone.
+
+`Retry-After` comes from the upstream twice over: `data.num` hours inside a quota
+payload, or a `Retry-After` header (seconds) on an HTTP 429. Neither is invented.
+
 ## Unproven
 
 Quota has been observed live arriving as an upstream error payload, which the
 throw path already classifies. That it can also arrive as a non-200 HTTP
-status is asserted, not measured; the mapping above covers it either way.
+status is asserted, not measured; the mapping above covers it either way. The
+same goes for a `Retry-After` header on that channel — handled, never seen.

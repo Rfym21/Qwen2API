@@ -98,6 +98,13 @@ test('un upstream sobrecargado sale 503 upstream_unavailable', async () => {
   assert.equal(res.headers['Retry-After'], '10')
 })
 
+test('un fallo sin veredicto (dobles viejos) sale 502 upstream_error, no revienta', async () => {
+  const res = await drive({ status: false, response: null })
+
+  assert.equal(res.statusCode, 502)
+  assert.equal(res.body.error.code, 'upstream_error')
+})
+
 test('la razon concreta del modulo de request sigue llegando al cliente', async () => {
   const res = await drive({ ...failure({ status: 503 }), message: 'no hay cuentas configuradas' })
 

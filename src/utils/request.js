@@ -875,7 +875,9 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             )
             accountManager.recordAccountFailure(currentAccount.email, lastError.code)
         } else {
-            // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown
+            // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown。
+            // Excepción deliberada: el 429, que cae en la rama de cuota agotada de arriba
+            // (ADR docs/adr/0001) y sí enfría la cuenta.
             const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)

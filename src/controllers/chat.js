@@ -24,7 +24,7 @@ const {
     isWafChallengeError,
     noteRateLimitedAccount,
     unclassifiedFailure,
-    RATE_LIMIT_OPENAI_TYPE
+    openAIErrorShape
 } = require('../utils/upstream-error.js')
 const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
 
@@ -226,34 +226,13 @@ const writeOpenAIHttpError = (res, error = {}) => {
  */
 const upstreamErrorShape = (error, fallbackMessage, fallbackCode = 'upstream_error') => {
     // 529 es un status de Anthropic; en el cable OpenAI el adjunto caido es 503.
+    // La traduccion al cable vive en utils/upstream-error.js#openAIErrorShape, junto a los dos
+    // vocabularios: la comparten esta via, la de retorno y el runtime de agente.
     return openAIErrorShape(
         describeUpstreamFailure(error, 502, 503),
         error?.publicMessage || fallbackMessage,
         error?.code || fallbackCode
     )
-}
-
-/**
- * Un veredicto de upstream en la forma de error de cable OpenAI. Es la unica traduccion: la
- * usan la via de excepcion (upstreamErrorShape) y la via de retorno del modulo de request,
- * que antes contestaba un 500 mudo para todo.
- * @param {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null}} failure
- * @param {string} message - Mensaje para el cliente
- * @param {string} [fallbackCode] - `code` cuando el veredicto no trae uno propio
- * @returns {{status: number, message: string, code: string, type?: string, retry_after?: number}}
- */
-const openAIErrorShape = (failure, message, fallbackCode = 'upstream_error') => {
-    const shape = {
-        status: failure.status,
-        message,
-        code: failure.rateLimited
-            ? RATE_LIMIT_OPENAI_TYPE
-            : (failure.overloaded ? 'upstream_unavailable' : fallbackCode)
-    }
-    if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE
-    else if (failure.overloaded) shape.type = 'server_error'
-    if (failure.retryAfter !== null) shape.retry_after = failure.retryAfter
-    return shape
 }
 
 const runWithProcessingHeartbeat = async (res, work, intervalMs = 15000) => {
@@ -1557,13 +1536,11 @@ const handleChatCompletion = async (req, res) => {
         // anthropic.js). Cualquier otra cosa conserva el 500 de siempre.
         const failure = describeUpstreamFailure(error, 500, 503)
         if (failure.overloaded) {
-            return writeOpenAIHttpError(res, {
-                status: failure.status,
-                message: error.publicMessage || 'Upstream context attachment unavailable; retry',
-                type: 'server_error',
-                code: 'upstream_unavailable',
-                retry_after: failure.retryAfter
-            })
+            // Misma forma que produce el traductor compartido para "upstream sobrecargado".
+            return writeOpenAIHttpError(res, openAIErrorShape(
+                failure,
+                error.publicMessage || 'Upstream context attachment unavailable; retry'
+            ))
         }
         res.status(500)
             .json({

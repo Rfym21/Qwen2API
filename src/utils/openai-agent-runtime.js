@@ -9,7 +9,10 @@ const {
 const { consumeSSEStream, createUpstreamResponseFilter } = require('./sse.js')
 const { mergeUpstreamUsage } = require('./precise-tokenizer.js')
 const { createUpstreamDeltaNormalizer, createClientToolNamePredicate } = require('./chat-helpers.js')
-const { assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError } = require('./upstream-error.js')
+const {
+  assertNoUpstreamFailure, UpstreamResponseError, isRateLimitError, isWafChallengeError,
+  openAIErrorShape, unclassifiedFailure
+} = require('./upstream-error.js')
 const { recordFailedAccount, createAccountReplayBody } = require('./agent-account-failover.js')
 const {
   parseAgentControlText,
@@ -943,13 +946,16 @@ const runOpenAIAgentTurn = async (initialResponse, options = {}) => {
       agentRetry: true
     })
     if (!retryResponse?.status || !retryResponse.response) {
+      // El reenvio de correccion tampoco arranco: su fallo dice por que (cuota 429, transporte
+      // 503, opaco 502) en vez de aplanarse en un 502 mudo. Sin veredicto se conserva el 502
+      // y el code de siempre.
       return {
         ok: false,
-        error: {
-          status: 502,
-          message: retryResponse?.message || 'Agent 回合纠正请求失败',
-          code: 'upstream_retry_failed'
-        },
+        error: openAIErrorShape(
+          retryResponse?.failure || unclassifiedFailure(502),
+          retryResponse?.message || 'Agent 回合纠正请求失败',
+          'upstream_retry_failed'
+        ),
         attempt,
         attempts: attemptNumber
       }

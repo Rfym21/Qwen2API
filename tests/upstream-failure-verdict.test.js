@@ -70,6 +70,18 @@ test('un 429 del upstream sale clasificado como cuota, no como un fallo mudo', a
   assert.equal(result.failure.retryAfter, null)
 })
 
+test('un 429 con Retry-After del upstream no pierde la espera', async () => {
+  const withHeader = () => {
+    const error = httpFailure(429)
+    error.response.headers = { 'retry-after': '120' }
+    return error
+  }
+  const result = await withPost(async () => { throw withHeader() }, () => send())
+
+  assert.equal(result.failure.status, 429)
+  assert.equal(result.failure.retryAfter, 120, 'la espera que el upstream SI mando viaja')
+})
+
 test('un no-200 sin causa clasificable sale 502, no 500', async () => {
   const result = await withPost(async () => { throw httpFailure(500) }, () => send())
 

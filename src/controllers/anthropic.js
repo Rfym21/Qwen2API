@@ -133,10 +133,12 @@ const toAnthropicToolUseId = (id) => {
  * @param {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null}} failure
  * @param {string} message - Mensaje para el cliente
  */
+const anthropicErrorType = (failure) => failure.rateLimited
+  ? RATE_LIMIT_ANTHROPIC_TYPE
+  : (failure.overloaded ? 'overloaded_error' : 'api_error');
+
 const writeAnthropicHttpFailure = (res, failure, message) => {
-  const errorType = failure.rateLimited
-    ? RATE_LIMIT_ANTHROPIC_TYPE
-    : (failure.overloaded ? 'overloaded_error' : 'api_error');
+  const errorType = anthropicErrorType(failure);
   // Retry-After solo con una espera que mando el upstream de verdad.
   if (failure.retryAfter !== null) res.set({ 'Retry-After': String(failure.retryAfter) });
   return res.status(failure.status).json({
@@ -2834,9 +2836,7 @@ const handleAnthropicMessages = async (req, res) => {
     // 500 por defecto: lo que llega aqui son excepciones nuestras o challenges ya
     // clasificados, no un no-200 opaco del upstream (ese sale por la via de retorno).
     const failure = describeUpstreamFailure(error, 500);
-    const errorType = failure.rateLimited
-      ? RATE_LIMIT_ANTHROPIC_TYPE
-      : (failure.overloaded ? 'overloaded_error' : 'api_error');
+    const errorType = anthropicErrorType(failure);
     // La otra mitad: sin esto el cliente deja de reintentar pero el servidor sigue
     // devolviendo la misma cuenta agotada al sorteo, y la quema en cada vuelta.
     // Si el failover a mitad de stream ya paso la cuenta a cooldown (recordFailedAccount)
