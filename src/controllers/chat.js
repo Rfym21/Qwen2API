@@ -23,6 +23,7 @@ const {
     isRateLimitError,
     isWafChallengeError,
     noteRateLimitedAccount,
+    unclassifiedFailure,
     RATE_LIMIT_OPENAI_TYPE
 } = require('../utils/upstream-error.js')
 const { runOpenAIAgentTurn, feedNativeFrame } = require('../utils/openai-agent-runtime.js')
@@ -225,13 +226,29 @@ const writeOpenAIHttpError = (res, error = {}) => {
  */
 const upstreamErrorShape = (error, fallbackMessage, fallbackCode = 'upstream_error') => {
     // 529 es un status de Anthropic; en el cable OpenAI el adjunto caido es 503.
-    const failure = describeUpstreamFailure(error, 502, 503)
+    return openAIErrorShape(
+        describeUpstreamFailure(error, 502, 503),
+        error?.publicMessage || fallbackMessage,
+        error?.code || fallbackCode
+    )
+}
+
+/**
+ * Un veredicto de upstream en la forma de error de cable OpenAI. Es la unica traduccion: la
+ * usan la via de excepcion (upstreamErrorShape) y la via de retorno del modulo de request,
+ * que antes contestaba un 500 mudo para todo.
+ * @param {{rateLimited: boolean, overloaded: boolean, status: number, retryAfter: number|null}} failure
+ * @param {string} message - Mensaje para el cliente
+ * @param {string} [fallbackCode] - `code` cuando el veredicto no trae uno propio
+ * @returns {{status: number, message: string, code: string, type?: string, retry_after?: number}}
+ */
+const openAIErrorShape = (failure, message, fallbackCode = 'upstream_error') => {
     const shape = {
         status: failure.status,
-        message: error?.publicMessage || fallbackMessage,
+        message,
         code: failure.rateLimited
             ? RATE_LIMIT_OPENAI_TYPE
-            : (failure.overloaded ? 'upstream_unavailable' : (error?.code || fallbackCode))
+            : (failure.overloaded ? 'upstream_unavailable' : fallbackCode)
     }
     if (failure.rateLimited) shape.type = RATE_LIMIT_OPENAI_TYPE
     else if (failure.overloaded) shape.type = 'server_error'
@@ -1477,11 +1494,13 @@ const handleChatCompletion = async (req, res) => {
         const response_data = await sendChatRequest(req.body, upstreamOptions)
 
         if (!response_data.status || !response_data.response) {
-            res.status(500)
-                .json({
-                    error: response_data.message || "Request failed"
-                })
-            return
+            // El fallo dice por que fallo: cuota 429 `insufficient_quota`, sobrecarga o
+            // transporte 503, sin clasificar 502. Antes: un 500 mudo para todo, con el que
+            // un cliente agentico no podia distinguir "vuelve luego" de "servidor roto".
+            return writeOpenAIHttpError(res, openAIErrorShape(
+                response_data.failure || unclassifiedFailure(502),
+                response_data.message || 'Upstream did not produce a usable response'
+            ))
         }
 
     // Aviso al cliente cuando el contexto se recortó en silencio. El fallback por fallo
