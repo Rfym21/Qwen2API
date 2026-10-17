@@ -728,7 +728,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         }
     })
 
-    // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.2.81）
+    // 构建请求配置（与通义千问 React Web 客户端完全一致，对齐 FE 0.3.19）
     const requestConfig = {
         headers,
         responseType: 'stream', // Always use streaming (upstream doesn't support stream=false)
@@ -749,7 +749,7 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
     requestConfig.headers.referer = `${chatBaseUrl}/c/${chat_id}`
     const url = `${chatBaseUrl}/api/v2/chat/completions?chat_id=` + chat_id
-    // 对齐网页双写 chatId/parentId（FE 0.2.81）
+    // 对齐网页双写 chatId/parentId（FE 0.3.19）
     const parentId = options.parentId ?? body.parentId ?? body.parent_id ?? null
     const messages = Array.isArray(body.messages)
         ? body.messages.map(message => ({
@@ -906,7 +906,7 @@ const generateChatID = async (currentToken, model, account, chatType = 't2t') =>
 
         applyProxyToAxiosConfig(requestConfig, account);
 
-        // 对齐 chat.qwen.ai FE 0.2.81：chatId/project_id + normal 模式
+        // 对齐 chat.qwen.ai FE 0.3.19：chatId/project_id + normal 模式
         const response_data = await axios.post(`${chatBaseUrl}/api/v2/chats/new`, {
             chatId: '',
             models: [model],

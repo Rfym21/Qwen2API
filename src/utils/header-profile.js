@@ -7,6 +7,11 @@
 const config = require('../config/index.js')
 const { getTimezoneHeader } = require('./tools')
 
+// chat.qwen.ai 前端版本（FE version）：请求头 Version 必须与线上前端一致，
+// 否则 /api/v2/chat/completions 返回 Bad_Request（2026-10-17 实测线上为 0.3.19）。
+// 前端三天内从 0.3.17 升到 0.3.19，此处过期需同步更新。
+const QWEN_WEB_VERSION = '0.3.19'
+
 // Chrome version pool — small set to avoid identical UA across all accounts
 const CHROME_VERSIONS = ['149.0.0.0', '148.0.0.0', '147.0.0.0', '146.0.0.0']
 
@@ -99,7 +104,7 @@ function buildRequestHeaders(account, options = {}) {
             'accept': options.accept || 'application/json',
             'accept-encoding': 'gzip, deflate, br, zstd',
             'source': 'web',
-            'version': '0.2.81',
+            'Version': QWEN_WEB_VERSION,
             'timezone': getTimezoneHeader(),
             'connection': 'keep-alive',
             'sec-fetch-dest': 'empty',
@@ -116,6 +121,8 @@ function buildRequestHeaders(account, options = {}) {
             if (options.ssxmodItna) cookieParts.push(`ssxmod_itna=${options.ssxmodItna}`)
             if (options.ssxmodItna2) cookieParts.push(`ssxmod_itna2=${options.ssxmodItna2}`)
             headers['cookie'] = cookieParts.join(';')
+            // FE 0.3.x 起 completions 硬校验 Bearer 鉴权（缺失则 Unauthorized），与前端 eX 拦截器一致
+            headers['Authorization'] = `Bearer ${options.token}`
         }
         if (options.extra) Object.assign(headers, options.extra)
         return headers
@@ -144,7 +151,7 @@ function buildRequestHeaders(account, options = {}) {
         'accept': options.accept || 'application/json',
         'accept-encoding': 'gzip, deflate, br, zstd',
         'source': 'web',
-        'version': '0.2.81',
+        'Version': QWEN_WEB_VERSION,
         'timezone': timezone,
         'connection': 'keep-alive',
         'sec-fetch-dest': 'empty',
@@ -163,6 +170,8 @@ function buildRequestHeaders(account, options = {}) {
         if (options.ssxmodItna) cookieParts.push(`ssxmod_itna=${options.ssxmodItna}`)
         if (options.ssxmodItna2) cookieParts.push(`ssxmod_itna2=${options.ssxmodItna2}`)
         headers['cookie'] = cookieParts.join(';')
+        // FE 0.3.x 起 completions 硬校验 Bearer 鉴权（缺失则 Unauthorized），与前端 eX 拦截器一致
+        headers['Authorization'] = `Bearer ${options.token}`
     }
 
     if (options.extra) Object.assign(headers, options.extra)
