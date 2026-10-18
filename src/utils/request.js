@@ -10,7 +10,8 @@ const { uploadAgentContextFile, buildChatFileDescriptor } = require('./upload.js
 const { buildRequestHeaders } = require('./header-profile')
 const {
     ContextExternalizationError, isTransportInterruption, assertChatChallengeBreakerClosed,
-    bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe
+    bindChatChallengeContext, chatChallengeFrom, isWafChallengeError, releaseChatProbe,
+    describeUpstreamFailure, unclassifiedFailure
 } = require('./upstream-error.js')
 const { contextPrefixCache, prefixMatches, canonicalHistoryHash } = require('./context-prefix-cache.js')
 const {
@@ -695,7 +696,9 @@ const sendChatRequest = async (body, options = {}) => {
         return {
             status: false,
             response: null,
-            message: reason
+            message: reason,
+            // Fallo local de configuracion, no del cliente: reintentar mas tarde es lo correcto.
+            failure: unclassifiedFailure(503)
         }
     }
 
@@ -743,7 +746,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         return {
             status: false,
             response: null,
-            message: '无法创建或续接 Qwen 会话'
+            message: '无法创建或续接 Qwen 会话',
+            // Upstream opaco: los challenges ya se lanzan antes de llegar aqui, asi que esto
+            // no es "vuelve en un rato" sino "el upstream contesto algo que no entendemos".
+            failure: unclassifiedFailure(502)
         }
     }
     // 浏览器 referer 为 /c/<chat_id>（在 chat_id 生成后动态设置）
@@ -840,10 +846,23 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
         }
     }
 
+    // El veredicto sale con el fallo: los llamadores no tienen que volver a deducir el
+    // significado de un booleano. Sin respuesta HTTP no hay veredicto que leer — el
+    // transporte se cayo, y eso es reintentable (503). Con respuesta, decide el clasificador
+    // (429 del upstream o 502 opaco).
+    const failure = lastError?.response
+        ? describeUpstreamFailure(lastError, 502, 503)
+        : unclassifiedFailure(503)
+
     // 所有尝试失败 — 分类错误
     if (lastError && currentAccount?.email) {
         const hadHttpResponse = !!lastError.response
-        if (!hadHttpResponse && isRetryableNetworkError(lastError)) {
+        if (failure.rateLimited) {
+            // La misma pared que el canal de payload, por el otro canal: la cuenta queda en
+            // cuota agotada (cooldown por defecto si el upstream no dijo cuanto esperar).
+            logger.error(`发送聊天请求失败: 账户额度已耗尽`, 'REQUEST', '', lastError.message)
+            accountManager.recordAccountQuotaExhausted(currentAccount.email, failure.retryAfter)
+        } else if (!hadHttpResponse && isRetryableNetworkError(lastError)) {
             // 传输层失败耗尽重试——记 failure，累计可触发 cooldown（PR #112 语义）
             logger.error(
                 `聊天请求传输失败 (已尝试 ${totalAttempts} 次): ${lastError.message}`,
@@ -856,7 +875,10 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
             )
             accountManager.recordAccountFailure(currentAccount.email, lastError.code)
         } else {
-            // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown
+            // HTTP 4xx/5xx (上游主动拒绝, 账户有效) — 仅刷新 warn 指示, 不影响 cooldown。
+            // Excepción deliberada y registrada: el 429, que cae en la rama de cuota agotada
+            // de arriba y sí enfría la cuenta — con el cooldown por defecto cuando el cuerpo
+            // no trae espera.
             const status = lastError.response?.status
             logger.error('发送聊天请求失败', 'REQUEST', '', lastError.message)
             accountManager.recordAccountError(currentAccount.email, status)
@@ -871,7 +893,8 @@ const postChatRequest = async (body, options, currentAccount, currentToken, brea
 
     return {
         status: false,
-        response: null
+        response: null,
+        failure
     }
 }
 

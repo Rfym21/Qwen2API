@@ -328,9 +328,12 @@ describe('interception observability (finding 3)', () => {
       hint = JSON.stringify(sender.calls[0]);
     });
 
+    // El token de la razon es el unificado del vocabulario (`required_tool`, ticket 05):
+    // antes decia `required`. Lo que esta prueba cuida — que el log diga los nombres
+    // descartados aunque otra razon los tape — no cambia.
     assert.ok(
-      warns.some(line => /required; dropped: read_file/.test(line)),
-      `expected a "required; dropped: read_file" warn, got:\n${warns.join('\n')}`
+      warns.some(line => /required_tool; dropped: read_file/.test(line)),
+      `expected a "required_tool; dropped: read_file" warn, got:\n${warns.join('\n')}`
     );
     // finding 4 para la razon required: el hint lleva el dato clave ademas del suyo.
     assert.match(hint, /You did not call any tool/);

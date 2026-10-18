@@ -1,0 +1,2481 @@
+{
+  "corpus": "agent-turn-corpus",
+  "scenarios": {
+    "accept_final_answer": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "content",
+            "text": "All requested work is complete."
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "end_turn"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "All requested work is complete."
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "end_turn"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "content",
+            "text": "All requested work is complete."
+          },
+          {
+            "kind": "finish",
+            "reason": "stop"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "kind": "content",
+            "text": "All requested work is complete."
+          },
+          {
+            "kind": "finish",
+            "reason": "stop"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      }
+    },
+    "accept_tool_call": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 0,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 0,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      }
+    },
+    "bare": {
+      "anthropic.nonstream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "kind": "content",
+            "text": "The answer is 42, and no tool is needed for it."
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "end_turn"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "The answer is 42, and no tool is needed for it."
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "end_turn"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "bare"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "bare"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "delivered_round_then_empty": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "thinking",
+            "text": "Let me reconsider the request from scratch."
+          },
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result.",
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "missing_tool",
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 3
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "I will read the file now and then summarise what it contains."
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "index": 1,
+            "kind": "thinking_block_start"
+          },
+          {
+            "kind": "thinking",
+            "text": "Let me reconsider the request from scratch."
+          },
+          {
+            "index": 1,
+            "kind": "signature"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "end_turn"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "missing_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.",
+          "# Agent turn recovery\nThe previous attempt ended without a visible answer or executable tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "bare",
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 3
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "kind": "reasoning",
+            "text": "Let me reconsider the request from scratch."
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.",
+          "# Agent turn recovery\nThe previous attempt ended without a visible answer or executable tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "bare",
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 3
+      }
+    },
+    "empty": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "thinking",
+            "text": "Let me consider the request before answering."
+          },
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "thinking_block_start"
+          },
+          {
+            "kind": "thinking",
+            "text": "Let me consider the request before answering."
+          },
+          {
+            "index": 0,
+            "kind": "signature"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt ended without a visible answer or executable tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "kind": "reasoning",
+            "text": "Let me consider the request before answering."
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt ended without a visible answer or executable tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "empty"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "good_call_with_broken_sibling": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "\n\n"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "intercepted": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "intercepted"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "The Bash tool seems unavailable in this environment, so the task cannot continue."
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "intercepted"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "intercepted"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nYour tool call did not reach the client. Re-emit it now using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format as the first content of your answer — never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "intercepted"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      }
+    },
+    "invalid_control": {
+      "anthropic.nonstream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 0,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 0,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply produced no visible final answer or executable tool call. Continue the Agent task now. If any action remains, emit the required `[TOOL CALL]` block immediately with no preamble. Only give a normal final answer when the task is actually complete; do not repeat hidden reasoning."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt left the completion wrapper unbalanced, or emitted more than one. Use exactly one <agent_final>...</agent_final> pair (or exactly one <agent_blocked>...</agent_blocked>), never both and never two of either — both tags of the pair must be present.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "invalid_control"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt left the completion wrapper unbalanced, or emitted more than one. Use exactly one <agent_final>...</agent_final> pair (or exactly one <agent_blocked>...</agent_blocked>), never both and never two of either — both tags of the pair must be present.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "invalid_control"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "malformed_protocol": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "malformed_protocol"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "{\"name\": \"RunCommand\", \"arguments\": {\"command\": \"ls -la\"}}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "malformed_protocol"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "malformed_protocol"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nYour tool call was malformed and was NOT executed. Re-emit it now: output [TOOL CALL] as the FIRST content of your answer, then the JSON payload, then [END TOOL CALL] — nothing before, between, or after.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "malformed_protocol"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "missing_tool": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "missing_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "I will read the file now and then summarise what it contains."
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYour previous reply described an action but did not execute any tool call. Perform that action now by emitting the real `[TOOL CALL]` block immediately with no preamble. Do not describe the action again or claim completion without a tool result."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "missing_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "prose_with_tools": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "content",
+            "text": "Sure, let me look at that file."
+          },
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "Sure, let me look at that file.\n\n"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "prose_with_tools"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "prose_with_tools"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "required_tool": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "thinking",
+            "text": "The user wants a tool run, but I should answer in prose instead."
+          },
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "thinking_block_start"
+          },
+          {
+            "kind": "thinking",
+            "text": "The user wants a tool run, but I should answer in prose instead."
+          },
+          {
+            "index": 0,
+            "kind": "signature"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 1,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 1,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt violated tool_choice and did not call the required tool.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "kind": "reasoning",
+            "text": "The user wants a tool run, but I should answer in prose instead."
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt violated tool_choice and did not call the required tool.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "text_channel_cut_with_calls": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 5
+        },
+        "upstreamSends": 1
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 0,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 0,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "index": 1,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "\n\n"
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 5
+        },
+        "upstreamSends": 1
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 5
+        },
+        "upstreamSends": 1
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [],
+        "retried": false,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 5
+        },
+        "upstreamSends": 1
+      }
+    },
+    "thought_tool_call": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "thinking",
+            "text": "[TOOL CALL]{\"name\":\"Read\",\"arguments\":{\"file_path\":\"a.txt\"}}[END TOOL CALL]"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "thought_tool_call"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "index": 0,
+            "kind": "thinking_block_start"
+          },
+          {
+            "kind": "thinking",
+            "text": "[TOOL CALL]{\"name\":\"Read\",\"arguments\":{\"file_path\":\"a.txt\"}}[END TOOL CALL]"
+          },
+          {
+            "index": 0,
+            "kind": "signature"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "index": 1,
+            "kind": "text_block_start"
+          },
+          {
+            "kind": "content",
+            "text": "I have read the file and here is my summary."
+          },
+          {
+            "index": 1,
+            "kind": "block_stop"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 2,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 2,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 2,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nYour tool call was emitted inside your hidden reasoning, so it was never executed and never reached the client. Re-emit it now as the FIRST content of your answer, using EXACTLY the `[TOOL CALL]...[END TOOL CALL]` format — never inside reasoning, never any other format.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "thought_tool_call"
+        ],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": false,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt returned bare prose without declaring a verified final result or emitting the next tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [],
+        "upstreamFrames": {
+          "served": 3,
+          "total": 3
+        },
+        "upstreamSends": 2
+      }
+    },
+    "tool_error": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 0,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 0,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\n# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    },
+    "tool_error_with_required": {
+      "anthropic.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "id": "toolu_<hex24>",
+            "input": {
+              "file_path": "a.txt"
+            },
+            "kind": "tool_use",
+            "name": "Read"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "anthropic.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "message_start"
+          },
+          {
+            "id": "toolu_<hex24>",
+            "index": 0,
+            "kind": "tool_use_start",
+            "name": "Read"
+          },
+          {
+            "index": 0,
+            "kind": "tool_use_args",
+            "partial_json": "{\"file_path\":\"a.txt\"}"
+          },
+          {
+            "index": 0,
+            "kind": "block_stop"
+          },
+          {
+            "kind": "stop_reason",
+            "stop_reason": "tool_use"
+          },
+          {
+            "kind": "message_stop"
+          }
+        ],
+        "hints": [
+          "# Tool-call retry\nYou did not call any tool. You MUST now call exactly one tool using the [TOOL CALL]...[END TOOL CALL] format."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "required_tool"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.nonstream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "id": "call_<hex24>",
+            "index": null,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      },
+      "openai.stream": {
+        "applicable": true,
+        "delivered": [
+          {
+            "kind": "role",
+            "role": "assistant"
+          },
+          {
+            "id": "call_<hex24>",
+            "index": 0,
+            "kind": "tool_call",
+            "name": "Read"
+          },
+          {
+            "arguments": "{\"file_path\":\"a.txt\"}",
+            "index": 0,
+            "kind": "tool_call_args"
+          },
+          {
+            "kind": "finish",
+            "reason": "tool_calls"
+          },
+          {
+            "kind": "usage"
+          },
+          {
+            "kind": "done"
+          }
+        ],
+        "hints": [
+          "# Agent turn recovery\nThe previous attempt contained an invalid, truncated, or unknown tool call.\nContinue the SAME original task. Re-check its acceptance criteria and the latest tool result.\nIf work remains, output only valid `[TOOL CALL]...[END TOOL CALL]` blocks. If and only if all work is verified complete, output <agent_final>the final report</agent_final>.\nIf user input is strictly required, output <agent_blocked>the blocker</agent_blocked>. Do not output bare planning prose.\nThe tool name(s) WebFetch do not exist.\nUse ONLY these exact tool names: Read, Bash, Edit."
+        ],
+        "retried": true,
+        "status": 200,
+        "targets": [
+          "tool_error"
+        ],
+        "upstreamFrames": {
+          "served": 2,
+          "total": 2
+        },
+        "upstreamSends": 2
+      }
+    }
+  },
+  "version": 1
+}
